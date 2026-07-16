@@ -1,0 +1,57 @@
+# The single definition of "relevant to me" (DESIGN §11).
+#
+# This file is injected (prompt-cached) into every scoring and synthesis prompt.
+# Tuning the system means editing THIS file plus `signalforge mark useful|noise`
+# feedback — never editing prompts (CLAUDE.md §4).
+#
+# Validated by `InterestsConfig` in src/signalforge/config.py.
+
+# Keys from taxonomy.yaml, in `group.leaf` form.
+priority_topics:
+  - agents.mcp
+  - engineering.code-gen
+  - engineering.context
+  - models.local
+  - retrieval.rag
+
+interests:
+  - python
+  - fastapi
+  - sqlite
+  - duckdb
+  - claude-code
+  - trading-systems
+  - local-first
+
+stack:
+  - python
+  - typescript
+  - fastapi
+  - sqlite
+  - postgres
+  - docker
+  - wsl
+
+learning_goals:
+  - agent memory architectures
+  - production llm evaluation
+
+architecture_philosophy: >
+  Local-first, deterministic pipelines, low operational cost, monolith-by-default,
+  boring technology, human-in-the-loop.
+
+ignore:
+  topics:
+    - crypto
+    - web3
+    - model-release-hype
+  people: []
+  repos: []
+
+# Weekly-brief inclusion gates (DESIGN §9):
+#   signal >= weekly_min_signal AND relevance >= weekly_min_relevance
+#   AND (signal + relevance + novelty) >= weekly_min_total
+thresholds:
+  weekly_min_signal: 3
+  weekly_min_relevance: 3
+  weekly_min_total: 10

@@ -1,0 +1,29 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Data — regenerable plumbing (the vault is git-tracked; the DB is not)
+data/signalforge.db
+data/signalforge.db-*
+data/http_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local Claude Code settings (personal permission grants)
+.claude/settings.local.json
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

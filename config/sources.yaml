@@ -1,0 +1,81 @@
+# What SignalForge ingests. Config is data, not code (CLAUDE.md §4) — adding a
+# blog is an edit here, never a Python change. Shape and starting values: DESIGN §7.
+#
+# Validated by `SourcesConfig` in src/signalforge/config.py with extra="forbid":
+# an unknown key is a startup error, not a silent no-op.
+
+defaults:
+  fetch_timeout: 20 # seconds, per HTTP request
+  min_hn_points: 80 # HN front-page score floor
+  # The triage cost knob. Summaries are truncated to this before scoring, and
+  # triage runs on titles + summaries only (DESIGN §8), so this sets the ceiling
+  # on the monthly bill: ~1k tokens x ~150 items/day. Turn this first if spend
+  # surprises you — see the month-to-date figure in `signalforge status`.
+  max_summary_chars: 4000
+
+# Blogs / personal sites — RSS via feedparser (Phase 0).
+# `weight` is a score multiplier for a trusted author; omit it for 1.0.
+rss:
+  - id: simonwillison
+    url: https://simonwillison.net/atom/everything/
+    weight: 1.3
+  - id: interconnects
+    url: https://www.interconnects.ai/feed
+  - id: karpathy
+    url: https://karpathy.bearblog.dev/feed/
+  - id: sebastian-raschka
+    url: https://magazine.sebastianraschka.com/feed
+  - id: chip-huyen
+    url: https://huyenchip.com/feed.xml
+  - id: hamel-husain
+    url: https://hamel.dev/index.xml
+  - id: swyx
+    url: https://www.swyx.io/rss.xml
+  - id: jason-liu
+    url: https://jxnl.co/feed_rss_created.xml
+# Anthropic's engineering blog publishes no RSS feed (every plausible path 404s
+# as of 2026-07-16). Its posts reach HN within hours, and `hackernews.keywords`
+# below already covers them — same reasoning DESIGN §7 applies to X/Twitter.
+# Revisit if a feed ever appears.
+
+# GitHub releases (Phase 0). `token_env` names an env var — NEVER the token
+# itself (NEVER rule 16). Unauthenticated works at 60 req/hr; a token lifts it
+# to 5000. Release notes become the item summary.
+github:
+  token_env: GITHUB_TOKEN
+  releases:
+    - Aider-AI/aider
+    - langchain-ai/langgraph
+    - modelcontextprotocol/specification
+    - ollama/ollama
+    - vllm-project/vllm
+    - BerriAI/litellm
+    - anthropics/claude-code
+    - stanfordnlp/dspy
+    - pydantic/pydantic-ai
+    - ggml-org/llama.cpp
+    - huggingface/transformers
+  # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
+  awesome_lists:
+    - e2b-dev/awesome-ai-agents
+    - punkpeye/awesome-mcp-servers
+
+# Phase 1 — modeled and configured now, ingested when the phase gate opens.
+arxiv:
+  categories: [cs.AI, cs.CL, cs.LG, cs.SE]
+  require_keywords:
+    - agent
+    - context
+    - retrieval
+    - inference
+    - evaluation
+    - fine-tuning
+    - quantization
+    - reasoning
+    - embedding
+    - tool use
+
+# Hacker News via the Algolia API (Phase 0) — free, no auth.
+# Front page >= defaults.min_hn_points, plus one search per keyword.
+hackernews:
+  keywords: [llm, claude, mcp, agent, rag, inference, ollama, vllm]

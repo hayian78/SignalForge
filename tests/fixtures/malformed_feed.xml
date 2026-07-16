@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<rss version="2.0">
+  <channel>
+    <title>Half-written feed</title>
+    <link>https://example.com/</link>
+    <description>Truncated mid-serve — feedparser sets bozo but recovers the first item.</description>
+    <item>
+      <title>A recoverable item before the damage</title>
+      <link>https://example.com/posts/recoverable</link>
+      <guid isPermaLink="false">example-recoverable-1</guid>
+      <pubDate>Wed, 15 Jul 2026 10:00:00 +0000</pubDate>
+      <description>&lt;p&gt;This entry parses fine.&lt;/p&gt;</description>
+    </item>
+    <item>
+      <title>Unclosed tags from here on
+      <link>https://example.com/posts/broken</link>
+      <description>Ampersand & raw, element never closed

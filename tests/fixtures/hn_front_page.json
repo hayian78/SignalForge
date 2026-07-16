@@ -1,0 +1,58 @@
+{
+  "hits": [
+    {
+      "created_at": "2026-07-15T14:22:03.000Z",
+      "title": "Show HN: A local-first RAG pipeline in 400 lines of SQLite",
+      "url": "https://github.com/example/sqlite-rag",
+      "author": "dang_not_really",
+      "points": 412,
+      "story_text": null,
+      "num_comments": 133,
+      "objectID": "44921100",
+      "created_at_i": 1784125323,
+      "_tags": ["story", "author_dang_not_really", "story_44921100", "front_page"]
+    },
+    {
+      "created_at": "2026-07-15T09:01:44.000Z",
+      "title": "Ask HN: What broke when you moved agents to MCP?",
+      "url": null,
+      "author": "curiousdev",
+      "points": 188,
+      "story_text": "We migrated three internal agents to MCP servers last quarter. Sharing notes and hoping for war stories.",
+      "num_comments": 96,
+      "objectID": "44918744",
+      "created_at_i": 1784106104,
+      "_tags": ["story", "ask_hn", "author_curiousdev", "story_44918744", "front_page"]
+    },
+    {
+      "created_at": "2026-07-15T16:40:12.000Z",
+      "title": "A low-scoring front page straggler",
+      "url": "https://example.com/low-score",
+      "author": "someone",
+      "points": 12,
+      "story_text": null,
+      "num_comments": 3,
+      "objectID": "44922801",
+      "created_at_i": 1784133612,
+      "_tags": ["story", "author_someone", "story_44922801", "front_page"]
+    },
+    {
+      "created_at": "2026-07-15T11:00:00.000Z",
+      "title": null,
+      "url": null,
+      "author": "commenter",
+      "points": 300,
+      "comment_text": "A comment hit — has no title and must never become an item.",
+      "objectID": "44919999",
+      "created_at_i": 1784113200,
+      "_tags": ["comment", "author_commenter"]
+    }
+  ],
+  "nbHits": 4,
+  "page": 0,
+  "nbPages": 1,
+  "hitsPerPage": 50,
+  "processingTimeMS": 3,
+  "query": "",
+  "params": "tags=front_page&hitsPerPage=50"
+}

@@ -1,0 +1,35 @@
+{
+  "hits": [
+    {
+      "created_at": "2026-07-15T14:22:03.000Z",
+      "title": "Show HN: A local-first RAG pipeline in 400 lines of SQLite",
+      "url": "https://github.com/example/sqlite-rag",
+      "author": "dang_not_really",
+      "points": 412,
+      "story_text": null,
+      "num_comments": 133,
+      "objectID": "44921100",
+      "created_at_i": 1784125323,
+      "_tags": ["story", "author_dang_not_really", "story_44921100"]
+    },
+    {
+      "created_at": "2026-07-13T07:15:31.000Z",
+      "title": "The MCP specification adds streaming sampling",
+      "url": "https://modelcontextprotocol.io/blog/streaming-sampling?utm_campaign=launch",
+      "author": "specfan",
+      "points": 254,
+      "story_text": null,
+      "num_comments": 61,
+      "objectID": "44901233",
+      "created_at_i": 1783969531,
+      "_tags": ["story", "author_specfan", "story_44901233"]
+    }
+  ],
+  "nbHits": 2,
+  "page": 0,
+  "nbPages": 1,
+  "hitsPerPage": 50,
+  "processingTimeMS": 5,
+  "query": "mcp",
+  "params": "query=mcp&tags=story&numericFilters=points%3E%3D80"
+}
