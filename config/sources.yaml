@@ -39,10 +39,27 @@ rss:
     url: https://www.swyx.io/rss.xml
   - id: jason-liu
     url: https://jxnl.co/feed_rss_created.xml
+  # Company engineering blogs (added 2026-07-17). Higher volume and more product
+  # marketing than the personal blogs above — triage plus
+  # `ignore.topics: model-release-hype` in interests.yaml are the filter.
+  - id: openai-news
+    url: https://openai.com/news/rss.xml
+  - id: deepmind
+    url: https://deepmind.google/blog/rss.xml
+  - id: cloudflare-ai
+    # Tag-scoped feed: AI/inference/Workers-AI posts only, not the full firehose.
+    url: https://blog.cloudflare.com/tag/ai/rss/
+  - id: microsoft-research
+    url: https://www.microsoft.com/en-us/research/feed/
+  - id: together-ai
+    url: https://www.together.ai/blog/rss.xml
+  - id: modal
+    url: https://modal.com/blog/atom.xml
 # Anthropic's engineering blog publishes no RSS feed (every plausible path 404s
 # as of 2026-07-16). Its posts reach HN within hours, and `hackernews.keywords`
 # below already covers them — same reasoning DESIGN §7 applies to X/Twitter.
-# Revisit if a feed ever appears.
+# Revisit if a feed ever appears. Meta AI is in the same boat:
+# ai.meta.com/blog/rss/ serves an HTML page, not a feed (checked 2026-07-17).
 
 # GitHub releases (Phase 0). `token_env` names an env var — NEVER the token
 # itself (NEVER rule 16). Unauthenticated works at 60 req/hr; a token lifts it
@@ -61,6 +78,17 @@ github:
     - pydantic/pydantic-ai
     - ggml-org/llama.cpp
     - huggingface/transformers
+    # Added 2026-07-17. modelcontextprotocol/servers carries implementation
+    # changes the spec repo doesn't; duckdb is an interests.yaml interest
+    # (SignalForge itself is SQLite). Considered and skipped: microsoft/autogen
+    # (dormant — no release since 2025-09), astral-sh/uv + ruff (tooling churn,
+    # not AI signal; revisit on felt need).
+    - OpenHands/OpenHands
+    - block/goose
+    - continuedev/continue
+    - microsoft/markitdown
+    - modelcontextprotocol/servers
+    - duckdb/duckdb
   # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
   awesome_lists:
     - e2b-dev/awesome-ai-agents
