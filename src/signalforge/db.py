@@ -25,12 +25,18 @@ from signalforge.models import Item, SourceType
 __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION",
+    "DigestItem",
     "Migration",
+    "RunRecord",
     "connect",
     "connection",
+    "count_killed_items",
     "finish_run",
+    "get_digest_items",
     "get_item",
     "get_item_by_canonical_url",
+    "get_latest_run",
+    "insert_score",
     "migrate",
     "start_run",
     "upsert_item",
@@ -460,6 +466,135 @@ def get_item_by_canonical_url(conn: sqlite3.Connection, canonical_url: str) -> I
 
 
 # --------------------------------------------------------------------------- #
+# scores — read side for report/daily.py
+#
+# `score/` (another agent's work-in-progress) owns writing this table. These
+# are read-only queries added for the report writer; they touch no insert path
+# and must not be treated as a source of truth for scoring behaviour.
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class DigestItem:
+    """One kept item plus its score row — the join `report/daily.py` needs.
+
+    Not a `items`/`scores` row in its own right, just a read-side view; there
+    is no writer for this shape.
+    """
+
+    item: Item
+    signal: int | None
+    relevance: int | None
+    novelty: int | None
+    reasoning: str
+    model: str
+    rubric_version: str
+    scored_at: datetime
+
+
+def _row_to_digest_item(row: sqlite3.Row) -> DigestItem:
+    return DigestItem(
+        item=_row_to_item(row),
+        signal=row["signal"],
+        relevance=row["relevance"],
+        novelty=row["novelty"],
+        reasoning=row["reasoning"],
+        model=row["model"],
+        rubric_version=row["rubric_version"],
+        scored_at=_from_iso(row["scored_at"]) or datetime.fromtimestamp(0),
+    )
+
+
+_SELECT_DIGEST_ITEMS = """
+    SELECT items.*, scores.signal, scores.relevance, scores.novelty,
+           scores.reasoning, scores.model, scores.rubric_version, scores.scored_at
+    FROM scores
+    JOIN items ON items.id = scores.item_id
+    WHERE scores.triage = 'keep'
+      AND substr(scores.scored_at, 1, 10) = ?
+    ORDER BY (COALESCE(scores.signal, 0) + COALESCE(scores.relevance, 0)
+              + COALESCE(scores.novelty, 0)) DESC,
+             items.id ASC
+"""
+
+
+def get_digest_items(conn: sqlite3.Connection, *, scored_date: str) -> list[DigestItem]:
+    """Kept items scored on `scored_date` (an ISO `YYYY-MM-DD` string), ranked.
+
+    Ranking is the sum of the three score dimensions, highest first, with
+    `item.id` as a stable tie-break so re-rendering the same date is
+    byte-for-byte identical (CLAUDE.md §3). "Scored on `scored_date`" — not
+    "since the last digest run" — is the deliberate boundary: it makes the
+    digest a pure function of `(scored_date, db state)`, so rendering the same
+    date twice always reads the same rows regardless of when you happen to run
+    it, which is what idempotent overwrite requires.
+    """
+    rows = conn.execute(_SELECT_DIGEST_ITEMS, (scored_date,)).fetchall()
+    return [_row_to_digest_item(row) for row in rows]
+
+
+def count_killed_items(conn: sqlite3.Connection, *, scored_date: str) -> int:
+    """How many items were triaged `kill` on `scored_date` — the digest footer's count."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS n FROM scores WHERE triage = 'kill' AND substr(scored_at, 1, 10) = ?",
+        (scored_date,),
+    ).fetchone()
+    return int(row["n"])
+
+
+# --------------------------------------------------------------------------- #
+# scores — write side for score/
+# --------------------------------------------------------------------------- #
+
+_INSERT_SCORE = """
+    INSERT INTO scores (
+        item_id, triage, signal, relevance, novelty, reasoning,
+        rubric_version, model, scored_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def insert_score(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    triage: str,
+    signal: int | None,
+    relevance: int | None,
+    novelty: int | None,
+    reasoning: str,
+    rubric_version: str,
+    model: str,
+    scored_at: datetime,
+) -> None:
+    """Insert one `scores` row.
+
+    `item_id` is the table's primary key (DESIGN §5), so a second insert for an
+    already-scored item raises `sqlite3.IntegrityError` rather than silently
+    double-writing — idempotency is enforced by `score/`'s caller never
+    selecting an already-scored item in the first place (its `WHERE
+    scores.item_id IS NULL` query), not by an upsert here. `rubric_version` and
+    `model` are required on every row (CLAUDE.md §3) so a later rubric change
+    never leaves an ambiguous score behind.
+    """
+    conn.execute(
+        _INSERT_SCORE,
+        (
+            item_id,
+            triage,
+            signal,
+            relevance,
+            novelty,
+            reasoning,
+            rubric_version,
+            model,
+            _to_iso(scored_at),
+        ),
+    )
+    logger.debug("inserted score", extra={"item_id": item_id, "triage": triage})
+
+
+# --------------------------------------------------------------------------- #
 # runs
 # --------------------------------------------------------------------------- #
 
@@ -522,4 +657,48 @@ def finish_run(
             "items_new": items_new,
             "error_count": len(errors) if errors else 0,
         },
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecord:
+    """One `runs` row, read back — `errors` already decoded from JSON."""
+
+    id: int
+    kind: str
+    started_at: datetime
+    finished_at: datetime | None
+    status: str | None
+    items_new: int
+    errors: list[dict[str, str]]
+
+
+def get_latest_run(conn: sqlite3.Connection, *, kind: str) -> RunRecord | None:
+    """The most recently *started* `runs` row of `kind`, or None if there is none yet.
+
+    Used by the digest footer to surface "yesterday's source failures": the
+    digest reads the last `ingest` run's `errors` rather than re-deriving
+    failure state itself, keeping `runs.errors` the single monitoring channel
+    (CLAUDE.md §7, DESIGN §7).
+    """
+    row = conn.execute(
+        "SELECT * FROM runs WHERE kind = ? ORDER BY id DESC LIMIT 1", (kind,)
+    ).fetchone()
+    if row is None:
+        return None
+    raw_errors = row["errors"]
+    decoded = json.loads(raw_errors) if raw_errors else []
+    errors = (
+        [record for record in decoded if isinstance(record, dict)]
+        if isinstance(decoded, list)
+        else []
+    )
+    return RunRecord(
+        id=row["id"],
+        kind=row["kind"],
+        started_at=_from_iso(row["started_at"]) or datetime.fromtimestamp(0),
+        finished_at=_from_iso(row["finished_at"]),
+        status=row["status"],
+        items_new=row["items_new"] or 0,
+        errors=errors,
     )

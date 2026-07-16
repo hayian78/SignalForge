@@ -26,6 +26,20 @@ FIXED_PUBLISHED_AT = datetime(2026, 7, 15, 12, 30, 0, tzinfo=UTC)
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+@pytest.fixture(autouse=True)
+def _no_real_dotenv_leakage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`config.get_secret` falls back to reading `.env` from the current
+    working directory (CLAUDE.md §10 rule 16 — secrets never in YAML, but
+    they *can* live in a developer's real `.env` at the repo root, which is
+    also pytest's cwd). Without this, a real `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`
+    sitting in that file would silently change test outcomes depending on
+    whichever machine the suite runs on — the same hermeticity problem
+    NEVER rule 13 exists to prevent for live network calls. Tests that want a
+    secret present opt in explicitly via `monkeypatch.setenv`.
+    """
+    monkeypatch.setattr("signalforge.config.dotenv_values", lambda _path: {})
+
+
 @pytest.fixture
 def repo_config_dir() -> Path:
     """The repo's real `config/` — the YAML that actually ships.

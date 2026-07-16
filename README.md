@@ -42,6 +42,9 @@ Secrets live in `.env` (never committed):
 
 ```bash
 uv run signalforge ingest    # fetch from all configured sources into SQLite
+uv run signalforge score     # batched Haiku triage + scoring of unscored items
+uv run signalforge digest    # render today's Daily Digest into vault/daily/
+uv run signalforge daily     # ingest -> score -> digest, in one call (cron 06:00)
 uv run signalforge status    # last-run health, per-source freshness, token spend
 ```
 

@@ -1,0 +1,36 @@
+---
+date: {{ context.date.isoformat() }}
+tags: [signalforge, daily-digest]
+item_count: {{ context.items | length }}
+---
+
+# Daily Digest — {{ context.date.isoformat() }}
+
+{% if context.items %}
+{% for line in context.items %}
+## {{ loop.index }}. {{ line.title }}
+
+{{ line.why_it_matters }}
+
+**Scores:** signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
+**Link:** {{ line.url }}
+
+{% endfor %}
+{% else %}
+No items cleared triage today — a quiet news day, or a pipeline problem worth
+checking with `signalforge status`.
+
+{% endif %}
+---
+
+*{{ context.killed_count }} item(s) killed at triage · {{ context.scored_count }} scored today.*
+
+{% if context.source_failures %}
+**Source failures (last ingest run):**
+
+{% for failure in context.source_failures %}
+- `{{ failure.source_id }}`: {{ failure.message }}
+{% endfor %}
+{% else %}
+No source failures in the last ingest run.
+{% endif %}

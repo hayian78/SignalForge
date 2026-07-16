@@ -46,6 +46,7 @@ import logging
 import sqlite3
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -55,22 +56,34 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from signalforge.config import ConfigError, SourcesConfig, load_sources
+from signalforge.config import (
+    ConfigError,
+    InterestsConfig,
+    SourcesConfig,
+    load_interests,
+    load_sources,
+)
 from signalforge.db import connection, finish_run, start_run, upsert_item
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY
 from signalforge.ingest.hackernews import HN_SOURCE_ID
 from signalforge.models import Item
+from signalforge.report.daily import build_digest_context, digest_path, render_digest
+from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "ingest", "status"]
+__all__ = ["app", "digest", "ingest", "score", "status"]
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_DIR: Final = Path("config")
 DEFAULT_DB_PATH: Final = Path("data/signalforge.db")
 DEFAULT_CACHE_DIR: Final = Path("data/http_cache")
+DEFAULT_VAULT_DIR: Final = Path("vault")
 
 RUN_KIND_INGEST: Final = "ingest"
+RUN_KIND_SCORE: Final = "score"
+RUN_KIND_DIGEST: Final = "daily"
+"""Matches the `runs.kind` vocabulary in DESIGN §5 (`ingest | score | daily | weekly | monthly`)."""
 
 _RUN_LEVEL_SOURCE_ID: Final = "*"
 """`runs.errors[].source_id` for a failure that belongs to the run, not a source."""
@@ -128,6 +141,14 @@ def main(
 def _load_sources_or_exit(config_dir: Path) -> SourcesConfig:
     try:
         return load_sources(config_dir)
+    except ConfigError as exc:
+        err_console.print(f"[red]config error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+
+def _load_interests_or_exit(config_dir: Path) -> InterestsConfig:
+    try:
+        return load_interests(config_dir)
     except ConfigError as exc:
         err_console.print(f"[red]config error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
@@ -456,6 +477,259 @@ def ingest(
 
     if status_value == "failed":
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# score
+# --------------------------------------------------------------------------- #
+
+
+def _count_unscored_items(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n
+        FROM items
+        LEFT JOIN scores ON scores.item_id = items.id
+        WHERE scores.item_id IS NULL
+        """
+    ).fetchone()
+    return int(row["n"])
+
+
+def _render_score_report(outcome: ScoreOutcome, *, dry_run: bool, pending: int = 0) -> None:
+    if dry_run:
+        console.print(
+            f"[yellow]dry run[/yellow]: {pending} unscored item(s); "
+            "nothing sent to the LLM, no run recorded."
+        )
+        return
+
+    if outcome.errors:
+        errors_table = Table(title="Errors (recorded to runs.errors)", header_style="bold red")
+        errors_table.add_column("item/source")
+        errors_table.add_column("type")
+        errors_table.add_column("message", overflow="fold")
+        for record in outcome.errors:
+            errors_table.add_row(record["source_id"], record["error_type"], record["message"])
+        console.print(errors_table)
+
+    console.print(
+        f"[green]score complete[/green]: {outcome.items_scored} item(s) scored, "
+        f"{len(outcome.errors)} error(s); "
+        f"{outcome.input_tokens:,} input / {outcome.output_tokens:,} output tokens."
+    )
+
+
+@app.command()
+def score(
+    config_dir: Annotated[
+        Path, typer.Option("--config-dir", help="Directory holding interests.yaml.")
+    ] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run", help="Report unscored item count only: no LLM call, no run recorded."
+        ),
+    ] = False,
+) -> None:
+    """Triage + score every currently-unscored item via batched Haiku calls.
+
+    Reads only stored items (`items` left-joined against `scores`) and calls
+    the LLM only through `signalforge.llm` — this command never touches
+    `anthropic` directly (CLAUDE.md §2). Idempotent by construction
+    (CLAUDE.md §3): an item that already carries a `scores` row is invisible
+    to the selection query, so re-running `score` twice sends nothing already
+    scored to the LLM and spends zero additional tokens.
+    """
+    interests = _load_interests_or_exit(config_dir)
+
+    with connection(db) as conn:
+        if dry_run:
+            # No `runs` row, no LLM call — an inspection tool, not a run,
+            # mirroring `ingest --dry-run`'s contract.
+            pending = _count_unscored_items(conn)
+            _render_score_report(ScoreOutcome(), dry_run=True, pending=pending)
+            return
+
+        run_id = start_run(conn, RUN_KIND_SCORE, started_at=datetime.now(UTC))
+        run_level_error: dict[str, str] | None = None
+        outcome = ScoreOutcome()
+        status_value = "failed"
+        try:
+            outcome = score_unscored_items(conn, interests)
+            if not outcome.errors:
+                status_value = "ok"
+            elif outcome.items_scored > 0:
+                status_value = "partial"
+            else:
+                status_value = "failed"
+            _render_score_report(outcome, dry_run=False)
+        except BaseException as exc:
+            # Includes KeyboardInterrupt, mirroring `ingest`'s no-silent-runs
+            # rule (CLAUDE.md §3): a crash mid-batch still closes its `runs`
+            # row. Scores already persisted by `score_unscored_items` are
+            # real, so a run that died partway through is `partial`, not a
+            # total loss.
+            run_level_error = _run_level_error(exc)
+            status_value = "partial" if outcome.items_scored > 0 else "failed"
+            raise
+        finally:
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                items_new=0,  # score writes no `items` rows, only `scores` rows.
+                llm_input_tokens=outcome.input_tokens,
+                llm_output_tokens=outcome.output_tokens,
+                errors=[*outcome.errors, *([run_level_error] if run_level_error else [])] or None,
+            )
+
+    if status_value == "failed":
+        raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# digest
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def digest(
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
+    vault_dir: Annotated[
+        Path,
+        typer.Option("--vault-dir", help="Obsidian vault root (digests land in <vault>/daily/)."),
+    ] = DEFAULT_VAULT_DIR,
+    target_date: Annotated[
+        datetime | None,
+        typer.Option(
+            "--date",
+            formats=["%Y-%m-%d"],
+            help=(
+                "Digest date, YYYY-MM-DD (default: today, UTC). "
+                "Re-rendering a date overwrites its file."
+            ),
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Render to stdout only: no file written, no validators."),
+    ] = False,
+) -> None:
+    """Render the Daily Digest (DESIGN §13) from already-scored items.
+
+    Reads `items`/`scores`/`runs` only — no HTTP, no LLM call (CLAUDE.md §2):
+    triage/scoring is the `score` command's job, this one only assembles and
+    writes markdown. Idempotent by construction (CLAUDE.md §3): re-running for
+    the same `--date` overwrites `<vault>/daily/<date>.md` rather than
+    appending, because the query is a pure function of that date.
+
+    Unlike `ingest`, there is no partial/failed distinction here — assembling
+    and writing one file is a single step with nothing to isolate, so the run
+    is either `ok` or `failed`.
+    """
+    resolved_date = target_date.date() if target_date is not None else datetime.now(UTC).date()
+
+    with connection(db) as conn:
+        run_id = start_run(conn, RUN_KIND_DIGEST, started_at=datetime.now(UTC))
+        run_level_error: dict[str, str] | None = None
+        status_value = "failed"
+        item_count = 0
+        try:
+            context = build_digest_context(conn, target_date=resolved_date)
+            item_count = len(context.items)
+            rendered = render_digest(context)
+
+            if dry_run:
+                console.print(rendered)
+                console.print(
+                    f"[yellow]dry run[/yellow]: {item_count} item(s) would render; nothing written."
+                )
+            else:
+                path = digest_path(vault_dir, target_date=resolved_date)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(rendered, encoding="utf-8")
+                console.print(f"[green]digest written[/green]: {path} ({item_count} item(s)).")
+            status_value = "ok"
+        except BaseException as exc:
+            # Includes KeyboardInterrupt, mirroring `ingest`'s no-silent-runs rule
+            # (CLAUDE.md §3): a crash mid-render still closes its `runs` row.
+            run_level_error = _run_level_error(exc)
+            raise
+        finally:
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                items_new=0,  # digest writes no `items` rows.
+                llm_input_tokens=0,
+                llm_output_tokens=0,
+                errors=[run_level_error] if run_level_error is not None else None,
+            )
+
+    if status_value == "failed":
+        raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# daily
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def daily(
+    config_dir: Annotated[Path, typer.Option("--config-dir")] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    cache_dir: Annotated[Path, typer.Option("--cache-dir")] = DEFAULT_CACHE_DIR,
+    vault_dir: Annotated[Path, typer.Option("--vault-dir")] = DEFAULT_VAULT_DIR,
+    max_concurrency: Annotated[int, typer.Option("--max-concurrency", min=1)] = (
+        DEFAULT_MAX_CONCURRENCY
+    ),
+) -> None:
+    """Run `ingest`, `score`, then `digest` in sequence (DESIGN §14, cron 06:00).
+
+    Each step keeps its own `runs` row and failure isolation — a step that
+    comes back `partial`/`failed` does not stop the next one from running,
+    since each downstream step only cares about rows the previous one already
+    committed (ingest's new items, score's new scores). This command never
+    fixes "today" before `score` runs and then hands that fixed date to
+    `digest`: `digest` always resolves `--date` itself, immediately after
+    `score` returns, so a triage batch that happens to straddle UTC midnight
+    still lands in the digest computed *after* it finished, not one decided
+    before it started.
+
+    Exit code is the worst of the three steps' (2 > 1 > 0), so a config error
+    in any step is still visible to cron even though later steps still ran.
+    """
+    worst_exit = 0
+
+    steps: tuple[Callable[[], None], ...] = (
+        lambda: ingest(
+            config_dir=config_dir,
+            db=db,
+            cache_dir=cache_dir,
+            source=None,
+            max_concurrency=max_concurrency,
+        ),
+        lambda: score(config_dir=config_dir, db=db),
+        lambda: digest(db=db, vault_dir=vault_dir),
+    )
+    for step in steps:
+        try:
+            step()
+        except typer.Exit as exc:
+            worst_exit = max(worst_exit, exc.exit_code)
+        except BaseException:
+            # A step already recorded its own `runs` row and re-raised
+            # (CLAUDE.md §3 — no silent runs); `daily` isolates steps from
+            # each other the same way `ingest` isolates sources.
+            worst_exit = max(worst_exit, 1)
+
+    if worst_exit:
+        raise typer.Exit(code=worst_exit)
 
 
 # --------------------------------------------------------------------------- #

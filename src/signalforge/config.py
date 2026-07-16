@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Final
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -223,16 +224,25 @@ class Secrets(BaseSettings):
 def get_secret(env_var: str) -> SecretStr | None:
     """Read an arbitrary secret named by config (e.g. `github.token_env`).
 
+    Checks a real environment variable first — so a value exported by cron,
+    systemd, or the shell always wins — and falls back to `.env` in the
+    current working directory. Reading `.env` fresh on every call (rather than
+    loading it once into `os.environ`) means nothing here mutates global
+    process state, which matters for tests: importing this module in a test
+    run must not leak a developer's real `.env` secrets into `os.environ` for
+    every subsequent test to see.
+
     Returns None when unset, so callers decide whether the credential is
     optional (GitHub works unauthenticated at 60 req/hr) or fatal. The value is
     wrapped in `SecretStr` and never logged — only the *name* of the missing
     variable is.
     """
-    raw = os.environ.get(env_var)
-    if raw is None or not raw.strip():
+    raw = os.environ.get(env_var) or dotenv_values(".env").get(env_var)
+    stripped = raw.strip() if raw is not None else ""
+    if not stripped:
         logger.debug("secret not set in environment", extra={"env_var": env_var})
         return None
-    return SecretStr(raw)
+    return SecretStr(stripped)
 
 
 # --------------------------------------------------------------------------- #
