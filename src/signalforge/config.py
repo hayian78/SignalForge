@@ -79,6 +79,15 @@ class SourceDefaults(_StrictModel):
             "titles + summaries only (DESIGN §8), so this bounds the per-item token spend."
         ),
     )
+    max_item_age_days: int = Field(
+        ge=1,
+        description=(
+            "Ingest freshness window, days. Items published earlier than this are skipped "
+            "before they reach the DB or triage — the guard against a first run (or a newly "
+            "added source) backfilling feed history. Items with no parseable published date "
+            "are kept, not dropped."
+        ),
+    )
 
 
 class RssSource(_StrictModel):

@@ -10,7 +10,12 @@ import respx
 from signalforge.ingest.base import HttpFetcher
 from signalforge.ingest.hackernews import HackerNewsIngestor, build_hackernews_ingestors
 from signalforge.models import SourceType
-from tests.ingest.conftest import MAX_SUMMARY_CHARS, fixture_text, make_sources_config
+from tests.ingest.conftest import (
+    MAX_ITEM_AGE_DAYS,
+    MAX_SUMMARY_CHARS,
+    fixture_text,
+    make_sources_config,
+)
 
 SEARCH_URL = "https://hn.algolia.com/api/v1/search"
 NOW = datetime(2026, 7, 16, 6, 0, 0, tzinfo=UTC)
@@ -214,6 +219,7 @@ def test_build_hackernews_ingestor_reads_threshold_from_defaults() -> None:
             "fetch_timeout": 20,
             "min_hn_points": 150,
             "max_summary_chars": MAX_SUMMARY_CHARS,
+            "max_item_age_days": MAX_ITEM_AGE_DAYS,
         },
         hackernews={"keywords": ["llm", "mcp"]},
     )

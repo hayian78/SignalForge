@@ -48,9 +48,10 @@ import hashlib
 import json
 import logging
 import re
+from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from types import TracebackType
@@ -75,6 +76,7 @@ __all__ = [
     "IngestRun",
     "Ingestor",
     "ValidatorStore",
+    "filter_by_age",
     "run_ingestors",
     "truncate_summary",
 ]
@@ -125,6 +127,51 @@ def truncate_summary(
     if len(text) > max_chars:
         text = text[:max_chars].rstrip() + "…"
     return text
+
+
+def filter_by_age(
+    items: Sequence[Item],
+    *,
+    max_age_days: int,
+    now: datetime | None = None,
+) -> list[Item]:
+    """Drop items published before ``now - max_age_days``; keep everything else.
+
+    The guard against history backfill: a first run — or a newly added source —
+    yields a feed's entire archive, and without this cutoff every one of those
+    items would land in the DB and on the triage bill. `max_age_days` comes from
+    `defaults.max_item_age_days` in `sources.yaml` (NEVER rule 6); it is applied
+    once, at the point where every ingestor's items converge, so no per-source
+    adapter can forget it.
+
+    Items with a missing or unparseable `published_at` are **kept**. Dropping
+    unknown-date items would silently lose fresh content from feeds with broken
+    dates; the conservative failure mode is a few extra triage tokens, never a
+    lost item.
+
+    The cutoff is measured from `now`, which defaults to the current time —
+    inherent to ingest, and harmless to idempotency: re-running upserts the same
+    in-window items onto the same unique keys. It is a parameter so tests freeze
+    it instead of sleeping (CLAUDE.md §8).
+    """
+    cutoff = (now if now is not None else datetime.now(UTC)) - timedelta(days=max_age_days)
+    kept: list[Item] = []
+    skipped: Counter[str] = Counter()
+    for item in items:
+        if item.published_at is not None and item.published_at < cutoff:
+            skipped[item.source_id] += 1
+            continue
+        kept.append(item)
+    for source_id, count in sorted(skipped.items()):
+        logger.info(
+            "skipped items older than the ingest freshness window",
+            extra={
+                "source_id": source_id,
+                "skipped_too_old": count,
+                "max_item_age_days": max_age_days,
+            },
+        )
+    return kept
 
 
 class FetchError(Exception):

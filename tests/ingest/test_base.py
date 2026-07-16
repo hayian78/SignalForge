@@ -8,6 +8,8 @@ raises cannot take the run down with it.
 from __future__ import annotations
 
 import json
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -20,6 +22,7 @@ from signalforge.ingest.base import (
     IngestError,
     Ingestor,
     IngestResult,
+    filter_by_age,
     run_ingestors,
 )
 from signalforge.models import Item, SourceType
@@ -455,3 +458,97 @@ async def test_no_ingestors_is_an_empty_result(fetcher: HttpFetcher) -> None:
     result = await run_ingestors([], fetcher)
     assert result.items == []
     assert result.ok
+
+
+# --------------------------------------------------------------------------- #
+# The ingest freshness window (`defaults.max_item_age_days`)
+# --------------------------------------------------------------------------- #
+
+_NOW = datetime(2026, 7, 16, 12, 0, 0, tzinfo=UTC)
+"""Frozen reference time — the filter takes `now` as a parameter precisely so
+these tests never sleep and never depend on the wall clock (CLAUDE.md §8)."""
+
+
+def _dated_item(source_id: str, title: str, published_at: datetime | None) -> Item:
+    return Item(
+        source_id=source_id,
+        source_type=SourceType.RSS,
+        url=f"https://example.com/{source_id}/{title}",
+        title=title,
+        published_at=published_at,
+    )
+
+
+def test_filter_by_age_drops_items_older_than_the_window() -> None:
+    """The first-run backfill guard: a 2019 archive entry never reaches the DB."""
+    old = _dated_item("blog", "archive-post", _NOW - timedelta(days=365))
+    ancient = _dated_item("blog", "from-2019", datetime(2019, 3, 1, tzinfo=UTC))
+
+    kept = filter_by_age([old, ancient], max_age_days=7, now=_NOW)
+
+    assert kept == []
+
+
+def test_filter_by_age_keeps_items_inside_the_window() -> None:
+    fresh = _dated_item("blog", "today", _NOW - timedelta(hours=3))
+    week_old = _dated_item("blog", "six-days", _NOW - timedelta(days=6))
+
+    kept = filter_by_age([fresh, week_old], max_age_days=7, now=_NOW)
+
+    assert [item.title for item in kept] == ["today", "six-days"]
+
+
+def test_filter_by_age_keeps_items_with_no_published_date() -> None:
+    """Missing/unparseable dates are kept, never silently dropped — the
+    conservative failure mode costs triage tokens, not items."""
+    undated = _dated_item("blog", "no-date", None)
+    old = _dated_item("blog", "old", _NOW - timedelta(days=30))
+
+    kept = filter_by_age([undated, old], max_age_days=7, now=_NOW)
+
+    assert [item.title for item in kept] == ["no-date"]
+
+
+def test_filter_by_age_boundary_is_inclusive() -> None:
+    """An item published exactly at the cutoff is not "older than" it — kept."""
+    at_cutoff = _dated_item("blog", "on-the-line", _NOW - timedelta(days=7))
+
+    kept = filter_by_age([at_cutoff], max_age_days=7, now=_NOW)
+
+    assert [item.title for item in kept] == ["on-the-line"]
+
+
+def test_filter_by_age_preserves_order_across_sources() -> None:
+    items = [
+        _dated_item("a", "a-fresh", _NOW - timedelta(days=1)),
+        _dated_item("b", "b-old", _NOW - timedelta(days=10)),
+        _dated_item("b", "b-fresh", _NOW - timedelta(days=2)),
+    ]
+
+    kept = filter_by_age(items, max_age_days=7, now=_NOW)
+
+    assert [item.title for item in kept] == ["a-fresh", "b-fresh"]
+
+
+def test_filter_by_age_logs_skipped_counts_per_source(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    items = [
+        _dated_item("alpha", "old-1", _NOW - timedelta(days=20)),
+        _dated_item("alpha", "old-2", _NOW - timedelta(days=30)),
+        _dated_item("beta", "old-3", _NOW - timedelta(days=40)),
+        _dated_item("beta", "fresh", _NOW - timedelta(days=1)),
+    ]
+
+    with caplog.at_level(logging.INFO, logger="signalforge.ingest.base"):
+        kept = filter_by_age(items, max_age_days=7, now=_NOW)
+
+    assert [item.title for item in kept] == ["fresh"]
+    skip_records = [
+        record
+        for record in caplog.records
+        if record.getMessage() == "skipped items older than the ingest freshness window"
+    ]
+    counts = {record.source_id: record.skipped_too_old for record in skip_records}  # type: ignore[attr-defined]
+    assert counts == {"alpha": 2, "beta": 1}
+    assert all(record.max_item_age_days == 7 for record in skip_records)  # type: ignore[attr-defined]

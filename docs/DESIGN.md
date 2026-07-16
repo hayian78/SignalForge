@@ -366,6 +366,7 @@ defaults:
   fetch_timeout: 20
   min_hn_points: 80
   max_summary_chars: 4000   # triage cost ceiling — see §8
+  max_item_age_days: 7      # ingest freshness window: first runs / new sources never backfill history
 
 rss:
   - id: simonwillison

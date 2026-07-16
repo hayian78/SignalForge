@@ -12,6 +12,12 @@ defaults:
   # on the monthly bill: ~1k tokens x ~150 items/day. Turn this first if spend
   # surprises you — see the month-to-date figure in `signalforge status`.
   max_summary_chars: 4000
+  # Ingest freshness window. A first run — or a newly added source — would
+  # otherwise backfill the feed's entire history (RSS archives, every GitHub
+  # release) into the pipeline and the triage bill; items published more than
+  # this many days ago are skipped before they reach the DB or triage. Items
+  # with no parseable published date are kept, not dropped.
+  max_item_age_days: 7
 
 # Blogs / personal sites — RSS via feedparser (Phase 0).
 # `weight` is a score multiplier for a trusted author; omit it for 1.0.

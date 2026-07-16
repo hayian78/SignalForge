@@ -50,6 +50,7 @@ SOURCES_YAML = textwrap.dedent("""
       fetch_timeout: 20
       min_hn_points: 80
       max_summary_chars: 4000
+      max_item_age_days: 7
 
     rss:
       - id: simonwillison
@@ -97,6 +98,7 @@ MINIMAL_SOURCES_YAML = textwrap.dedent("""
       fetch_timeout: 20
       min_hn_points: 80
       max_summary_chars: 4000
+      max_item_age_days: 7
 """)
 
 MINIMAL_INTERESTS_YAML = textwrap.dedent("""
@@ -134,6 +136,7 @@ def test_design_section_7_sources_yaml_parses(tmp_path: Path) -> None:
     assert config.defaults.fetch_timeout == 20
     assert config.defaults.min_hn_points == 80
     assert config.defaults.max_summary_chars == 4000
+    assert config.defaults.max_item_age_days == 7
     assert [source.id for source in config.rss] == ["simonwillison", "interconnects"]
     assert config.rss[0].weight == 1.3
     assert config.rss[1].weight == 1.0, "weight defaults to the identity element"
@@ -164,13 +167,20 @@ def test_sources_defaults_block_is_required(tmp_path: Path) -> None:
         load_sources(tmp_path)
 
 
-@pytest.mark.parametrize("knob", ["fetch_timeout", "min_hn_points", "max_summary_chars"])
+@pytest.mark.parametrize(
+    "knob", ["fetch_timeout", "min_hn_points", "max_summary_chars", "max_item_age_days"]
+)
 def test_omitting_a_source_default_is_an_error_not_a_silent_default(knob: str) -> None:
     # SourceDefaults has NO Python fallbacks: a tuning knob that silently
     # materializes in code is exactly NEVER rule 6. `max_summary_chars` is the
     # sharpest case — a Python default on the triage cost knob is a number that
     # sets the monthly bill while being invisible in the file the user tunes.
-    values = {"fetch_timeout": 20, "min_hn_points": 80, "max_summary_chars": 4000}
+    values = {
+        "fetch_timeout": 20,
+        "min_hn_points": 80,
+        "max_summary_chars": 4000,
+        "max_item_age_days": 7,
+    }
     del values[knob]
     with pytest.raises(ValueError, match=knob):
         SourceDefaults(**values)
@@ -182,9 +192,23 @@ def test_non_positive_max_summary_chars_is_rejected(tmp_path: Path, size: int) -
     # gutting scoring quality rather than failing loudly.
     write_sources(
         tmp_path,
-        f"defaults:\n  fetch_timeout: 20\n  min_hn_points: 80\n  max_summary_chars: {size}\n",
+        "defaults:\n  fetch_timeout: 20\n  min_hn_points: 80\n"
+        f"  max_summary_chars: {size}\n  max_item_age_days: 7\n",
     )
     with pytest.raises(ConfigError, match="max_summary_chars"):
+        load_sources(tmp_path)
+
+
+@pytest.mark.parametrize("days", [0, -1])
+def test_non_positive_max_item_age_days_is_rejected(tmp_path: Path, days: int) -> None:
+    # A zero-day window keeps only undated items — an ingest that silently
+    # drops everything fresh rather than failing loudly.
+    write_sources(
+        tmp_path,
+        "defaults:\n  fetch_timeout: 20\n  min_hn_points: 80\n"
+        f"  max_summary_chars: 4000\n  max_item_age_days: {days}\n",
+    )
+    with pytest.raises(ConfigError, match="max_item_age_days"):
         load_sources(tmp_path)
 
 
@@ -380,6 +404,7 @@ def test_shipped_sources_yaml_parses(repo_config_dir: Path) -> None:
 
     assert config.defaults.fetch_timeout > 0
     assert config.defaults.max_summary_chars > 0
+    assert config.defaults.max_item_age_days >= 1
     assert config.rss, "sources.yaml ships with no RSS feeds — Phase 0 has nothing to ingest"
     assert config.github is not None
     assert config.github.releases, "the github block ships with no repos to poll"

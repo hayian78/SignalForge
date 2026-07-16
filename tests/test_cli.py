@@ -117,6 +117,9 @@ def config_dir(tmp_path: Path) -> Path:
         "  fetch_timeout: 5\n"
         "  min_hn_points: 80\n"
         "  max_summary_chars: 4000\n"
+        # Huge on purpose: the inline feeds carry fixed dates, and a tight
+        # window would rot as they age. The filter has its own frozen-now tests.
+        "  max_item_age_days: 3650\n"
         "rss:\n"
         f"  - id: alpha\n    url: {FEED_A}\n"
         f"  - id: beta\n    url: {FEED_B}\n",

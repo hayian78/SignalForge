@@ -8,6 +8,7 @@ is a test failure, not a 6am cron surprise.
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -113,6 +114,54 @@ async def test_empty_config_ingests_nothing(cache_dir: Path) -> None:
     result = await ingest_all(make_sources_config(), cache_dir=cache_dir)
     assert result.items == []
     assert result.ok
+
+
+@respx.mock
+async def test_max_item_age_filters_stale_items_across_every_source(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`defaults.max_item_age_days` is applied once, where all three ingestors'
+    items converge — so a first run cannot backfill feed history into the DB or
+    the triage bill. `now` is frozen near the fixtures' capture dates; the
+    filter takes it as a parameter precisely so no test sleeps or depends on
+    the wall clock (CLAUDE.md §8).
+    """
+    monkeypatch.delenv("SIGNALFORGE_TEST_TOKEN", raising=False)
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(200, content=fixture_bytes("simonwillison_atom.xml"))
+    )
+    respx.get(url__startswith=RELEASES_URL).mock(
+        return_value=httpx.Response(200, text=fixture_text("github_releases.json"))
+    )
+    respx.get(HN_SEARCH_URL).mock(
+        return_value=httpx.Response(200, text=fixture_text("hn_front_page.json"))
+    )
+    config = make_sources_config(
+        defaults={
+            "fetch_timeout": 20,
+            "min_hn_points": 80,
+            "max_summary_chars": 4000,
+            "max_item_age_days": 7,
+        },
+        rss=[{"id": "example-blog", "url": FEED_URL}],
+        github={"token_env": "SIGNALFORGE_TEST_TOKEN", "releases": ["Aider-AI/aider"]},
+        hackernews={"keywords": ["mcp"]},
+    )
+    frozen_now = datetime(2026, 7, 16, tzinfo=UTC)
+
+    run = await ingest_all(config, cache_dir=cache_dir, now=frozen_now)
+
+    assert run.ok
+    # The 2026-07-02 release (v0.85.2) is outside the 7-day window and is the
+    # only dated fixture item that is; everything in-window survives, from all
+    # three source types.
+    urls = {item.url for item in run.items}
+    assert "https://github.com/Aider-AI/aider/releases/tag/v0.85.2" not in urls
+    assert "https://github.com/Aider-AI/aider/releases/tag/v0.86.0" in urls
+    assert {item.source_type.value for item in run.items} == {"rss", "github", "hn"}
+    # And nothing that survived is stale.
+    cutoff = datetime(2026, 7, 9, tzinfo=UTC)
+    assert all(item.published_at is None or item.published_at >= cutoff for item in run.items)
 
 
 # --------------------------------------------------------------------------- #

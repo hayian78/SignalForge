@@ -56,6 +56,13 @@ MAX_SUMMARY_CHARS = 4000
 `sources.yaml` value, but is deliberately a *test* constant: production reads it
 from config (NEVER rule 6), so nothing under `src/` may hardcode it."""
 
+MAX_ITEM_AGE_DAYS = 3650
+"""Test-side stand-in for `defaults.max_item_age_days`, deliberately huge —
+NOT the shipped value. The recorded fixtures carry real capture dates, so a
+window mirroring the shipped 7 days would make the suite rot as the fixtures
+age past it. Tests that exercise the age filter itself pass a tight window and
+a frozen `now` explicitly."""
+
 
 def make_sources_config(**overrides: object) -> SourcesConfig:
     """Build a valid `SourcesConfig` in memory (no YAML file involved)."""
@@ -64,6 +71,7 @@ def make_sources_config(**overrides: object) -> SourcesConfig:
             "fetch_timeout": 20,
             "min_hn_points": 80,
             "max_summary_chars": MAX_SUMMARY_CHARS,
+            "max_item_age_days": MAX_ITEM_AGE_DAYS,
         },
         "rss": [],
     }
