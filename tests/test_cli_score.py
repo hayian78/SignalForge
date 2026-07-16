@@ -55,7 +55,8 @@ def config_dir(tmp_path: Path) -> Path:
         "  topics: [crypto]\n"
         "  people: []\n"
         "  repos: []\n"
-        "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10}\n",
+        "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,"
+        " daily_max_items: 15}\n",
         encoding="utf-8",
     )
     return path

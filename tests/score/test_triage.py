@@ -24,7 +24,12 @@ from signalforge.score import score_unscored_items
 
 def make_interests(**overrides: object) -> InterestsConfig:
     data: dict[str, object] = {
-        "thresholds": {"weekly_min_signal": 3, "weekly_min_relevance": 3, "weekly_min_total": 10},
+        "thresholds": {
+            "weekly_min_signal": 3,
+            "weekly_min_relevance": 3,
+            "weekly_min_total": 10,
+            "daily_max_items": 15,
+        },
     }
     data.update(overrides)
     return InterestsConfig.model_validate(data)

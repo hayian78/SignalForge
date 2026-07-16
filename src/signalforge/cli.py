@@ -597,6 +597,9 @@ def score(
 
 @app.command()
 def digest(
+    config_dir: Annotated[
+        Path, typer.Option("--config-dir", help="Directory holding interests.yaml.")
+    ] = DEFAULT_CONFIG_DIR,
     db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
     vault_dir: Annotated[
         Path,
@@ -630,6 +633,9 @@ def digest(
     and writing one file is a single step with nothing to isolate, so the run
     is either `ok` or `failed`.
     """
+    # Only `thresholds.daily_max_items` is used here, but the digest reads it
+    # from validated config like every other tuning knob (CLAUDE.md §4).
+    interests = _load_interests_or_exit(config_dir)
     resolved_date = target_date.date() if target_date is not None else datetime.now(UTC).date()
 
     with connection(db) as conn:
@@ -638,7 +644,11 @@ def digest(
         status_value = "failed"
         item_count = 0
         try:
-            context = build_digest_context(conn, target_date=resolved_date)
+            context = build_digest_context(
+                conn,
+                target_date=resolved_date,
+                max_items=interests.thresholds.daily_max_items,
+            )
             item_count = len(context.items)
             rendered = render_digest(context)
 
@@ -715,7 +725,7 @@ def daily(
             max_concurrency=max_concurrency,
         ),
         lambda: score(config_dir=config_dir, db=db),
-        lambda: digest(db=db, vault_dir=vault_dir),
+        lambda: digest(config_dir=config_dir, db=db, vault_dir=vault_dir),
     )
     for step in steps:
         try:

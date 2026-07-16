@@ -2,6 +2,7 @@
 date: 2026-07-16
 tags: [signalforge, daily-digest]
 item_count: 2
+kept_count: 2
 ---
 
 # Daily Digest — 2026-07-16

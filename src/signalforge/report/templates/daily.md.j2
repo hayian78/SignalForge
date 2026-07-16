@@ -2,6 +2,7 @@
 date: {{ context.date.isoformat() }}
 tags: [signalforge, daily-digest]
 item_count: {{ context.items | length }}
+kept_count: {{ context.kept_count }}
 ---
 
 # Daily Digest — {{ context.date.isoformat() }}
@@ -23,7 +24,7 @@ checking with `signalforge status`.
 {% endif %}
 ---
 
-*{{ context.killed_count }} item(s) killed at triage · {{ context.scored_count }} scored today.*
+*{{ context.killed_count }} item(s) killed at triage{% if context.hidden_kept_count > 0 %} · {{ context.hidden_kept_count }} more kept item(s) beyond the daily cap{% endif %} · {{ context.scored_count }} scored today.*
 
 {% if context.source_failures %}
 **Source failures (last ingest run):**

@@ -88,7 +88,8 @@ DESIGN_INTERESTS_YAML = textwrap.dedent("""
       topics: [crypto, web3, model-release-hype]
       people: []
       repos: []
-    thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10}
+    thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,
+                 daily_max_items: 15}
 """)
 
 MINIMAL_SOURCES_YAML = textwrap.dedent("""
@@ -99,7 +100,8 @@ MINIMAL_SOURCES_YAML = textwrap.dedent("""
 """)
 
 MINIMAL_INTERESTS_YAML = textwrap.dedent("""
-    thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10}
+    thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,
+                 daily_max_items: 15}
 """)
 
 
@@ -290,6 +292,7 @@ def test_design_section_11_interests_yaml_parses(tmp_path: Path) -> None:
     assert config.thresholds.weekly_min_signal == 3
     assert config.thresholds.weekly_min_relevance == 3
     assert config.thresholds.weekly_min_total == 10
+    assert config.thresholds.daily_max_items == 15
 
 
 def test_thresholds_block_is_required(tmp_path: Path) -> None:
@@ -298,11 +301,19 @@ def test_thresholds_block_is_required(tmp_path: Path) -> None:
         load_interests(tmp_path)
 
 
-@pytest.mark.parametrize("knob", ["weekly_min_signal", "weekly_min_relevance", "weekly_min_total"])
+@pytest.mark.parametrize(
+    "knob",
+    ["weekly_min_signal", "weekly_min_relevance", "weekly_min_total", "daily_max_items"],
+)
 def test_omitting_a_threshold_is_an_error_not_a_silent_default(knob: str) -> None:
-    # Thresholds is the canonical NEVER rule 6 case: the weekly-brief gate must
-    # be readable in YAML, never a number hiding in Python.
-    values = {"weekly_min_signal": 3, "weekly_min_relevance": 3, "weekly_min_total": 10}
+    # Thresholds is the canonical NEVER rule 6 case: the weekly-brief gate and
+    # the daily cap must be readable in YAML, never a number hiding in Python.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
     del values[knob]
     with pytest.raises(ValueError, match=knob):
         Thresholds(**values)
@@ -317,12 +328,19 @@ def test_omitting_a_threshold_is_an_error_not_a_silent_default(knob: str) -> Non
         ("weekly_min_relevance", 6),
         ("weekly_min_total", 2),
         ("weekly_min_total", 16),
+        ("daily_max_items", 0),
     ],
 )
 def test_out_of_range_thresholds_are_rejected(field: str, value: int) -> None:
     # Scores are 1-5 on three dimensions (DESIGN §9); a threshold outside the
-    # reachable range is a gate that always or never opens.
-    values = {"weekly_min_signal": 3, "weekly_min_relevance": 3, "weekly_min_total": 10}
+    # reachable range is a gate that always or never opens. A zero-item daily
+    # cap is a digest that renders nothing, ever.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
     values[field] = value
     with pytest.raises(ValueError, match=field):
         Thresholds(**values)
@@ -393,6 +411,7 @@ def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
     assert 1 <= config.thresholds.weekly_min_signal <= 5
     assert 1 <= config.thresholds.weekly_min_relevance <= 5
     assert 3 <= config.thresholds.weekly_min_total <= 15
+    assert config.thresholds.daily_max_items >= 1
     assert config.priority_topics, "interests.yaml defines 'relevant to me' — it cannot be empty"
 
 

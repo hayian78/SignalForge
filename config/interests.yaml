@@ -51,7 +51,11 @@ ignore:
 # Weekly-brief inclusion gates (DESIGN §9):
 #   signal >= weekly_min_signal AND relevance >= weekly_min_relevance
 #   AND (signal + relevance + novelty) >= weekly_min_total
+#
+# daily_max_items caps the Daily Digest at the top-N ranked kept items
+# (DESIGN §13's 60-second read); the rest are counted in the footer.
 thresholds:
   weekly_min_signal: 3
   weekly_min_relevance: 3
   weekly_min_total: 10
+  daily_max_items: 15

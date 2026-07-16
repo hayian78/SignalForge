@@ -81,7 +81,8 @@ def config_dir(tmp_path: Path) -> Path:
         "  topics: [crypto]\n"
         "  people: []\n"
         "  repos: []\n"
-        "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10}\n",
+        "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,"
+        " daily_max_items: 15}\n",
         encoding="utf-8",
     )
     return path
@@ -136,9 +137,17 @@ def _score(config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch) -> 
     return _run("score", "--config-dir", str(config_dir), "--db", str(db_path))
 
 
-def _digest(db_path: Path, vault_dir: Path, target_date: str) -> Result:
+def _digest(config_dir: Path, db_path: Path, vault_dir: Path, target_date: str) -> Result:
     return _run(
-        "digest", "--db", str(db_path), "--vault-dir", str(vault_dir), "--date", target_date
+        "digest",
+        "--config-dir",
+        str(config_dir),
+        "--db",
+        str(db_path),
+        "--vault-dir",
+        str(vault_dir),
+        "--date",
+        target_date,
     )
 
 
@@ -159,7 +168,7 @@ def test_ingest_score_digest_chain_twice_is_fully_idempotent(
         scored_at = conn.execute("SELECT scored_at FROM scores WHERE item_id = 1").fetchone()[0]
     target_date = scored_at[:10]
 
-    digest_result = _digest(db_path, vault_dir, target_date)
+    digest_result = _digest(config_dir, db_path, vault_dir, target_date)
     assert digest_result.exit_code == 0
 
     digest_path = vault_dir / "daily" / f"{target_date}.md"
@@ -179,7 +188,7 @@ def test_ingest_score_digest_chain_twice_is_fully_idempotent(
     score_result_2 = _run("score", "--config-dir", str(config_dir), "--db", str(db_path))
     assert score_result_2.exit_code == 0
 
-    digest_result_2 = _digest(db_path, vault_dir, target_date)
+    digest_result_2 = _digest(config_dir, db_path, vault_dir, target_date)
     assert digest_result_2.exit_code == 0
     second_render = digest_path.read_text(encoding="utf-8")
 

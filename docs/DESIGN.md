@@ -501,7 +501,7 @@ ignore:
   topics: [crypto, web3, model-release-hype]
   people: []
   repos: []
-thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10}
+thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10, daily_max_items: 15}
 ```
 
 This file is injected (cached) into every scoring and synthesis prompt. It is the single place where "relevant to me" is defined — tuning the system means editing this file and marking items `useful`/`noise` via the CLI, never editing prompts.
@@ -544,7 +544,7 @@ All reports land in the vault, git-committed, with frontmatter for Obsidian quer
 
 | Report | Cadence / trigger | Contents | Phase |
 |---|---|---|---|
-| **Daily Digest** | cron 06:00 | 5–15 kept items: title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count | 0 |
+| **Daily Digest** | cron 06:00 | Top `daily_max_items` (default 15) ranked kept items: title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items beyond the cap. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
 | **Weekly Intelligence Brief** | Sunday 07:00 | *The product.* Lead: "The 3 things that mattered." Then clustered top items with synthesis + citations, impact-engine verdicts per project (P3), trend deltas (P2), watchlist changes, cost/ops footer | 1 |
 | **Monthly Trend Report** | 1st of month | Rising/falling topics vs 3-month baseline, new entrants, cluster arcs, "boring but steady" section | 2 |
 | **Technology Radar** | Monthly, regenerated | Adopt/Trial/Assess/Hold per tool, derived from impact verdict history | 3 |

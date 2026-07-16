@@ -91,6 +91,16 @@ class DigestContext:
     killed_count: int
     scored_count: int
     """Kept + killed for this date — the denominator the footer's count is against."""
+    hidden_kept_count: int
+    """Kept items ranked below the `daily_max_items` cap — counted in the
+    footer rather than rendered, so the digest stays a 60-second read
+    (DESIGN §13) without hiding that they exist."""
+
+    @property
+    def kept_count(self) -> int:
+        """Every kept item for the date — shown plus hidden. Derived here so
+        the template renders it rather than doing arithmetic in jinja."""
+        return len(self.items) + self.hidden_kept_count
 
 
 def _trim_reasoning(text: str, *, limit: int = _WHY_IT_MATTERS_MAX_CHARS) -> str:
@@ -148,8 +158,17 @@ def _source_failures(conn: sqlite3.Connection) -> tuple[SourceFailure, ...]:
     )
 
 
-def build_digest_context(conn: sqlite3.Connection, *, target_date: Date) -> DigestContext:
-    """Assemble everything `daily.md.j2` needs for `target_date`. No writes."""
+def build_digest_context(
+    conn: sqlite3.Connection, *, target_date: Date, max_items: int
+) -> DigestContext:
+    """Assemble everything `daily.md.j2` needs for `target_date`. No writes.
+
+    `max_items` is `thresholds.daily_max_items` from `interests.yaml`
+    (CLAUDE.md §4 — the cap is config, never a Python constant). The list from
+    `get_digest_items` is already ranked (total score desc, stable tie-break),
+    so truncating to the top N is deterministic: same date, same DB state,
+    same config ⇒ the same N items in the same order, every render.
+    """
     scored_date = target_date.isoformat()
     scored_items = get_digest_items(conn, scored_date=scored_date)
     lines = tuple(line for scored in scored_items if (line := _to_line(scored)) is not None)
@@ -157,10 +176,11 @@ def build_digest_context(conn: sqlite3.Connection, *, target_date: Date) -> Dige
 
     return DigestContext(
         date=target_date,
-        items=lines,
+        items=lines[:max_items],
         source_failures=_source_failures(conn),
         killed_count=killed_count,
         scored_count=len(scored_items) + killed_count,
+        hidden_kept_count=max(0, len(lines) - max_items),
     )
 
 
@@ -185,14 +205,16 @@ def digest_path(vault_dir: Path, *, target_date: Date) -> Path:
     return vault_dir / "daily" / f"{target_date.isoformat()}.md"
 
 
-def write_digest(conn: sqlite3.Connection, *, target_date: Date, vault_dir: Path) -> Path:
+def write_digest(
+    conn: sqlite3.Connection, *, target_date: Date, vault_dir: Path, max_items: int
+) -> Path:
     """Render and write `target_date`'s digest, overwriting any existing file.
 
     Idempotent by construction: same date, same query, same path, `write_text`
     replaces the file's contents rather than appending (CLAUDE.md §3, NEVER
     rule 4).
     """
-    context = build_digest_context(conn, target_date=target_date)
+    context = build_digest_context(conn, target_date=target_date, max_items=max_items)
     rendered = render_digest(context)
     path = digest_path(vault_dir, target_date=target_date)
     path.parent.mkdir(parents=True, exist_ok=True)

@@ -175,12 +175,22 @@ class IgnoreRules(_StrictModel):
 
 
 class Thresholds(_StrictModel):
-    """Weekly-brief inclusion gates (DESIGN §9). Required — thresholds are the
-    canonical example of what must never be hardcoded in Python."""
+    """Report tuning knobs: weekly-brief inclusion gates (DESIGN §9) and the
+    daily-digest cap (DESIGN §13). Required — thresholds are the canonical
+    example of what must never be hardcoded in Python."""
 
     weekly_min_signal: int = Field(ge=1, le=5)
     weekly_min_relevance: int = Field(ge=1, le=5)
     weekly_min_total: int = Field(ge=3, le=15)
+
+    daily_max_items: int = Field(
+        ge=1,
+        description=(
+            "Daily Digest cap: only the top-N ranked kept items render (DESIGN §13's \"5–15 "
+            'kept items… 60-second read"); the rest are counted in the footer. Deliberately '
+            "no upper bound — a single-user tunable, not a score-range gate."
+        ),
+    )
 
 
 class InterestsConfig(_StrictModel):

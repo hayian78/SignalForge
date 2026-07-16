@@ -37,6 +37,10 @@ GOLDEN_FIXTURE = REPO_ROOT / "fixtures" / "daily_digest_golden.md"
 TARGET_DATE = date(2026, 7, 16)
 SCORED_AT = "2026-07-16T06:05:00+00:00"
 
+MAX_ITEMS = 15
+"""Mirrors the shipped `thresholds.daily_max_items`. The cap itself is config
+(CLAUDE.md §4) — tests that exercise truncation pass a small value explicitly."""
+
 
 def _insert_score(
     conn: sqlite3.Connection,
@@ -93,7 +97,7 @@ def test_build_digest_context_orders_kept_items_by_total_score_desc(
     _insert_score(conn, low_id, signal=2, relevance=2, novelty=2)
     _insert_score(conn, high_id, signal=5, relevance=5, novelty=5)
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert [line.title for line in context.items] == ["High scorer", "Low scorer"]
 
@@ -110,7 +114,7 @@ def test_build_digest_context_excludes_killed_items_but_counts_them(
     _insert_score(conn, kept_id, triage="keep")
     _insert_score(conn, killed_id, triage="kill", signal=1, relevance=1, novelty=1)
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert [line.title for line in context.items] == ["Kept"]
     assert context.killed_count == 1
@@ -123,7 +127,7 @@ def test_build_digest_context_excludes_items_scored_on_a_different_date(
     item_id, _ = upsert_item(conn, make_item())
     _insert_score(conn, item_id, scored_at="2026-07-15T06:05:00+00:00")
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert context.items == ()
     assert context.killed_count == 0
@@ -133,7 +137,7 @@ def test_build_digest_context_excludes_items_scored_on_a_different_date(
 def test_build_digest_context_with_nothing_scored_is_empty_not_an_error(
     conn: sqlite3.Connection,
 ) -> None:
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert context == DigestContext(
         date=TARGET_DATE,
@@ -141,6 +145,7 @@ def test_build_digest_context_with_nothing_scored_is_empty_not_an_error(
         source_failures=(),
         killed_count=0,
         scored_count=0,
+        hidden_kept_count=0,
     )
 
 
@@ -150,7 +155,7 @@ def test_why_it_matters_is_the_stored_reasoning_verbatim_when_short(
     item_id, _ = upsert_item(conn, make_item())
     _insert_score(conn, item_id, reasoning="Short and clear reasoning.")
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert context.items[0].why_it_matters == "Short and clear reasoning."
 
@@ -160,7 +165,7 @@ def test_why_it_matters_is_trimmed_for_a_long_reasoning_string(conn: sqlite3.Con
     long_reasoning = "word " * 200
     _insert_score(conn, item_id, reasoning=long_reasoning)
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     line = context.items[0].why_it_matters
     assert len(line) < len(long_reasoning)
@@ -180,7 +185,7 @@ def test_source_failures_come_from_the_latest_ingest_run(conn: sqlite3.Connectio
         ],
     )
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert len(context.source_failures) == 1
     assert context.source_failures[0].source_id == "interconnects"
@@ -194,14 +199,99 @@ def test_run_level_errors_are_excluded_from_source_failures(conn: sqlite3.Connec
         [{"source_id": "*", "error_type": "RuntimeError", "message": "the network fell over"}],
     )
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     assert context.source_failures == ()
 
 
 def test_no_ingest_run_yet_means_no_source_failures(conn: sqlite3.Connection) -> None:
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
     assert context.source_failures == ()
+
+
+# --------------------------------------------------------------------------- #
+# The daily_max_items cap — DESIGN §13's "5–15 kept items… 60-second read"
+# --------------------------------------------------------------------------- #
+
+
+def _seed_ranked_items(conn: sqlite3.Connection, count: int) -> None:
+    """`count` kept items with strictly descending totals, so rank is unambiguous:
+    item-1 scores highest, item-`count` lowest."""
+    for rank in range(1, count + 1):
+        item_id, _ = upsert_item(
+            conn,
+            make_item(
+                external_id=f"ranked-{rank}",
+                url=f"https://example.com/ranked-{rank}",
+                title=f"Ranked item {rank}",
+            ),
+        )
+        score = 5 - (rank - 1)  # 5, 4, 3, … — total drops by 3 per rank.
+        _insert_score(conn, item_id, signal=score, relevance=score, novelty=score)
+
+
+def test_cap_truncates_to_the_top_n_and_counts_the_rest(conn: sqlite3.Connection) -> None:
+    _seed_ranked_items(conn, 5)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=3)
+
+    assert [line.title for line in context.items] == [
+        "Ranked item 1",
+        "Ranked item 2",
+        "Ranked item 3",
+    ]
+    assert context.hidden_kept_count == 2
+    # Kept-vs-killed semantics are untouched by the cap: all 5 were scored.
+    assert context.killed_count == 0
+    assert context.scored_count == 5
+
+
+def test_cap_leaves_a_short_day_alone(conn: sqlite3.Connection) -> None:
+    _seed_ranked_items(conn, 2)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=3)
+
+    assert len(context.items) == 2
+    assert context.hidden_kept_count == 0
+
+
+def test_cap_equal_to_kept_count_hides_nothing(conn: sqlite3.Connection) -> None:
+    _seed_ranked_items(conn, 3)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=3)
+
+    assert len(context.items) == 3
+    assert context.hidden_kept_count == 0
+
+
+def test_top_n_is_deterministic_across_re_renders(conn: sqlite3.Connection) -> None:
+    """Same date, same DB state, same cap ⇒ the same N items in the same order —
+    the cap must never turn re-rendering into a shuffle (CLAUDE.md §3)."""
+    _seed_ranked_items(conn, 5)
+
+    first = build_digest_context(conn, target_date=TARGET_DATE, max_items=3)
+    second = build_digest_context(conn, target_date=TARGET_DATE, max_items=3)
+
+    assert first == second
+    assert render_digest(first) == render_digest(second)
+
+
+def test_truncation_footer_line_renders_only_when_items_are_hidden(
+    conn: sqlite3.Connection,
+) -> None:
+    _seed_ranked_items(conn, 5)
+
+    capped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=3))
+    uncapped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=15))
+
+    assert "2 more kept item(s) beyond the daily cap" in capped
+    assert "item_count: 3" in capped
+    assert "kept_count: 5" in capped
+    assert "Ranked item 4" not in capped
+
+    assert "beyond the daily cap" not in uncapped
+    assert "item_count: 5" in uncapped
+    assert "kept_count: 5" in uncapped
 
 
 # --------------------------------------------------------------------------- #
@@ -339,7 +429,7 @@ def test_render_digest_matches_the_golden_fixture(conn: sqlite3.Connection) -> N
         ],
     )
 
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
     rendered = render_digest(context)
 
     expected = GOLDEN_FIXTURE.read_text(encoding="utf-8")
@@ -347,7 +437,7 @@ def test_render_digest_matches_the_golden_fixture(conn: sqlite3.Connection) -> N
 
 
 def test_render_digest_with_no_items_renders_sensibly(conn: sqlite3.Connection) -> None:
-    context = build_digest_context(conn, target_date=TARGET_DATE)
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
 
     rendered = render_digest(context)
 
@@ -365,7 +455,7 @@ def test_render_digest_with_no_items_renders_sensibly(conn: sqlite3.Connection) 
 def test_write_digest_creates_the_expected_path(conn: sqlite3.Connection, tmp_path: Path) -> None:
     vault_dir = tmp_path / "vault"
 
-    path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir)
+    path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir, max_items=MAX_ITEMS)
 
     assert path == vault_dir / "daily" / "2026-07-16.md"
     assert path.is_file()
@@ -378,11 +468,15 @@ def test_write_digest_twice_overwrites_rather_than_duplicating(
     item_id, _ = upsert_item(conn, make_item())
     _insert_score(conn, item_id)
 
-    first_path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir)
+    first_path = write_digest(
+        conn, target_date=TARGET_DATE, vault_dir=vault_dir, max_items=MAX_ITEMS
+    )
     first_content = first_path.read_text(encoding="utf-8")
 
     # A second run for the same date, DB state unchanged: byte-for-byte no-op.
-    second_path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir)
+    second_path = write_digest(
+        conn, target_date=TARGET_DATE, vault_dir=vault_dir, max_items=MAX_ITEMS
+    )
     second_content = second_path.read_text(encoding="utf-8")
 
     assert second_path == first_path
@@ -398,12 +492,12 @@ def test_write_digest_overwrite_reflects_updated_db_state(
     vault_dir = tmp_path / "vault"
     item_id, _ = upsert_item(conn, make_item(title="First title"))
     _insert_score(conn, item_id, reasoning="First reasoning.")
-    write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir)
+    write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir, max_items=MAX_ITEMS)
 
     conn.execute(
         "UPDATE scores SET reasoning = ? WHERE item_id = ?", ("Updated reasoning.", item_id)
     )
-    path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir)
+    path = write_digest(conn, target_date=TARGET_DATE, vault_dir=vault_dir, max_items=MAX_ITEMS)
 
     content = path.read_text(encoding="utf-8")
     assert "Updated reasoning." in content
