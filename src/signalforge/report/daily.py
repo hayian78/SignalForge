@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from collections import Counter
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date as Date
 from pathlib import Path
@@ -34,6 +36,7 @@ from pathlib import Path
 import jinja2
 
 from signalforge.db import DigestItem, count_killed_items, get_digest_items, get_latest_run
+from signalforge.models import SourceType
 
 __all__ = [
     "DigestContext",
@@ -42,6 +45,7 @@ __all__ = [
     "build_digest_context",
     "digest_path",
     "render_digest",
+    "select_digest_items",
     "write_digest",
 ]
 
@@ -92,9 +96,10 @@ class DigestContext:
     scored_count: int
     """Kept + killed for this date — the denominator the footer's count is against."""
     hidden_kept_count: int
-    """Kept items ranked below the `daily_max_items` cap — counted in the
-    footer rather than rendered, so the digest stays a 60-second read
-    (DESIGN §13) without hiding that they exist."""
+    """Kept items that did not render — below the `daily_max_items` cap, or
+    past their source's crowding limit. Counted in the footer rather than
+    rendered, so the digest stays a 60-second read (DESIGN §13) without hiding
+    that they exist."""
 
     @property
     def kept_count(self) -> int:
@@ -158,29 +163,106 @@ def _source_failures(conn: sqlite3.Connection) -> tuple[SourceFailure, ...]:
     )
 
 
+def select_digest_items(
+    scored_items: Sequence[DigestItem],
+    *,
+    max_items: int,
+    max_per_source: int | None = None,
+    max_per_github_repo: int | None = None,
+) -> list[DigestItem]:
+    """The ranked kept items that actually render, after crowding limits.
+
+    `scored_items` arrives already ranked (total score desc, `item.id`
+    tie-break). Both limits only ever *remove* candidates and never reorder
+    them, so each keeps the top-ranked slice within its group and the digest
+    stays a deterministic sub-sequence of the ranking: same rows, same config ⇒
+    the same items in the same order (CLAUDE.md §3).
+
+    Ranking — not recency — picks which of a repo's releases represents it.
+    Recency reads as the obvious rule and is a trap: prereleases and betas
+    publish *after* the stable release they follow, so "newest wins" hands the
+    slot to `3.3.0b1` and drops the `3.2.0` that earned the score. The ranking
+    already encodes which release is worth reading; defer to it.
+
+    For a `github` source, `source_id` *is* the watched repo (`external_id` is
+    `repo@tag`), so grouping releases by project needs no URL parsing and no
+    version-string comparison. `max_per_github_repo` is therefore just a
+    tighter `max_per_source` for release watches — a repo shipping four
+    versions in one window is not four times the news that one blog posting
+    four times is.
+    """
+
+    def limit_for(scored: DigestItem) -> int | None:
+        """The tightest limit that applies to `scored`, or None if unlimited.
+
+        A repo is also a source, so both knobs match a release — the tighter
+        one has to win, or `daily_max_per_github_repo: 1` under a looser
+        `daily_max_per_source: 2` would be a no-op.
+        """
+        applicable = [max_per_source]
+        if scored.item.source_type == SourceType.GITHUB:
+            applicable.append(max_per_github_repo)
+        limits = [limit for limit in applicable if limit is not None]
+        return min(limits) if limits else None
+
+    taken: Counter[str] = Counter()
+    selected: list[DigestItem] = []
+    for scored in scored_items:
+        limit = limit_for(scored)
+        if limit is not None and taken[scored.item.source_id] >= limit:
+            continue
+        taken[scored.item.source_id] += 1
+        selected.append(scored)
+        if len(selected) == max_items:
+            break
+
+    return selected
+
+
 def build_digest_context(
-    conn: sqlite3.Connection, *, target_date: Date, max_items: int
+    conn: sqlite3.Connection,
+    *,
+    target_date: Date,
+    max_items: int,
+    max_per_source: int | None = None,
+    max_per_github_repo: int | None = None,
 ) -> DigestContext:
     """Assemble everything `daily.md.j2` needs for `target_date`. No writes.
 
-    `max_items` is `thresholds.daily_max_items` from `interests.yaml`
-    (CLAUDE.md §4 — the cap is config, never a Python constant). The list from
-    `get_digest_items` is already ranked (total score desc, stable tie-break),
-    so truncating to the top N is deterministic: same date, same DB state,
-    same config ⇒ the same N items in the same order, every render.
+    Every limit here is `thresholds.*` from `interests.yaml` (CLAUDE.md §4 —
+    caps are config, never Python constants). The list from `get_digest_items`
+    is already ranked, and `select_digest_items` only filters it, so the result
+    is deterministic: same date, same DB state, same config ⇒ the same items in
+    the same order, every render.
+
+    `hidden_kept_count` counts every kept item that did not render — crowded
+    out of its source's slots as well as below the cap — so the footer's total
+    still reconciles with `kept_count` and no item is silently dropped
+    (CLAUDE.md §7).
+
+    Citability is settled before selection, not after: an uncitable item must
+    not take a slot only to be dropped at render (NEVER rule 7), which would
+    silently shorten the digest.
     """
     scored_date = target_date.isoformat()
     scored_items = get_digest_items(conn, scored_date=scored_date)
-    lines = tuple(line for scored in scored_items if (line := _to_line(scored)) is not None)
+    citable = [scored for scored in scored_items if _to_line(scored) is not None]
+    selected = select_digest_items(
+        citable,
+        max_items=max_items,
+        max_per_source=max_per_source,
+        max_per_github_repo=max_per_github_repo,
+    )
+    lines = tuple(line for scored in selected if (line := _to_line(scored)) is not None)
     killed_count = count_killed_items(conn, scored_date=scored_date)
 
     return DigestContext(
         date=target_date,
-        items=lines[:max_items],
+        items=lines,
         source_failures=_source_failures(conn),
         killed_count=killed_count,
         scored_count=len(scored_items) + killed_count,
-        hidden_kept_count=max(0, len(lines) - max_items),
+        hidden_kept_count=max(0, len(citable) - len(lines)),
     )
 
 
@@ -206,7 +288,13 @@ def digest_path(vault_dir: Path, *, target_date: Date) -> Path:
 
 
 def write_digest(
-    conn: sqlite3.Connection, *, target_date: Date, vault_dir: Path, max_items: int
+    conn: sqlite3.Connection,
+    *,
+    target_date: Date,
+    vault_dir: Path,
+    max_items: int,
+    max_per_source: int | None = None,
+    max_per_github_repo: int | None = None,
 ) -> Path:
     """Render and write `target_date`'s digest, overwriting any existing file.
 
@@ -214,7 +302,13 @@ def write_digest(
     replaces the file's contents rather than appending (CLAUDE.md §3, NEVER
     rule 4).
     """
-    context = build_digest_context(conn, target_date=target_date, max_items=max_items)
+    context = build_digest_context(
+        conn,
+        target_date=target_date,
+        max_items=max_items,
+        max_per_source=max_per_source,
+        max_per_github_repo=max_per_github_repo,
+    )
     rendered = render_digest(context)
     path = digest_path(vault_dir, target_date=target_date)
     path.parent.mkdir(parents=True, exist_ok=True)

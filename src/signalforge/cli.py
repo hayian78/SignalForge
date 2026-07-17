@@ -633,8 +633,8 @@ def digest(
     and writing one file is a single step with nothing to isolate, so the run
     is either `ok` or `failed`.
     """
-    # Only `thresholds.daily_max_items` is used here, but the digest reads it
-    # from validated config like every other tuning knob (CLAUDE.md §4).
+    # Only the `thresholds.daily_*` knobs are used here, but the digest reads
+    # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
     resolved_date = target_date.date() if target_date is not None else datetime.now(UTC).date()
 
@@ -648,6 +648,8 @@ def digest(
                 conn,
                 target_date=resolved_date,
                 max_items=interests.thresholds.daily_max_items,
+                max_per_source=interests.thresholds.daily_max_per_source,
+                max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
             )
             item_count = len(context.items)
             rendered = render_digest(context)

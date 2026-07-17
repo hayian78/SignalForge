@@ -437,6 +437,15 @@ def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
     assert 1 <= config.thresholds.weekly_min_relevance <= 5
     assert 3 <= config.thresholds.weekly_min_total <= 15
     assert config.thresholds.daily_max_items >= 1
+    # The crowding limits are what stop one prolific source (a link blog, a
+    # release watch shipping four versions) from sweeping the digest. They are
+    # optional in the model, so assert the shipped file actually sets them —
+    # deleting either key is a silent revert, not a failure.
+    assert config.thresholds.daily_max_per_source is not None
+    assert config.thresholds.daily_max_per_github_repo is not None
+    assert config.thresholds.daily_max_per_github_repo <= config.thresholds.daily_max_per_source, (
+        "the per-repo limit is the tighter of the two; above the per-source cap it is a no-op"
+    )
     assert config.priority_topics, "interests.yaml defines 'relevant to me' — it cannot be empty"
 
 
@@ -598,3 +607,33 @@ def test_plausible_env_var_names_are_accepted(tmp_path: Path) -> None:
 def test_secret_str_is_the_declared_type(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
     assert isinstance(get_secret("GITHUB_TOKEN"), SecretStr)
+
+
+@pytest.mark.parametrize("knob", ["daily_max_per_source", "daily_max_per_github_repo"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_crowding_limits_reject_meaningless_values(knob: str, bad: int) -> None:
+    # A limit of 0 would render an empty digest rather than "no limit" — the
+    # off switch is omitting the key, so the model must not accept a count
+    # that silently empties the report.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+        knob: bad,
+    }
+    with pytest.raises(ValueError, match=knob):
+        Thresholds(**values)
+
+
+@pytest.mark.parametrize("knob", ["daily_max_per_source", "daily_max_per_github_repo"])
+def test_crowding_limits_are_optional(knob: str) -> None:
+    # Unlike the four required thresholds, these default to "no limit" — an
+    # existing interests.yaml stays valid and behaves exactly as before.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
+    assert getattr(Thresholds(**values), knob) is None

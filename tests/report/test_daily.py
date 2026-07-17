@@ -284,12 +284,12 @@ def test_truncation_footer_line_renders_only_when_items_are_hidden(
     capped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=3))
     uncapped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=15))
 
-    assert "2 more kept item(s) beyond the daily cap" in capped
+    assert "2 more kept item(s) not shown" in capped
     assert "item_count: 3" in capped
     assert "kept_count: 5" in capped
     assert "Ranked item 4" not in capped
 
-    assert "beyond the daily cap" not in uncapped
+    assert "not shown" not in uncapped
     assert "item_count: 5" in uncapped
     assert "kept_count: 5" in uncapped
 
@@ -509,3 +509,260 @@ def test_digest_path_is_stable_for_a_given_date(tmp_path: Path) -> None:
     assert digest_path(vault_dir, target_date=TARGET_DATE) == digest_path(
         vault_dir, target_date=TARGET_DATE
     )
+
+
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Crowding limits — daily_max_per_source, daily_max_per_github_repo
+# --------------------------------------------------------------------------- #
+
+
+def _insert_release(
+    conn: sqlite3.Connection,
+    *,
+    repo: str,
+    tag: str,
+    published_at: datetime,
+    total: int = 15,
+) -> int:
+    """One GitHub release item + score. `source_id` is the repo, as the real
+    release-watch ingestor writes it."""
+    item_id, _ = upsert_item(
+        conn,
+        make_item(
+            source_id=repo,
+            source_type=SourceType.GITHUB,
+            external_id=f"{repo}@{tag}",
+            url=f"https://github.com/{repo}/releases/tag/{tag}",
+            title=f"{repo} {tag}",
+            published_at=published_at,
+        ),
+    )
+    per_dimension, remainder = divmod(total, 3)
+    _insert_score(
+        conn,
+        item_id,
+        signal=per_dimension + remainder,
+        relevance=per_dimension,
+        novelty=per_dimension,
+    )
+    return item_id
+
+
+def _insert_post(conn: sqlite3.Connection, *, slug: str, total: int = 12) -> int:
+    """One RSS post + score from the default `simonwillison` source."""
+    item_id, _ = upsert_item(
+        conn,
+        make_item(
+            external_id=slug,
+            url=f"https://simonwillison.net/2026/Jul/15/{slug}/",
+            title=f"Post {slug}",
+        ),
+    )
+    per_dimension, remainder = divmod(total, 3)
+    _insert_score(
+        conn,
+        item_id,
+        signal=per_dimension + remainder,
+        relevance=per_dimension,
+        novelty=per_dimension,
+    )
+    return item_id
+
+
+def test_github_repo_limit_collapses_a_version_pile_to_one(conn: sqlite3.Connection) -> None:
+    """Four versions of one library landing in one window is one piece of news,
+    not four — and must not eat four of the digest's slots."""
+    for tag, total in [("3.2.0", 15), ("3.1.1", 14), ("3.1.0", 14), ("3.0.4", 14)]:
+        _insert_release(
+            conn,
+            repo="stanfordnlp/dspy",
+            tag=tag,
+            published_at=datetime(2026, 4, 21, tzinfo=UTC),
+            total=total,
+        )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+    # The other three are still kept items — hidden, never silently dropped.
+    assert context.hidden_kept_count == 3
+    assert context.kept_count == 4
+
+
+def test_github_repo_limit_keeps_the_best_release_not_the_newest(
+    conn: sqlite3.Connection,
+) -> None:
+    """The regression this rule exists for: a prerelease publishes *after* the
+    stable release it follows, so picking by recency hands the slot to a beta
+    and drops the release that earned the score."""
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.2.0",
+        published_at=datetime(2026, 4, 21, tzinfo=UTC),
+        total=15,
+    )
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.3.0b1",
+        published_at=datetime(2026, 5, 28, tzinfo=UTC),
+        total=10,
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+
+
+def test_github_repo_limit_is_per_repo_not_across_repos(conn: sqlite3.Connection) -> None:
+    """Two repos each shipping a release are two separate pieces of news."""
+    _insert_release(
+        conn, repo="ollama/ollama", tag="v0.32.0", published_at=datetime(2026, 7, 14, tzinfo=UTC)
+    )
+    _insert_release(
+        conn, repo="stanfordnlp/dspy", tag="3.2.0", published_at=datetime(2026, 7, 15, tzinfo=UTC)
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert len(context.items) == 2
+
+
+def test_github_repo_limit_leaves_non_github_items_alone(conn: sqlite3.Connection) -> None:
+    """The rule is about release piles; two posts from one blog are both still
+    news. `daily_max_per_source` is what bounds those."""
+    for n in range(3):
+        _insert_post(conn, slug=f"post-{n}")
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert len(context.items) == 3
+
+
+def test_max_per_source_caps_a_prolific_source_and_promotes_the_tail(
+    conn: sqlite3.Connection,
+) -> None:
+    """The whole point: a link blog sweeping the top of the ranking must not
+    crowd out a lower-ranked item from a different source."""
+    for rank in range(3):
+        _insert_post(conn, slug=f"sw-{rank}", total=15)
+
+    other, _ = upsert_item(
+        conn,
+        make_item(
+            source_id="jxnl",
+            external_id="lessons",
+            url="https://jxnl.co/writing/lessons/",
+            title="Lessons from industry leaders",
+        ),
+    )
+    _insert_score(conn, other, signal=4, relevance=5, novelty=4)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15, max_per_source=2)
+
+    assert [line.title for line in context.items] == [
+        "Post sw-0",
+        "Post sw-1",
+        "Lessons from industry leaders",
+    ]
+    assert context.hidden_kept_count == 1
+
+
+def test_max_per_source_keeps_each_source_s_best(conn: sqlite3.Connection) -> None:
+    """The cap drops a source's *weakest* items — it takes the top slice of the
+    ranking within a source, never an arbitrary slice."""
+    for slug, total in [("weak", 9), ("best", 15), ("mid", 12)]:
+        _insert_post(conn, slug=slug, total=total)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15, max_per_source=2)
+
+    assert [line.title for line in context.items] == ["Post best", "Post mid"]
+
+
+def test_limits_are_off_by_default(conn: sqlite3.Connection) -> None:
+    """Absent config changes nothing — every kept item still renders."""
+    for rank in range(3):
+        _insert_post(conn, slug=f"sw-{rank}")
+    for tag in ["3.2.0", "3.1.1"]:
+        _insert_release(
+            conn, repo="stanfordnlp/dspy", tag=tag, published_at=datetime(2026, 4, 21, tzinfo=UTC)
+        )
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15)
+
+    assert len(context.items) == 5
+
+
+def test_github_repo_limit_wins_over_the_looser_per_source_limit(
+    conn: sqlite3.Connection,
+) -> None:
+    """A repo is also a source, so both limits match it. The tighter one must
+    decide — otherwise `daily_max_per_github_repo: 1` would be a no-op."""
+    for tag, total in [("3.2.0", 15), ("3.1.1", 14), ("3.1.0", 13)]:
+        _insert_release(
+            conn,
+            repo="stanfordnlp/dspy",
+            tag=tag,
+            published_at=datetime(2026, 4, 21, tzinfo=UTC),
+            total=total,
+        )
+
+    context = build_digest_context(
+        conn,
+        target_date=TARGET_DATE,
+        max_items=15,
+        max_per_source=2,
+        max_per_github_repo=1,
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+
+
+def test_limits_never_reorder_the_ranking(conn: sqlite3.Connection) -> None:
+    """Filtering must leave a sub-sequence of the ranking — a crowded-out item
+    must not promote a lower-ranked one above a higher-ranked one."""
+    _insert_post(conn, slug="sw-best", total=15)
+    _insert_post(conn, slug="sw-second", total=14)
+    _insert_post(conn, slug="sw-third", total=13)
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.2.0",
+        published_at=datetime(2026, 4, 21, tzinfo=UTC),
+        total=12,
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_source=2, max_per_github_repo=1
+    )
+
+    titles = [line.title for line in context.items]
+    assert titles == ["Post sw-best", "Post sw-second", "stanfordnlp/dspy 3.2.0"]
+
+
+def test_crowding_limits_are_deterministic_across_re_renders(conn: sqlite3.Connection) -> None:
+    """Filtering must never turn re-rendering into a shuffle (CLAUDE.md §3)."""
+    for rank in range(4):
+        _insert_post(conn, slug=f"sw-{rank}")
+    _insert_release(
+        conn, repo="stanfordnlp/dspy", tag="3.2.0", published_at=datetime(2026, 4, 21, tzinfo=UTC)
+    )
+
+    kwargs = {"max_items": 15, "max_per_source": 2, "max_per_github_repo": 1}
+    first = build_digest_context(conn, target_date=TARGET_DATE, **kwargs)  # type: ignore[arg-type]
+    second = build_digest_context(conn, target_date=TARGET_DATE, **kwargs)  # type: ignore[arg-type]
+
+    assert first == second
+    assert render_digest(first) == render_digest(second)

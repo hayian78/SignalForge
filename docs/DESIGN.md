@@ -503,7 +503,9 @@ ignore:
   topics: [crypto, web3, model-release-hype]
   people: []
   repos: []
-thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10, daily_max_items: 15}
+thresholds:
+  {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10, daily_max_items: 15,
+   daily_max_per_source: 2, daily_max_per_github_repo: 1}
 ```
 
 This file is injected (cached) into every scoring and synthesis prompt. It is the single place where "relevant to me" is defined — tuning the system means editing this file and marking items `useful`/`noise` via the CLI, never editing prompts.
@@ -560,7 +562,7 @@ All reports land in the vault, git-committed, with frontmatter for Obsidian quer
 
 | Report | Cadence / trigger | Contents | Phase |
 |---|---|---|---|
-| **Daily Digest** | cron 06:00 | Top `daily_max_items` (default 15) ranked kept items: title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items beyond the cap. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
+| **Daily Digest** | cron 06:00 | Top `daily_max_items` (default 15) kept items after crowding limits (below): title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items not shown. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
 | **Weekly Intelligence Brief** | Sunday 07:00 | *The product.* Lead: "The 3 things that mattered." Then clustered top items with synthesis + citations, impact-engine verdicts per project (P3), trend deltas (P2), watchlist changes, cost/ops footer | 1 |
 | **Monthly Trend Report** | 1st of month | Rising/falling topics vs 3-month baseline, new entrants, cluster arcs, "boring but steady" section | 2 |
 | **Technology Radar** | Monthly, regenerated | Adopt/Trial/Assess/Hold per tool, derived from impact verdict history | 3 |
@@ -568,6 +570,40 @@ All reports land in the vault, git-committed, with frontmatter for Obsidian quer
 | **Watchlists (repos, people)** | Continuous, updated weekly | Per-repo: release cadence, star velocity, notable issues. Per-person: recent output + hit rate | 2 |
 | **Projects Worth Building / Ideas Worth Ignoring** | Section in monthly report | Gaps the trend data exposes; hype the data deflated | 2–3 |
 | **Quarterly Architecture Review** | Manual ritual | *Not generated.* You, the vault, and an afternoon. The system's job is making that afternoon possible | — |
+
+### Crowding limits (Phase 0)
+
+Rank alone lets *volume* beat *merit*. Score is per-item, so a source that
+emits N items about one thing gets N shots at the top of the ranking: a
+release watch that backfills four versions of a library, or a link blog that
+posts five times, sweeps the digest while genuinely different items sit just
+under the cap. The first digests to hit this spent 8 of 15 slots that way.
+
+Two limits therefore run over the ranked kept items *before* `daily_max_items`
+(all deterministic Python — §8; nothing here is a judgment call):
+
+| Knob | Rule |
+|---|---|
+| `daily_max_per_source` | At most N items from any one `sources.yaml` source. |
+| `daily_max_per_github_repo` | A tighter cap for release watches — for a `github` source, `source_id` *is* the repo, so this needs no URL parsing or version comparison. Where both apply, the tighter wins. |
+
+Two properties they must keep:
+
+- **Best, not newest.** Each limit keeps the top-*ranked* slice within its
+  group. Recency is the tempting rule and it is wrong: prereleases publish
+  *after* the stable release they follow, so "newest wins" hands the slot to
+  `dspy 3.3.0b1` and evicts the `3.2.0` that actually scored. The ranking
+  already encodes which item is worth reading.
+- **Filter, never reorder.** The rendered list stays a sub-sequence of the
+  ranking, so the digest remains a pure function of `(date, db state, config)`
+  and re-renders byte-identically (principle 6). Crowded-out items are still
+  counted in the footer's not-shown total — they are hidden, never silently
+  dropped.
+
+These bound *presentation*, not relevance: a crowded-out item is still kept,
+still scored, still eligible for the weekly brief. They are also not a
+substitute for the ingest-side freshness window (`max_item_age_days`), which
+is what stops a newly-added source backfilling its history into one digest.
 
 ---
 

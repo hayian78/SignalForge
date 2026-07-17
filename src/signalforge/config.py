@@ -201,6 +201,28 @@ class Thresholds(_StrictModel):
         ),
     )
 
+    daily_max_per_source: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Crowding cap: at most N items from any one `sources.yaml` source may occupy "
+            "the digest's `daily_max_items` slots. One prolific source (a link blog, a "
+            "busy release watch) otherwise wins slots on volume rather than merit, "
+            "crowding out the rest of the ranking. None disables the cap."
+        ),
+    )
+
+    daily_max_per_github_repo: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "A tighter `daily_max_per_source` for release watches: at most N releases "
+            "per repo (highest-ranked, not newest — a prerelease publishes after the "
+            "stable release it follows). A repo shipping four versions in one window is "
+            "one piece of news. None falls back to `daily_max_per_source`."
+        ),
+    )
+
 
 class InterestsConfig(_StrictModel):
     """Root model for `interests.yaml` — the single definition of "relevant to me".

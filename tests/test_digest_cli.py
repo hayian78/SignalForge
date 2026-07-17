@@ -248,7 +248,7 @@ def test_digest_reads_the_cap_from_interests_yaml(
     content = (vault_dir / "daily" / "2026-07-16.md").read_text(encoding="utf-8")
     assert "item_count: 1" in content
     assert "kept_count: 2" in content
-    assert "1 more kept item(s) beyond the daily cap" in content
+    assert "1 more kept item(s) not shown" in content
 
 
 def test_digest_exits_2_on_a_missing_interests_config(
