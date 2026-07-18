@@ -643,18 +643,29 @@ is what stops a newly-added source backfilling its history into one digest.
 
 ### Phase 0 — Prove the loop (1–2 weekends) → *MVP seed*
 RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triage → daily digest in the vault, via cron.
+**Status — built, gate not yet met** (progress log: [`CHANGELOG.md`](../CHANGELOG.md)):
+- [x] Ingest (RSS + GitHub releases + HN) → SQLite, per-source isolation, conditional GET
+- [x] Normalize + exact dedup, idempotent upserts
+- [x] Batched Haiku triage + 3-dimension scoring on titles + summaries only
+- [x] Daily digest → vault, with per-source / per-repo crowding limits
+- [x] Timezone-aware day boundary (UTC storage, configurable reader locale)
+- [ ] Cron installed (06:00 daily); read 5 mornings straight and it saved time; live double-run = zero duplicates
+
 **Acceptance:** you read it 5 mornings straight and it saved time; a double-run produces zero duplicates. If the digest isn't worth reading, fix that before adding anything.
 **Local-day boundary (resolved).** Storage and every timestamp are UTC; the reader-facing calendar day is resolved through one configurable IANA timezone in `config/settings.yaml` (`SettingsConfig`, defaulting to `UTC` — §4, config not code). The daily digest computes "today" as `datetime.now(tz).date()`, and `report/daily.py::utc_day_window` converts that local date to the half-open UTC range `[local-midnight, next-local-midnight)` actually queried against `scored_at` (built from the two adjacent local midnights, so a DST-shortened/lengthened day stays exactly one calendar day). This is what lets a `score` and a `digest` run that straddle UTC midnight still agree on which day the work belongs to — the failure mode that gave a UTC+10 operator an empty digest while the items hid under the prior UTC date. `settings.yaml` is its own file because a timezone is neither a relevance rule (`interests.yaml`) nor a source (`sources.yaml`): it is who and where the operator is, and it is the seam that makes the tool portable to any locale. Scope is deliberately narrow: only the reader-facing digest day is localized. The `status` command's month-to-date token bucket (the $30 alarm) stays UTC — durations and freshness are timezone-invariant, and only the cost-month's first/last day would differ; keeping ops in UTC avoids a second, subtly different notion of "month" for a marginal readout.
 
 ### Phase 1 — MVP: the weekly question (4–6 more weekends)
+**Status — not started** (gated on Phase 0's acceptance).
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml`; arXiv + awesome-list diffing; 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands.
 **Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated `useful`.
 
 ### Phase 2 — Intelligence layer (months 3–5) → *V2*
+**Status — not started.**
 Local embeddings + `sqlite-vec`; semantic dedup + weekly clustering; **signal strength** — the count of distinct independent sources corroborating a cluster within a time window, a deterministic ranking input alongside the three LLM dimensions (one blog post is weak; the same idea in a release + a blog + a paper + an HN thread the same week is strong); novelty-by-distance; trend detection + monthly report, including per-source yield stats (items kept / promoted / marked useful per source — the pruning data for risk 6); watchlists; GitHub star-velocity + issues; Reddit weekly consensus; **feedback adaptation** — monthly shrinkage-smoothed useful/noise stats per source/topic, proposed capped tuning nudges in the monthly report, and rotating feedback exemplars in the scoring prompt (§11 "Closing the feedback loop").
 **Gate:** only starts once Phase 1 briefs are being read every week.
 
 ### Phase 3 — Decision support (months 5–9) → *V2 complete*
+**Status — not started.**
 Architecture Impact Engine (`projects/*.md`, Ignore/Watch/Prototype/Adopt); knowledge extraction into atomic insight notes; **MCP server** exposing search over items/insights/verdicts to Claude Code; YouTube transcripts; newsletter inbox; radars.
 
 ### V3 vision — Research Analyst (month 9+, only if V2 has earned it)
