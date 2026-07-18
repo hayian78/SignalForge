@@ -3,11 +3,14 @@
 Phase 0 surface, and deliberately no more (NEVER rule 15):
 
 * `ingest` — fetch every configured source, persist the items, close a `runs` row.
+* `score` — triage/score unscored items via `score/` (DESIGN §8).
+* `digest` — assemble the day's markdown digest from scored items (DESIGN §13).
+* `daily` — `ingest` → `score` → `digest` in sequence, the cron entry (DESIGN §14).
 * `status` — last-run health, per-source freshness, month-to-date token spend
   (DESIGN §14).
 
-`score`, digests, and anything LLM-shaped are the *next* increment. This module
-must never import `llm.py`.
+LLM work stays behind the `score/` boundary: this module drives the pipeline but
+must never import `llm.py` directly (NEVER rule 1 — `anthropic` lives in `llm.py`).
 
 ### Why the persist loop is grouped by source
 
@@ -73,7 +76,7 @@ from signalforge.models import Item
 from signalforge.report.daily import build_digest_context, digest_path, render_digest
 from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "digest", "ingest", "score", "status"]
+__all__ = ["app", "daily", "digest", "ingest", "score", "status"]
 
 logger = logging.getLogger(__name__)
 
@@ -749,10 +752,13 @@ def daily(
             step()
         except typer.Exit as exc:
             worst_exit = max(worst_exit, exc.exit_code)
-        except BaseException:
+        except Exception:
             # A step already recorded its own `runs` row and re-raised
             # (CLAUDE.md §3 — no silent runs); `daily` isolates steps from
-            # each other the same way `ingest` isolates sources.
+            # each other the same way `ingest` isolates sources. Only `Exception`
+            # is caught, never `BaseException`: a KeyboardInterrupt/SystemExit
+            # must abort the whole `daily` run, not be downgraded to exit 1 and
+            # let the next step start — a human hitting Ctrl-C means stop.
             worst_exit = max(worst_exit, 1)
 
     if worst_exit:

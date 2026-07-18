@@ -23,7 +23,6 @@ from pydantic import SecretStr
 from signalforge.config import (
     SETTINGS_FILENAME,
     ConfigError,
-    Secrets,
     SettingsConfig,
     SourceDefaults,
     Thresholds,
@@ -428,7 +427,9 @@ def test_shipped_sources_yaml_names_env_vars_not_tokens(repo_config_dir: Path) -
     config = load_sources(repo_config_dir)
     assert config.github is not None
     assert config.github.token_env == config.github.token_env.upper()
-    assert not config.github.token_env.lower().startswith(("ghp", "github_pat"))
+    assert not config.github.token_env.lower().startswith(
+        ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+    )
 
 
 def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
@@ -543,31 +544,6 @@ def test_secret_is_not_stringified_by_repr_or_str(monkeypatch: pytest.MonkeyPatc
     assert "ghp_realtokenvalue" not in str(secret)
 
 
-def test_secrets_model_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-
-    assert secrets.github_token is not None
-    assert secrets.github_token.get_secret_value() == "ghp_x"
-    assert secrets.anthropic_api_key is not None
-    assert secrets.anthropic_api_key.get_secret_value() == "sk-ant-x"
-
-
-def test_secrets_default_to_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-    assert (secrets.github_token, secrets.anthropic_api_key) == (None, None)
-
-
-def test_secrets_repr_does_not_leak_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-supersecret")
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-    assert "sk-ant-supersecret" not in repr(secrets)
-    assert "sk-ant-supersecret" not in str(secrets.model_dump())
-
-
 def test_secrets_are_not_settable_from_yaml(tmp_path: Path) -> None:
     # A token in git-tracked YAML is the leak NEVER rule 16 exists to prevent.
     # SourcesConfig has no field to receive one, so extra="forbid" rejects it.
@@ -605,6 +581,30 @@ def test_plausible_env_var_names_are_accepted(tmp_path: Path) -> None:
     config = load_sources(tmp_path)
     assert config.github is not None
     assert config.github.token_env == "MY_GH_TOKEN_2"
+
+
+@pytest.mark.parametrize("name", ["GITHUB_PAT", "GITHUB_TOKEN", "GH_PAT", "MY_GITHUB_TOKEN"])
+def test_env_var_names_resembling_a_token_prefix_are_accepted(tmp_path: Path, name: str) -> None:
+    # The guard matches token SHAPES (`<prefix>_<body>`), not name prefixes, so
+    # `GITHUB_PAT` — a natural env-var NAME that lowercases to `github_pat` — must
+    # not be mistaken for a pasted `github_pat_<body>` token. Regression for the
+    # false-positive the old bare-prefix check produced. (A name that literally
+    # begins `ghp_`/`gho_` is still rejected — that shape is indistinguishable
+    # from a real token and no one names an env var that.)
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + f"github:\n  token_env: {name}\n")
+    config = load_sources(tmp_path)
+    assert config.github is not None
+    assert config.github.token_env == name
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["ghp_abc123", "gho_abc123", "ghu_abc123", "ghs_abc123", "ghr_abc123", "github_pat_11ABCDEF"],
+)
+def test_pasted_github_tokens_are_rejected(tmp_path: Path, token: str) -> None:
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + f"github:\n  token_env: {token}\n")
+    with pytest.raises(ConfigError, match="NAME of an environment variable"):
+        load_sources(tmp_path)
 
 
 def test_secret_str_is_the_declared_type(monkeypatch: pytest.MonkeyPatch) -> None:

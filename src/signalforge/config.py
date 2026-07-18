@@ -4,10 +4,10 @@ This module defines the *shape* of the configuration. Every value — source
 URLs, keyword lists, thresholds — lives in YAML. Adding a blog is a YAML edit,
 never a Python edit.
 
-Secrets never appear in YAML (CLAUDE.md §10 rule 16). They arrive from the
-environment via pydantic-settings, are held as `SecretStr`, and are never
-logged. `sources.yaml` names the *env var* to read (`token_env: GITHUB_TOKEN`),
-never the token itself.
+Secrets never appear in YAML (CLAUDE.md §10 rule 16). They are read from the
+environment (or `.env`) by `get_secret`, held as `SecretStr`, and never logged.
+`sources.yaml` names the *env var* to read (`token_env: GITHUB_TOKEN`), never
+the token itself.
 """
 
 from __future__ import annotations
@@ -21,7 +21,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
     "SETTINGS_FILENAME",
@@ -33,7 +32,6 @@ __all__ = [
     "IgnoreRules",
     "InterestsConfig",
     "RssSource",
-    "Secrets",
     "SettingsConfig",
     "SourceDefaults",
     "SourcesConfig",
@@ -105,6 +103,12 @@ class RssSource(_StrictModel):
     tuned threshold, so it is safe as a Python default."""
 
 
+_GITHUB_TOKEN_PREFIXES: Final = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+"""The `<prefix>_` forms GitHub tokens carry (classic PAT, OAuth, user/server,
+refresh, fine-grained). Matched against `token_env` to catch a pasted secret —
+the trailing underscore is deliberate so the env-var *name* `GITHUB_PAT` passes."""
+
+
 class GithubConfig(_StrictModel):
     """The `github:` block."""
 
@@ -132,9 +136,13 @@ class GithubConfig(_StrictModel):
         """`token_env` must name an env var, not carry a token.
 
         Guards the most likely config mistake: pasting a `ghp_...` PAT straight
-        into git-tracked YAML.
+        into git-tracked YAML. The check matches GitHub token *shapes* — the
+        `<prefix>_` form real tokens carry — not a bare name prefix, so the
+        legitimate env-var name `GITHUB_PAT` (which starts with `github_pat` but
+        is not `github_pat_<body>`) is accepted, while a pasted token is not.
         """
-        if not value.replace("_", "").isalnum() or value.lower().startswith(("ghp", "github_pat")):
+        lowered = value.lower()
+        if not value.replace("_", "").isalnum() or lowered.startswith(_GITHUB_TOKEN_PREFIXES):
             raise ValueError(
                 "token_env must be the NAME of an environment variable "
                 "(e.g. GITHUB_TOKEN), never a token value"
@@ -296,24 +304,6 @@ class SettingsConfig(_StrictModel):
 # --------------------------------------------------------------------------- #
 # Secrets — environment only, never YAML
 # --------------------------------------------------------------------------- #
-
-
-class Secrets(BaseSettings):
-    """API credentials, read from the environment / `.env`.
-
-    Held as `SecretStr` so an accidental log line or repr renders `**********`.
-    Never populated from a config file.
-    """
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
-    )
-
-    github_token: SecretStr | None = None
-    anthropic_api_key: SecretStr | None = None
 
 
 def get_secret(env_var: str) -> SecretStr | None:

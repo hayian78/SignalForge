@@ -71,3 +71,16 @@ def test_two_different_orderings_of_the_same_lists_render_identically() -> None:
 
 def test_rubric_version_is_a_non_empty_string() -> None:
     assert isinstance(RUBRIC_VERSION, str) and RUBRIC_VERSION
+
+
+def test_keep_rule_references_config_thresholds_not_hardcoded_numbers() -> None:
+    """The keep bar must name the `thresholds` keys, never inline the numbers —
+    otherwise tuning `interests.yaml` silently contradicts the prompt (CLAUDE.md
+    §4 / NEVER rule 6). Regression for the literals that used to live here."""
+    prompt = build_triage_system_prompt(make_interests())
+    assert "weekly_min_signal" in prompt
+    assert "weekly_min_relevance" in prompt
+    assert "weekly_min_total" in prompt
+    # The old hardcoded bar must not reappear in the instruction prose.
+    assert "signal >= 3" not in prompt
+    assert "(signal + relevance + novelty) >= 10" not in prompt
