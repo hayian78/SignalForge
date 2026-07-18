@@ -83,7 +83,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_DIR: Final = Path("config")
 DEFAULT_DB_PATH: Final = Path("data/signalforge.db")
 DEFAULT_CACHE_DIR: Final = Path("data/http_cache")
-DEFAULT_VAULT_DIR: Final = Path("vault")
+# The default vault location lives on `SettingsConfig.vault_dir` (config, not
+# code — CLAUDE.md §4), so both commands default the `--vault-dir` flag to None
+# and fall back to settings when it is not passed. No Python-side constant here.
 
 RUN_KIND_INGEST: Final = "ingest"
 RUN_KIND_SCORE: Final = "score"
@@ -615,9 +617,15 @@ def digest(
     ] = DEFAULT_CONFIG_DIR,
     db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
     vault_dir: Annotated[
-        Path,
-        typer.Option("--vault-dir", help="Obsidian vault root (digests land in <vault>/daily/)."),
-    ] = DEFAULT_VAULT_DIR,
+        Path | None,
+        typer.Option(
+            "--vault-dir",
+            help=(
+                "Vault root (digests land in <vault>/daily/). Overrides "
+                "settings.yaml `vault_dir`; unset falls back to it."
+            ),
+        ),
+    ] = None,
     target_date: Annotated[
         datetime | None,
         typer.Option(
@@ -649,7 +657,13 @@ def digest(
     # Only the `thresholds.daily_*` knobs are used here, but the digest reads
     # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
-    tz = _load_settings_or_exit(config_dir).tzinfo
+    settings = _load_settings_or_exit(config_dir)
+    tz = settings.tzinfo
+    # Precedence: an explicit --vault-dir wins; otherwise settings.yaml decides
+    # (which itself defaults to `vault/`). The flag default is None precisely so
+    # "not passed" (fall back to settings) is distinguishable from "passed the
+    # default value".
+    effective_vault_dir = vault_dir if vault_dir is not None else settings.vault_dir
     # "Today" and the digest's day boundary are the operator's local calendar
     # (settings.yaml), not UTC — storage stays UTC, presentation is local. An
     # explicit --date is already a local calendar date.
@@ -678,7 +692,7 @@ def digest(
                     f"[yellow]dry run[/yellow]: {item_count} item(s) would render; nothing written."
                 )
             else:
-                path = digest_path(vault_dir, target_date=resolved_date)
+                path = digest_path(effective_vault_dir, target_date=resolved_date)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(rendered, encoding="utf-8")
                 console.print(f"[green]digest written[/green]: {path} ({item_count} item(s)).")
@@ -714,7 +728,7 @@ def daily(
     config_dir: Annotated[Path, typer.Option("--config-dir")] = DEFAULT_CONFIG_DIR,
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
     cache_dir: Annotated[Path, typer.Option("--cache-dir")] = DEFAULT_CACHE_DIR,
-    vault_dir: Annotated[Path, typer.Option("--vault-dir")] = DEFAULT_VAULT_DIR,
+    vault_dir: Annotated[Path | None, typer.Option("--vault-dir")] = None,
     max_concurrency: Annotated[int, typer.Option("--max-concurrency", min=1)] = (
         DEFAULT_MAX_CONCURRENCY
     ),
