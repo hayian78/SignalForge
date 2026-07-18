@@ -1,0 +1,33 @@
+# Machine-local app & locale settings — validated by `SettingsConfig` in
+# src/signalforge/config.py. Not relevance (interests.yaml), not sources
+# (sources.yaml): this is who and where the operator is.
+#
+# This file is the COMMITTED TEMPLATE. Copy it to the real, gitignored file:
+#
+#     cp config/settings.yaml.example config/settings.yaml
+#
+# then edit your copy. The pipeline reads `config/settings.yaml`; if it is
+# absent every field falls back to the defaults shown here.
+
+# --- Timezone -------------------------------------------------------------
+# The pipeline stores and reasons in UTC everywhere. This zone resolves only
+# the reader-facing calendar day — which date a daily digest is "for", and
+# which scored items fall on it — so a run that crosses UTC midnight still
+# files its work under your local day, not the day before.
+#
+# IANA timezone name (tz database). Examples: UTC, America/New_York,
+# Europe/London, Australia/Sydney. Defaults to UTC if unset.
+timezone: UTC
+
+# --- Vault location -------------------------------------------------------
+# Directory the rendered reports are written to; the daily digest lands in
+# `<vault_dir>/daily/`. `~` and `$VARS` are expanded. A relative path resolves
+# against the working directory (for cron that is the repo, via the crontab
+# `cd`). Defaults to `vault/` inside the repo. The `--vault-dir` flag overrides
+# this. Leave it commented to keep digests in the repo.
+#
+# WSL writing to a Windows-side Obsidian vault (Obsidian on Windows, pipeline
+# in the Linux subsystem) looks like:
+#   vault_dir: /mnt/c/Users/<you>/Obsidian/SignalForge
+#
+# vault_dir: vault
