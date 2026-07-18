@@ -615,6 +615,7 @@ is what stops a newly-added source backfilling its history into one digest.
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.
 - Backups: the vault is git (push to a private remote); `signalforge.db` gets a nightly `sqlite3 .backup` copy; both configs are in the repo.
+- **Out-of-repo vault (`settings.yaml` `vault_dir`).** The output directory is configurable (e.g. a `/mnt/c` Windows Obsidian vault read from a WSL pipeline). When `vault_dir` points outside the repo, the vault has its own git story: the Phase 1 auto-commit in `report/writer.py` must target *that* directory's repo (or no-op cleanly when it isn't a repo), and the backup line above rides on the vault's actual location, not this repo. Decide this when `writer.py` is specced — it does not exist yet.
 
 ---
 

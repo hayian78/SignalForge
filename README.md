@@ -25,7 +25,7 @@ gated on the earlier ones being *used* — not merely built.
 - [x] `ANTHROPIC_API_KEY` configured
 
 **Remaining for the gate**
-- [ ] Cron installed (06:00 daily `signalforge daily`)
+- [x] Cron installed (06:00 daily `signalforge daily`)
 - [ ] Read the digest five mornings straight and it saved time
 - [ ] Live double-run produces zero duplicates
 
@@ -44,14 +44,20 @@ Progress is logged in [`CHANGELOG.md`](CHANGELOG.md); the full roadmap lives in
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
-uv sync                  # install dependencies
-cp .env.example .env     # then fill in your keys
+uv sync                                                # install dependencies
+cp .env.example .env                                   # then fill in your keys
+cp config/settings.yaml.example config/settings.yaml   # then set your timezone / vault path
 ```
 
 Secrets live in `.env` (never committed):
 
 - `ANTHROPIC_API_KEY` — triage and synthesis
 - `GITHUB_TOKEN` — raises the GitHub API limit to 5k req/hr
+
+Machine-local settings live in `config/settings.yaml` (also gitignored; the
+committed `config/settings.yaml.example` is the template): your `timezone`, and
+an optional `vault_dir` to write digests straight into an Obsidian vault — e.g.
+a WSL pipeline targeting a Windows vault at `/mnt/c/Users/<you>/Obsidian/...`.
 
 ## Usage
 
@@ -72,6 +78,7 @@ Python change.
 |---|---|
 | `config/sources.yaml` | What to ingest |
 | `config/interests.yaml` | Priorities, ignores, learning goals, scoring thresholds |
+| `config/settings.yaml` | Machine-local: timezone, vault output path (gitignored; see `.example`) |
 
 Tuning relevance means editing `interests.yaml` and marking items useful/noise — never editing
 prompts ad hoc.

@@ -668,6 +668,34 @@ def test_settings_rejects_an_unknown_zone_at_load(bad: str) -> None:
         SettingsConfig(timezone=bad)
 
 
+def test_settings_vault_dir_defaults_to_repo_vault() -> None:
+    # Unset → the historical location, so an existing install's digests keep
+    # landing in the repo's vault/ (CLAUDE.md §4 — the default lives in config).
+    assert SettingsConfig().vault_dir == Path("vault")
+
+
+def test_settings_vault_dir_expands_user_and_vars(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A committed example can carry a portable ~/... path and a real file a
+    # /mnt/c/... one, without an absolute home leaking into the repo.
+    monkeypatch.setenv("HOME", "/home/tester")
+    monkeypatch.setenv("OBSIDIAN", "/mnt/c/Users/tester/Obsidian")
+    # str is coerced to Path by pydantic after the before-validator expands it;
+    # the annotation is Path, so the deliberate str inputs are ignored for mypy.
+    expanded_home = SettingsConfig(vault_dir="~/Obsidian/SignalForge")  # type: ignore[arg-type]
+    assert expanded_home.vault_dir == Path("/home/tester/Obsidian/SignalForge")
+    expanded_var = SettingsConfig(vault_dir="$OBSIDIAN/SignalForge")  # type: ignore[arg-type]
+    assert expanded_var.vault_dir == Path("/mnt/c/Users/tester/Obsidian/SignalForge")
+
+
+def test_settings_vault_dir_rejects_unset_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An unset $VAR is left verbatim by expandvars; a nonsense path silently
+    # misfiling digests is the invisible-misconfig _StrictModel guards against —
+    # so it must raise at load, not defer to the first digest.
+    monkeypatch.delenv("DEFINITELY_UNSET_VAULT_VAR", raising=False)
+    with pytest.raises(ValueError, match="unexpanded environment variable"):
+        SettingsConfig(vault_dir="$DEFINITELY_UNSET_VAULT_VAR/vault")  # type: ignore[arg-type]
+
+
 def test_settings_rejects_unknown_keys() -> None:
     with pytest.raises(ValueError, match="locale"):
         SettingsConfig(locale="en_AU")  # type: ignore[call-arg]

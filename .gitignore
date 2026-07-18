@@ -3,6 +3,11 @@
 .env.*
 !.env.example
 
+# Local machine config — real file gitignored, example committed (mirrors the
+# .env / .env.example split above). Holds the operator's timezone and the
+# machine-specific vault path (e.g. a /mnt/c Windows Obsidian vault).
+config/settings.yaml
+
 # Data — regenerable plumbing (the vault is git-tracked; the DB is not)
 data/signalforge.db
 data/signalforge.db-*

@@ -278,6 +278,46 @@ class SettingsConfig(_StrictModel):
         ),
     )
 
+    vault_dir: Path = Field(
+        default=Path("vault"),
+        description=(
+            "Directory the rendered reports are written to (the daily digest lands "
+            "in `<vault_dir>/daily/`). `~` and `$VARS` are expanded, so a WSL "
+            "operator can point straight at a Windows-side Obsidian vault, e.g. "
+            "`/mnt/c/Users/<you>/Obsidian/SignalForge`. A relative path resolves "
+            "against the process working directory (for cron that is the repo, via "
+            "the `cd` in the crontab entry). Defaults to `vault/` inside the repo — "
+            "the historical location — and the `--vault-dir` flag overrides it."
+        ),
+    )
+
+    @field_validator("vault_dir", mode="before")
+    @classmethod
+    def _expand_vault_dir(cls, value: object) -> object:
+        """Expand `~` and `$VARS` before the value becomes a `Path`.
+
+        Runs `before` validation so a committed `settings.yaml.example` can carry
+        a portable `~/Obsidian/...` path and a real, gitignored `settings.yaml`
+        can carry a machine-specific `/mnt/c/...` one — neither leaking an
+        absolute home into the repo. Non-string/Path inputs pass through
+        untouched for pydantic to reject with its normal type error.
+
+        A `$VAR` that resolves to nothing is left verbatim by `expandvars`, which
+        would silently yield a nonsense path and file digests somewhere
+        surprising — the invisible-misconfig failure `_StrictModel` exists to
+        catch (same reasoning as the timezone validator). So a residual `$` after
+        expansion is rejected at load rather than deferred to the first digest.
+        """
+        if not isinstance(value, str | Path):
+            return value
+        expanded = os.path.expanduser(os.path.expandvars(os.fspath(value)))
+        if "$" in expanded:
+            raise ValueError(
+                f"vault_dir contains an unexpanded environment variable: {expanded!r}. "
+                "The referenced variable is unset — export it or use a literal path."
+            )
+        return expanded
+
     @field_validator("timezone")
     @classmethod
     def _validate_timezone(cls, value: str) -> str:
