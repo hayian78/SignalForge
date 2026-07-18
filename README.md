@@ -13,9 +13,24 @@ It answers **"what changed that matters to me"**, not "what happened".
 **Phase 0 — prove the loop.** RSS + GitHub releases + Hacker News → normalize → exact dedup →
 batched Haiku triage → daily digest in the vault, via cron.
 
-The Phase 0 acceptance gate (DESIGN §16): you read the digest five mornings straight and it saved
-you time, and a double-run produces zero duplicates. Later phases are gated on the earlier ones
-being *used* — not merely built.
+The pipeline is built; the phase is not *proven* until the acceptance gate is met. Later phases are
+gated on the earlier ones being *used* — not merely built.
+
+**Built**
+- [x] Ingest: RSS + GitHub releases + Hacker News → SQLite (per-source isolation, conditional GET)
+- [x] Normalize + exact dedup (idempotent upserts)
+- [x] Batched Haiku triage + 3-dimension scoring, on titles + summaries only
+- [x] Daily digest → Obsidian vault, with per-source / per-repo crowding limits
+- [x] Timezone-aware day boundary (UTC storage, configurable reader locale)
+- [x] `ANTHROPIC_API_KEY` configured
+
+**Remaining for the gate**
+- [ ] Cron installed (06:00 daily `signalforge daily`)
+- [ ] Read the digest five mornings straight and it saved time
+- [ ] Live double-run produces zero duplicates
+
+Progress is logged in [`CHANGELOG.md`](CHANGELOG.md); the full roadmap lives in
+[DESIGN §16](docs/DESIGN.md#16-roadmap).
 
 ## Documentation
 
