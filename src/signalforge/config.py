@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import dotenv_values
@@ -23,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, f
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
+    "SETTINGS_FILENAME",
     "SOURCES_FILENAME",
     "ArxivConfig",
     "ConfigError",
@@ -32,11 +34,13 @@ __all__ = [
     "InterestsConfig",
     "RssSource",
     "Secrets",
+    "SettingsConfig",
     "SourceDefaults",
     "SourcesConfig",
     "Thresholds",
     "get_secret",
     "load_interests",
+    "load_settings",
     "load_sources",
 ]
 
@@ -44,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 SOURCES_FILENAME: Final = "sources.yaml"
 INTERESTS_FILENAME: Final = "interests.yaml"
+SETTINGS_FILENAME: Final = "settings.yaml"
 
 
 class ConfigError(Exception):
@@ -240,6 +245,55 @@ class InterestsConfig(_StrictModel):
 
 
 # --------------------------------------------------------------------------- #
+# settings.yaml — app & locale (not relevance, not sources)
+# --------------------------------------------------------------------------- #
+
+
+class SettingsConfig(_StrictModel):
+    """Root model for `settings.yaml` — machine-local app and locale settings.
+
+    Deliberately separate from `interests.yaml` (relevance) and `sources.yaml`
+    (feeds): a timezone is neither what you care about nor where it comes from,
+    it is who and where the operator is. This is the file that makes the tool
+    portable — the pipeline stores and reasons in UTC everywhere, and *only*
+    the reader-facing day boundary is resolved through this zone.
+    """
+
+    timezone: str = Field(
+        default="UTC",
+        description=(
+            "IANA timezone name (e.g. 'Australia/Sydney', 'America/New_York', 'UTC') "
+            "used to resolve the reader's calendar day: which date a digest is 'for' "
+            "and which items fall on it. Storage stays UTC — this is presentation only. "
+            "Defaults to UTC so an operator who never sets it gets correct, if not "
+            "local, behaviour."
+        ),
+    )
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """Reject a name `zoneinfo` cannot resolve, at load time rather than at
+        the first digest. A typo'd zone silently falling back to UTC is exactly
+        the invisible-misconfiguration failure `_StrictModel` exists to prevent.
+        """
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"unknown IANA timezone {value!r}: {exc}. "
+                "Use a name from the tz database, e.g. 'Australia/Sydney' or 'UTC'."
+            ) from exc
+        return value
+
+    @property
+    def tzinfo(self) -> ZoneInfo:
+        """The validated zone as a `ZoneInfo`. Safe to construct — the validator
+        already proved it resolves."""
+        return ZoneInfo(self.timezone)
+
+
+# --------------------------------------------------------------------------- #
 # Secrets — environment only, never YAML
 # --------------------------------------------------------------------------- #
 
@@ -346,4 +400,27 @@ def load_interests(config_dir: Path) -> InterestsConfig:
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(path, exc)) from exc
     logger.debug("loaded interests config", extra={"path": str(path)})
+    return config
+
+
+def load_settings(config_dir: Path) -> SettingsConfig:
+    """Load and validate `<config_dir>/settings.yaml`, or default to UTC.
+
+    Unlike `sources.yaml`/`interests.yaml`, a *missing* settings file is not an
+    error: every field has a safe default (UTC), so an operator who never
+    creates one — or an existing install predating this file — gets correct
+    behaviour rather than a crash. A file that is *present* is still validated
+    strictly (unknown keys and bad zones raise `ConfigError`); only total
+    absence is tolerated.
+    """
+    path = config_dir / SETTINGS_FILENAME
+    if not path.is_file():
+        logger.debug("no settings.yaml; using defaults", extra={"path": str(path)})
+        return SettingsConfig()
+    data = _load_yaml_mapping(path)
+    try:
+        config = SettingsConfig.model_validate(data)
+    except ValidationError as exc:
+        raise ConfigError(_format_validation_error(path, exc)) from exc
+    logger.debug("loaded settings config", extra={"path": str(path), "timezone": config.timezone})
     return config

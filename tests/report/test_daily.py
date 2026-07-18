@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -27,6 +28,7 @@ from signalforge.report.daily import (
     build_digest_context,
     digest_path,
     render_digest,
+    utc_day_window,
     write_digest,
 )
 from tests.conftest import make_item
@@ -766,3 +768,116 @@ def test_crowding_limits_are_deterministic_across_re_renders(conn: sqlite3.Conne
 
     assert first == second
     assert render_digest(first) == render_digest(second)
+
+
+# --------------------------------------------------------------------------- #
+# Timezone — the reader's local day, resolved from a UTC store (settings.yaml)
+# --------------------------------------------------------------------------- #
+
+SYDNEY = ZoneInfo("Australia/Sydney")  # UTC+10, no DST in July
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def test_utc_day_window_utc_is_plain_midnights() -> None:
+    start, end = utc_day_window(date(2026, 7, 16), UTC)
+    assert start == "2026-07-16T00:00:00+00:00"
+    assert end == "2026-07-17T00:00:00+00:00"
+
+
+def test_utc_day_window_shifts_for_a_positive_offset_zone() -> None:
+    # Sydney is UTC+10, so local 2026-07-18 spans UTC 2026-07-17T14:00 .. 18T14:00.
+    start, end = utc_day_window(date(2026, 7, 18), SYDNEY)
+    assert start == "2026-07-17T14:00:00+00:00"
+    assert end == "2026-07-18T14:00:00+00:00"
+
+
+def test_utc_day_window_is_dst_correct_not_a_fixed_24h() -> None:
+    # US spring-forward: 2026-03-08 is a 23-hour day in New York. The window
+    # must be that real calendar day, not start+24h.
+    start, end = utc_day_window(date(2026, 3, 8), NEW_YORK)
+    span = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    assert span.total_seconds() == 23 * 3600
+
+
+def test_digest_day_uses_the_configured_zone_not_utc(conn: sqlite3.Connection) -> None:
+    """The actual 2026-07-18 bug: an item scored at 22:23 UTC on the 17th is
+    08:23 on the 18th in Sydney, so it belongs to the Sydney-local 18th digest —
+    exactly the day the old UTC logic left empty."""
+    item_id, _ = upsert_item(conn, make_item(external_id="late", title="Late-night item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T22:23:59+00:00")
+
+    on_the_18th = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    on_the_17th = build_digest_context(conn, target_date=date(2026, 7, 17), tz=SYDNEY, max_items=15)
+
+    assert [line.title for line in on_the_18th.items] == ["Late-night item"]
+    assert on_the_17th.items == ()
+
+
+def test_utc_default_preserves_the_old_calendar(conn: sqlite3.Connection) -> None:
+    """With no zone (tz defaults to UTC), the same item files under its UTC date —
+    proving the range query is backward compatible with the date-prefix logic."""
+    item_id, _ = upsert_item(conn, make_item(external_id="late", title="Late-night item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T22:23:59+00:00")
+
+    assert [
+        line.title
+        for line in build_digest_context(conn, target_date=date(2026, 7, 17), max_items=15).items
+    ] == ["Late-night item"]
+    assert build_digest_context(conn, target_date=date(2026, 7, 18), max_items=15).items == ()
+
+
+def test_local_midnight_belongs_to_the_new_day_not_the_old(conn: sqlite3.Connection) -> None:
+    """Half-open [start, end): an item at exactly local midnight is the first
+    item of the new day, never the last of the previous one."""
+    # Sydney midnight 2026-07-18T00:00+10:00 == 2026-07-17T14:00:00 UTC.
+    item_id, _ = upsert_item(conn, make_item(external_id="mid", title="Midnight item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T14:00:00+00:00")
+
+    assert (
+        build_digest_context(conn, target_date=date(2026, 7, 17), tz=SYDNEY, max_items=15).items
+        == ()
+    )
+    assert [
+        line.title
+        for line in build_digest_context(
+            conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15
+        ).items
+    ] == ["Midnight item"]
+
+
+def test_fractional_seconds_at_the_window_seam(conn: sqlite3.Connection) -> None:
+    """The whole range-comparison rests on lexical order matching time order at
+    the seam: stored values carry microseconds (`...SS.ffffff+00:00`) while the
+    bounds are whole-second (`...SS+00:00`), and `.` (0x2E) > `+` (0x2B) is what
+    keeps a sub-second-into-the-day item on the new day. Lock that ordering in —
+    a bound that regained fractional digits would break it silently."""
+    # Sydney 2026-07-18 starts at 2026-07-17T14:00:00 UTC (the `start` bound).
+    just_in, _ = upsert_item(
+        conn, make_item(external_id="in", url="https://example.com/in", title="Just inside")
+    )
+    _insert_score(conn, just_in, scored_at="2026-07-17T14:00:00.000001+00:00")
+    just_out, _ = upsert_item(
+        conn, make_item(external_id="out", url="https://example.com/out", title="Just outside")
+    )
+    _insert_score(conn, just_out, scored_at="2026-07-17T13:59:59.999999+00:00")
+
+    ctx = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    assert [line.title for line in ctx.items] == ["Just inside"]
+
+
+def test_killed_count_shares_the_digest_window(conn: sqlite3.Connection) -> None:
+    """The footer's killed count must use the same local-day window as the kept
+    items, or the counts stop reconciling across the UTC-midnight seam."""
+    kept, _ = upsert_item(
+        conn, make_item(external_id="k", url="https://example.com/kept", title="Kept")
+    )
+    _insert_score(conn, kept, scored_at="2026-07-17T22:00:00+00:00")
+    killed, _ = upsert_item(
+        conn, make_item(external_id="x", url="https://example.com/killed", title="Killed")
+    )
+    _insert_score(conn, killed, triage="kill", scored_at="2026-07-17T23:00:00+00:00")
+
+    ctx = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    assert ctx.killed_count == 1
+    assert ctx.kept_count == 1
+    assert ctx.scored_count == 2

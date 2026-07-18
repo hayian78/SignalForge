@@ -21,12 +21,15 @@ import pytest
 from pydantic import SecretStr
 
 from signalforge.config import (
+    SETTINGS_FILENAME,
     ConfigError,
     Secrets,
+    SettingsConfig,
     SourceDefaults,
     Thresholds,
     get_secret,
     load_interests,
+    load_settings,
     load_sources,
 )
 
@@ -637,3 +640,59 @@ def test_crowding_limits_are_optional(knob: str) -> None:
         "daily_max_items": 15,
     }
     assert getattr(Thresholds(**values), knob) is None
+
+
+# --------------------------------------------------------------------------- #
+# settings.yaml — app & locale (the timezone that resolves the reader's day)
+# --------------------------------------------------------------------------- #
+
+
+def test_settings_defaults_to_utc() -> None:
+    # UTC is the safe global default: an operator who never sets a zone gets
+    # correct (if not local) behaviour, not a crash.
+    settings = SettingsConfig()
+    assert settings.timezone == "UTC"
+    assert settings.tzinfo.key == "UTC"
+
+
+def test_settings_accepts_a_valid_iana_zone() -> None:
+    settings = SettingsConfig(timezone="Australia/Sydney")
+    assert settings.tzinfo.key == "Australia/Sydney"
+
+
+@pytest.mark.parametrize("bad", ["Mars/Phobos", "GMT+10", "Sydney", ""])
+def test_settings_rejects_an_unknown_zone_at_load(bad: str) -> None:
+    # A typo'd zone silently falling back to UTC is the invisible-config failure
+    # _StrictModel exists to prevent — it must raise, naming the field.
+    with pytest.raises(ValueError, match="timezone"):
+        SettingsConfig(timezone=bad)
+
+
+def test_settings_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="locale"):
+        SettingsConfig(locale="en_AU")  # type: ignore[call-arg]
+
+
+def test_load_settings_missing_file_is_not_an_error(tmp_path: Path) -> None:
+    # Unlike sources/interests, a wholly-absent settings.yaml is tolerated and
+    # yields UTC defaults — existing installs predating the file still run.
+    assert not (tmp_path / SETTINGS_FILENAME).exists()
+    assert load_settings(tmp_path).timezone == "UTC"
+
+
+def test_load_settings_present_file_is_validated_strictly(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text("timezone: Pluto/Nowhere\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="timezone"):
+        load_settings(tmp_path)
+
+
+def test_load_settings_reads_the_zone(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text("timezone: America/New_York\n", encoding="utf-8")
+    assert load_settings(tmp_path).tzinfo.key == "America/New_York"
+
+
+def test_shipped_settings_yaml_parses(repo_config_dir: Path) -> None:
+    # The shipped file must load and name a real zone — a broken settings.yaml
+    # would break every digest's day boundary.
+    settings = load_settings(repo_config_dir)
+    assert settings.tzinfo is not None

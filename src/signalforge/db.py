@@ -511,33 +511,44 @@ _SELECT_DIGEST_ITEMS = """
     FROM scores
     JOIN items ON items.id = scores.item_id
     WHERE scores.triage = 'keep'
-      AND substr(scores.scored_at, 1, 10) = ?
+      AND scores.scored_at >= ? AND scores.scored_at < ?
     ORDER BY (COALESCE(scores.signal, 0) + COALESCE(scores.relevance, 0)
               + COALESCE(scores.novelty, 0)) DESC,
              items.id ASC
 """
 
 
-def get_digest_items(conn: sqlite3.Connection, *, scored_date: str) -> list[DigestItem]:
-    """Kept items scored on `scored_date` (an ISO `YYYY-MM-DD` string), ranked.
+def get_digest_items(conn: sqlite3.Connection, *, start: str, end: str) -> list[DigestItem]:
+    """Kept items whose `scored_at` is in the half-open UTC range `[start, end)`, ranked.
 
-    Ranking is the sum of the three score dimensions, highest first, with
-    `item.id` as a stable tie-break so re-rendering the same date is
-    byte-for-byte identical (CLAUDE.md §3). "Scored on `scored_date`" — not
-    "since the last digest run" — is the deliberate boundary: it makes the
-    digest a pure function of `(scored_date, db state)`, so rendering the same
-    date twice always reads the same rows regardless of when you happen to run
-    it, which is what idempotent overwrite requires.
+    `start`/`end` are UTC ISO-8601 strings (`YYYY-MM-DDTHH:MM:SS+00:00`) marking
+    one reader-local calendar day converted to UTC — the caller
+    (`report/daily.py`) owns that conversion so this module stays timezone-
+    agnostic. Every `scored_at` is stored in the same UTC ISO format, so the
+    string comparison is chronological: lexical order equals time order when the
+    offset is always `+00:00`.
+
+    A range (not the old `substr(scored_at,1,10)` date-prefix match) is what lets
+    the digest's day track a non-UTC operator's calendar without re-storing any
+    timestamp locally. Ranking is the sum of the three dimensions, highest
+    first, with `item.id` as a stable tie-break, so rendering the same window
+    twice is byte-for-byte identical (CLAUDE.md §3): the digest is a pure
+    function of `(start, end, db state)`.
     """
-    rows = conn.execute(_SELECT_DIGEST_ITEMS, (scored_date,)).fetchall()
+    rows = conn.execute(_SELECT_DIGEST_ITEMS, (start, end)).fetchall()
     return [_row_to_digest_item(row) for row in rows]
 
 
-def count_killed_items(conn: sqlite3.Connection, *, scored_date: str) -> int:
-    """How many items were triaged `kill` on `scored_date` — the digest footer's count."""
+def count_killed_items(conn: sqlite3.Connection, *, start: str, end: str) -> int:
+    """How many items were triaged `kill` in the UTC range `[start, end)`.
+
+    Shares the digest's exact window (see `get_digest_items`) so the footer's
+    killed/kept/scored counts all reconcile against one calendar day.
+    """
     row = conn.execute(
-        "SELECT COUNT(*) AS n FROM scores WHERE triage = 'kill' AND substr(scored_at, 1, 10) = ?",
-        (scored_date,),
+        "SELECT COUNT(*) AS n FROM scores "
+        "WHERE triage = 'kill' AND scored_at >= ? AND scored_at < ?",
+        (start, end),
     ).fetchone()
     return int(row["n"])
 

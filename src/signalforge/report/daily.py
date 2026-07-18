@@ -9,11 +9,13 @@ calls an LLM and never regenerates a claim (CLAUDE.md §2, §5, NEVER rule 2).
 ### What "today" means
 
 A digest date is a pure input, not "now": `build_digest_context` asks for
-every kept item whose `scores.scored_at` falls on that calendar date. This is
-what makes rendering the same date idempotent (CLAUDE.md §3) — the query
-depends only on `(target_date, db state)`, never on when the command happens
-to run. The cron entry passes today's date; `--date` lets an operator
-re-render (or backfill) any day on demand.
+every kept item whose `scores.scored_at` falls on `target_date` — a calendar
+date in the operator's configured zone (`settings.yaml`), which
+`utc_day_window` converts to the UTC range actually queried. Storage is UTC
+throughout; only this boundary is local. That makes rendering idempotent
+(CLAUDE.md §3) — the query depends only on `(target_date, tz, db state)`, never
+on when the command runs. The cron entry passes today's local date; `--date`
+lets an operator re-render (or backfill) any day on demand.
 
 ### Citation discipline
 
@@ -30,6 +32,7 @@ import sqlite3
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime, time, timedelta, tzinfo
 from datetime import date as Date
 from pathlib import Path
 
@@ -46,6 +49,7 @@ __all__ = [
     "digest_path",
     "render_digest",
     "select_digest_items",
+    "utc_day_window",
     "write_digest",
 ]
 
@@ -219,21 +223,42 @@ def select_digest_items(
     return selected
 
 
+def utc_day_window(local_date: Date, tz: tzinfo) -> tuple[str, str]:
+    """The UTC ISO `[start, end)` bracketing `local_date` as one day in `tz`.
+
+    Built from the two adjacent local midnights, each converted to UTC — never
+    `start + 24h` — so a day shortened or lengthened by a DST transition is
+    still exactly one calendar day in `tz`, not a fixed 24-hour slab. With
+    `tz=UTC` this collapses to `[DT00:00:00+00:00, (D+1)T00:00:00+00:00)`, i.e.
+    the same rows the old date-prefix match selected (backward compatible).
+    """
+    start_local = datetime.combine(local_date, time.min, tzinfo=tz)
+    end_local = datetime.combine(local_date + timedelta(days=1), time.min, tzinfo=tz)
+    return start_local.astimezone(UTC).isoformat(), end_local.astimezone(UTC).isoformat()
+
+
 def build_digest_context(
     conn: sqlite3.Connection,
     *,
     target_date: Date,
+    tz: tzinfo = UTC,
     max_items: int,
     max_per_source: int | None = None,
     max_per_github_repo: int | None = None,
 ) -> DigestContext:
     """Assemble everything `daily.md.j2` needs for `target_date`. No writes.
 
+    `target_date` is a calendar date in `tz` (the operator's configured
+    `settings.yaml` zone), and `tz` converts it to the UTC window actually
+    queried — storage stays UTC, only the day boundary is local. `tz` defaults
+    to UTC so a caller that does not care about locale gets the historical
+    behaviour unchanged.
+
     Every limit here is `thresholds.*` from `interests.yaml` (CLAUDE.md §4 —
     caps are config, never Python constants). The list from `get_digest_items`
     is already ranked, and `select_digest_items` only filters it, so the result
-    is deterministic: same date, same DB state, same config ⇒ the same items in
-    the same order, every render.
+    is deterministic: same date, same zone, same DB state, same config ⇒ the
+    same items in the same order, every render.
 
     `hidden_kept_count` counts every kept item that did not render — crowded
     out of its source's slots as well as below the cap — so the footer's total
@@ -244,8 +269,8 @@ def build_digest_context(
     not take a slot only to be dropped at render (NEVER rule 7), which would
     silently shorten the digest.
     """
-    scored_date = target_date.isoformat()
-    scored_items = get_digest_items(conn, scored_date=scored_date)
+    start, end = utc_day_window(target_date, tz)
+    scored_items = get_digest_items(conn, start=start, end=end)
     citable = [scored for scored in scored_items if _to_line(scored) is not None]
     selected = select_digest_items(
         citable,
@@ -254,7 +279,7 @@ def build_digest_context(
         max_per_github_repo=max_per_github_repo,
     )
     lines = tuple(line for scored in selected if (line := _to_line(scored)) is not None)
-    killed_count = count_killed_items(conn, scored_date=scored_date)
+    killed_count = count_killed_items(conn, start=start, end=end)
 
     return DigestContext(
         date=target_date,
@@ -291,6 +316,7 @@ def write_digest(
     conn: sqlite3.Connection,
     *,
     target_date: Date,
+    tz: tzinfo = UTC,
     vault_dir: Path,
     max_items: int,
     max_per_source: int | None = None,
@@ -298,13 +324,14 @@ def write_digest(
 ) -> Path:
     """Render and write `target_date`'s digest, overwriting any existing file.
 
-    Idempotent by construction: same date, same query, same path, `write_text`
-    replaces the file's contents rather than appending (CLAUDE.md §3, NEVER
-    rule 4).
+    Idempotent by construction: same date, same zone, same query, same path,
+    `write_text` replaces the file's contents rather than appending
+    (CLAUDE.md §3, NEVER rule 4).
     """
     context = build_digest_context(
         conn,
         target_date=target_date,
+        tz=tz,
         max_items=max_items,
         max_per_source=max_per_source,
         max_per_github_repo=max_per_github_repo,

@@ -59,8 +59,10 @@ from rich.table import Table
 from signalforge.config import (
     ConfigError,
     InterestsConfig,
+    SettingsConfig,
     SourcesConfig,
     load_interests,
+    load_settings,
     load_sources,
 )
 from signalforge.db import connection, finish_run, start_run, upsert_item
@@ -149,6 +151,14 @@ def _load_sources_or_exit(config_dir: Path) -> SourcesConfig:
 def _load_interests_or_exit(config_dir: Path) -> InterestsConfig:
     try:
         return load_interests(config_dir)
+    except ConfigError as exc:
+        err_console.print(f"[red]config error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+
+def _load_settings_or_exit(config_dir: Path) -> SettingsConfig:
+    try:
+        return load_settings(config_dir)
     except ConfigError as exc:
         err_console.print(f"[red]config error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
@@ -636,7 +646,11 @@ def digest(
     # Only the `thresholds.daily_*` knobs are used here, but the digest reads
     # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
-    resolved_date = target_date.date() if target_date is not None else datetime.now(UTC).date()
+    tz = _load_settings_or_exit(config_dir).tzinfo
+    # "Today" and the digest's day boundary are the operator's local calendar
+    # (settings.yaml), not UTC — storage stays UTC, presentation is local. An
+    # explicit --date is already a local calendar date.
+    resolved_date = target_date.date() if target_date is not None else datetime.now(tz).date()
 
     with connection(db) as conn:
         run_id = start_run(conn, RUN_KIND_DIGEST, started_at=datetime.now(UTC))
@@ -647,6 +661,7 @@ def digest(
             context = build_digest_context(
                 conn,
                 target_date=resolved_date,
+                tz=tz,
                 max_items=interests.thresholds.daily_max_items,
                 max_per_source=interests.thresholds.daily_max_per_source,
                 max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
