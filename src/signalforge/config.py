@@ -4,10 +4,10 @@ This module defines the *shape* of the configuration. Every value — source
 URLs, keyword lists, thresholds — lives in YAML. Adding a blog is a YAML edit,
 never a Python edit.
 
-Secrets never appear in YAML (CLAUDE.md §10 rule 16). They arrive from the
-environment via pydantic-settings, are held as `SecretStr`, and are never
-logged. `sources.yaml` names the *env var* to read (`token_env: GITHUB_TOKEN`),
-never the token itself.
+Secrets never appear in YAML (CLAUDE.md §10 rule 16). They are read from the
+environment (or `.env`) by `get_secret`, held as `SecretStr`, and never logged.
+`sources.yaml` names the *env var* to read (`token_env: GITHUB_TOKEN`), never
+the token itself.
 """
 
 from __future__ import annotations
@@ -16,13 +16,14 @@ import logging
 import os
 from pathlib import Path
 from typing import Final
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = [
+    "SETTINGS_FILENAME",
     "SOURCES_FILENAME",
     "ArxivConfig",
     "ConfigError",
@@ -31,12 +32,13 @@ __all__ = [
     "IgnoreRules",
     "InterestsConfig",
     "RssSource",
-    "Secrets",
+    "SettingsConfig",
     "SourceDefaults",
     "SourcesConfig",
     "Thresholds",
     "get_secret",
     "load_interests",
+    "load_settings",
     "load_sources",
 ]
 
@@ -44,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 SOURCES_FILENAME: Final = "sources.yaml"
 INTERESTS_FILENAME: Final = "interests.yaml"
+SETTINGS_FILENAME: Final = "settings.yaml"
 
 
 class ConfigError(Exception):
@@ -100,6 +103,12 @@ class RssSource(_StrictModel):
     tuned threshold, so it is safe as a Python default."""
 
 
+_GITHUB_TOKEN_PREFIXES: Final = ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+"""The `<prefix>_` forms GitHub tokens carry (classic PAT, OAuth, user/server,
+refresh, fine-grained). Matched against `token_env` to catch a pasted secret —
+the trailing underscore is deliberate so the env-var *name* `GITHUB_PAT` passes."""
+
+
 class GithubConfig(_StrictModel):
     """The `github:` block."""
 
@@ -127,9 +136,13 @@ class GithubConfig(_StrictModel):
         """`token_env` must name an env var, not carry a token.
 
         Guards the most likely config mistake: pasting a `ghp_...` PAT straight
-        into git-tracked YAML.
+        into git-tracked YAML. The check matches GitHub token *shapes* — the
+        `<prefix>_` form real tokens carry — not a bare name prefix, so the
+        legitimate env-var name `GITHUB_PAT` (which starts with `github_pat` but
+        is not `github_pat_<body>`) is accepted, while a pasted token is not.
         """
-        if not value.replace("_", "").isalnum() or value.lower().startswith(("ghp", "github_pat")):
+        lowered = value.lower()
+        if not value.replace("_", "").isalnum() or lowered.startswith(_GITHUB_TOKEN_PREFIXES):
             raise ValueError(
                 "token_env must be the NAME of an environment variable "
                 "(e.g. GITHUB_TOKEN), never a token value"
@@ -201,6 +214,28 @@ class Thresholds(_StrictModel):
         ),
     )
 
+    daily_max_per_source: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Crowding cap: at most N items from any one `sources.yaml` source may occupy "
+            "the digest's `daily_max_items` slots. One prolific source (a link blog, a "
+            "busy release watch) otherwise wins slots on volume rather than merit, "
+            "crowding out the rest of the ranking. None disables the cap."
+        ),
+    )
+
+    daily_max_per_github_repo: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "A tighter `daily_max_per_source` for release watches: at most N releases "
+            "per repo (highest-ranked, not newest — a prerelease publishes after the "
+            "stable release it follows). A repo shipping four versions in one window is "
+            "one piece of news. None falls back to `daily_max_per_source`."
+        ),
+    )
+
 
 class InterestsConfig(_StrictModel):
     """Root model for `interests.yaml` — the single definition of "relevant to me".
@@ -218,26 +253,57 @@ class InterestsConfig(_StrictModel):
 
 
 # --------------------------------------------------------------------------- #
-# Secrets — environment only, never YAML
+# settings.yaml — app & locale (not relevance, not sources)
 # --------------------------------------------------------------------------- #
 
 
-class Secrets(BaseSettings):
-    """API credentials, read from the environment / `.env`.
+class SettingsConfig(_StrictModel):
+    """Root model for `settings.yaml` — machine-local app and locale settings.
 
-    Held as `SecretStr` so an accidental log line or repr renders `**********`.
-    Never populated from a config file.
+    Deliberately separate from `interests.yaml` (relevance) and `sources.yaml`
+    (feeds): a timezone is neither what you care about nor where it comes from,
+    it is who and where the operator is. This is the file that makes the tool
+    portable — the pipeline stores and reasons in UTC everywhere, and *only*
+    the reader-facing day boundary is resolved through this zone.
     """
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        case_sensitive=False,
+    timezone: str = Field(
+        default="UTC",
+        description=(
+            "IANA timezone name (e.g. 'Australia/Sydney', 'America/New_York', 'UTC') "
+            "used to resolve the reader's calendar day: which date a digest is 'for' "
+            "and which items fall on it. Storage stays UTC — this is presentation only. "
+            "Defaults to UTC so an operator who never sets it gets correct, if not "
+            "local, behaviour."
+        ),
     )
 
-    github_token: SecretStr | None = None
-    anthropic_api_key: SecretStr | None = None
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: str) -> str:
+        """Reject a name `zoneinfo` cannot resolve, at load time rather than at
+        the first digest. A typo'd zone silently falling back to UTC is exactly
+        the invisible-misconfiguration failure `_StrictModel` exists to prevent.
+        """
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            raise ValueError(
+                f"unknown IANA timezone {value!r}: {exc}. "
+                "Use a name from the tz database, e.g. 'Australia/Sydney' or 'UTC'."
+            ) from exc
+        return value
+
+    @property
+    def tzinfo(self) -> ZoneInfo:
+        """The validated zone as a `ZoneInfo`. Safe to construct — the validator
+        already proved it resolves."""
+        return ZoneInfo(self.timezone)
+
+
+# --------------------------------------------------------------------------- #
+# Secrets — environment only, never YAML
+# --------------------------------------------------------------------------- #
 
 
 def get_secret(env_var: str) -> SecretStr | None:
@@ -324,4 +390,27 @@ def load_interests(config_dir: Path) -> InterestsConfig:
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(path, exc)) from exc
     logger.debug("loaded interests config", extra={"path": str(path)})
+    return config
+
+
+def load_settings(config_dir: Path) -> SettingsConfig:
+    """Load and validate `<config_dir>/settings.yaml`, or default to UTC.
+
+    Unlike `sources.yaml`/`interests.yaml`, a *missing* settings file is not an
+    error: every field has a safe default (UTC), so an operator who never
+    creates one — or an existing install predating this file — gets correct
+    behaviour rather than a crash. A file that is *present* is still validated
+    strictly (unknown keys and bad zones raise `ConfigError`); only total
+    absence is tolerated.
+    """
+    path = config_dir / SETTINGS_FILENAME
+    if not path.is_file():
+        logger.debug("no settings.yaml; using defaults", extra={"path": str(path)})
+        return SettingsConfig()
+    data = _load_yaml_mapping(path)
+    try:
+        config = SettingsConfig.model_validate(data)
+    except ValidationError as exc:
+        raise ConfigError(_format_validation_error(path, exc)) from exc
+    logger.debug("loaded settings config", extra={"path": str(path), "timezone": config.timezone})
     return config

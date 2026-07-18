@@ -1,0 +1,12 @@
+# Machine-local app & locale settings — validated by `SettingsConfig` in
+# src/signalforge/config.py. Not relevance (interests.yaml), not sources
+# (sources.yaml): this is who and where the operator is.
+#
+# The pipeline stores and reasons in UTC everywhere. This zone resolves only
+# the reader-facing calendar day — which date a daily digest is "for", and
+# which scored items fall on it — so a run that crosses UTC midnight still
+# files its work under your local day, not the day before.
+
+# IANA timezone name (tz database). Examples: UTC, America/New_York,
+# Europe/London, Australia/Sydney. Defaults to UTC if this file is absent.
+timezone: Australia/Sydney

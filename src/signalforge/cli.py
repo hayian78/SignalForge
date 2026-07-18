@@ -3,11 +3,14 @@
 Phase 0 surface, and deliberately no more (NEVER rule 15):
 
 * `ingest` — fetch every configured source, persist the items, close a `runs` row.
+* `score` — triage/score unscored items via `score/` (DESIGN §8).
+* `digest` — assemble the day's markdown digest from scored items (DESIGN §13).
+* `daily` — `ingest` → `score` → `digest` in sequence, the cron entry (DESIGN §14).
 * `status` — last-run health, per-source freshness, month-to-date token spend
   (DESIGN §14).
 
-`score`, digests, and anything LLM-shaped are the *next* increment. This module
-must never import `llm.py`.
+LLM work stays behind the `score/` boundary: this module drives the pipeline but
+must never import `llm.py` directly (NEVER rule 1 — `anthropic` lives in `llm.py`).
 
 ### Why the persist loop is grouped by source
 
@@ -59,8 +62,10 @@ from rich.table import Table
 from signalforge.config import (
     ConfigError,
     InterestsConfig,
+    SettingsConfig,
     SourcesConfig,
     load_interests,
+    load_settings,
     load_sources,
 )
 from signalforge.db import connection, finish_run, start_run, upsert_item
@@ -71,7 +76,7 @@ from signalforge.models import Item
 from signalforge.report.daily import build_digest_context, digest_path, render_digest
 from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "digest", "ingest", "score", "status"]
+__all__ = ["app", "daily", "digest", "ingest", "score", "status"]
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +154,14 @@ def _load_sources_or_exit(config_dir: Path) -> SourcesConfig:
 def _load_interests_or_exit(config_dir: Path) -> InterestsConfig:
     try:
         return load_interests(config_dir)
+    except ConfigError as exc:
+        err_console.print(f"[red]config error:[/red] {exc}")
+        raise typer.Exit(code=2) from exc
+
+
+def _load_settings_or_exit(config_dir: Path) -> SettingsConfig:
+    try:
+        return load_settings(config_dir)
     except ConfigError as exc:
         err_console.print(f"[red]config error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
@@ -633,10 +646,14 @@ def digest(
     and writing one file is a single step with nothing to isolate, so the run
     is either `ok` or `failed`.
     """
-    # Only `thresholds.daily_max_items` is used here, but the digest reads it
-    # from validated config like every other tuning knob (CLAUDE.md §4).
+    # Only the `thresholds.daily_*` knobs are used here, but the digest reads
+    # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
-    resolved_date = target_date.date() if target_date is not None else datetime.now(UTC).date()
+    tz = _load_settings_or_exit(config_dir).tzinfo
+    # "Today" and the digest's day boundary are the operator's local calendar
+    # (settings.yaml), not UTC — storage stays UTC, presentation is local. An
+    # explicit --date is already a local calendar date.
+    resolved_date = target_date.date() if target_date is not None else datetime.now(tz).date()
 
     with connection(db) as conn:
         run_id = start_run(conn, RUN_KIND_DIGEST, started_at=datetime.now(UTC))
@@ -647,7 +664,10 @@ def digest(
             context = build_digest_context(
                 conn,
                 target_date=resolved_date,
+                tz=tz,
                 max_items=interests.thresholds.daily_max_items,
+                max_per_source=interests.thresholds.daily_max_per_source,
+                max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
             )
             item_count = len(context.items)
             rendered = render_digest(context)
@@ -732,10 +752,13 @@ def daily(
             step()
         except typer.Exit as exc:
             worst_exit = max(worst_exit, exc.exit_code)
-        except BaseException:
+        except Exception:
             # A step already recorded its own `runs` row and re-raised
             # (CLAUDE.md §3 — no silent runs); `daily` isolates steps from
-            # each other the same way `ingest` isolates sources.
+            # each other the same way `ingest` isolates sources. Only `Exception`
+            # is caught, never `BaseException`: a KeyboardInterrupt/SystemExit
+            # must abort the whole `daily` run, not be downgraded to exit 1 and
+            # let the next step start — a human hitting Ctrl-C means stop.
             worst_exit = max(worst_exit, 1)
 
     if worst_exit:

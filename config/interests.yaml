@@ -54,8 +54,20 @@ ignore:
 #
 # daily_max_items caps the Daily Digest at the top-N ranked kept items
 # (DESIGN §13's 60-second read); the rest are counted in the footer.
+#
+# The two daily_* crowding knobs below exist because rank alone lets volume
+# beat merit: a release watch that ships four versions in one window, or a
+# link blog that posts ten times, sweeps the top of the ranking and pushes
+# genuinely different items under the cap.
 thresholds:
   weekly_min_signal: 3
   weekly_min_relevance: 3
   weekly_min_total: 10
   daily_max_items: 15
+
+  # At most N items from any one source may take digest slots.
+  daily_max_per_source: 2
+
+  # One release per repo — the highest-ranked, not the newest (a prerelease
+  # publishes after the stable release it follows).
+  daily_max_per_github_repo: 1

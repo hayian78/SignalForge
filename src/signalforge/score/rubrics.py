@@ -27,7 +27,7 @@ from signalforge.config import InterestsConfig
 
 __all__ = ["RUBRIC_VERSION", "build_triage_system_prompt"]
 
-RUBRIC_VERSION: Final = "triage-v1"
+RUBRIC_VERSION: Final = "triage-v2"
 """Bump this constant — and only this constant — when the prompt text below
 changes. Nothing else needs to change for a rubric edit to be tracked."""
 
@@ -56,11 +56,12 @@ Novelty (`novelty`, 1-5):
   3 = a meaningful increment on a known approach
   1 = a restatement of material that is already well known
 
-Mark `triage` as "keep" when the item plausibly clears: signal >= 3 AND \
-relevance >= 3 AND (signal + relevance + novelty) >= 10 — the same bar the \
-weekly brief uses for inclusion. Otherwise mark it "kill". When genuinely \
-unsure between keep and kill, kill: this pipeline prizes precision over \
-recall, and a noisy digest is worse than a missed item.
+Mark `triage` as "keep" when the item plausibly clears the inclusion bar given \
+by the `thresholds` block below: signal >= `weekly_min_signal` AND relevance >= \
+`weekly_min_relevance` AND (signal + relevance + novelty) >= `weekly_min_total` \
+— the same bar the weekly brief uses for inclusion. Otherwise mark it "kill". \
+When genuinely unsure between keep and kill, kill: this pipeline prizes \
+precision over recall, and a noisy digest is worse than a missed item.
 
 Always write `reasoning` — even for a "kill" — as one sentence explaining the \
 scores you gave. It is stored permanently as the human-auditable record of \

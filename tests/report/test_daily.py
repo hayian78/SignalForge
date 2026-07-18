@@ -16,6 +16,7 @@ from __future__ import annotations
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -27,6 +28,7 @@ from signalforge.report.daily import (
     build_digest_context,
     digest_path,
     render_digest,
+    utc_day_window,
     write_digest,
 )
 from tests.conftest import make_item
@@ -284,12 +286,12 @@ def test_truncation_footer_line_renders_only_when_items_are_hidden(
     capped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=3))
     uncapped = render_digest(build_digest_context(conn, target_date=TARGET_DATE, max_items=15))
 
-    assert "2 more kept item(s) beyond the daily cap" in capped
+    assert "2 more kept item(s) not shown" in capped
     assert "item_count: 3" in capped
     assert "kept_count: 5" in capped
     assert "Ranked item 4" not in capped
 
-    assert "beyond the daily cap" not in uncapped
+    assert "not shown" not in uncapped
     assert "item_count: 5" in uncapped
     assert "kept_count: 5" in uncapped
 
@@ -509,3 +511,373 @@ def test_digest_path_is_stable_for_a_given_date(tmp_path: Path) -> None:
     assert digest_path(vault_dir, target_date=TARGET_DATE) == digest_path(
         vault_dir, target_date=TARGET_DATE
     )
+
+
+# --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Crowding limits — daily_max_per_source, daily_max_per_github_repo
+# --------------------------------------------------------------------------- #
+
+
+def _insert_release(
+    conn: sqlite3.Connection,
+    *,
+    repo: str,
+    tag: str,
+    published_at: datetime,
+    total: int = 15,
+) -> int:
+    """One GitHub release item + score. `source_id` is the repo, as the real
+    release-watch ingestor writes it."""
+    item_id, _ = upsert_item(
+        conn,
+        make_item(
+            source_id=repo,
+            source_type=SourceType.GITHUB,
+            external_id=f"{repo}@{tag}",
+            url=f"https://github.com/{repo}/releases/tag/{tag}",
+            title=f"{repo} {tag}",
+            published_at=published_at,
+        ),
+    )
+    per_dimension, remainder = divmod(total, 3)
+    _insert_score(
+        conn,
+        item_id,
+        signal=per_dimension + remainder,
+        relevance=per_dimension,
+        novelty=per_dimension,
+    )
+    return item_id
+
+
+def _insert_post(conn: sqlite3.Connection, *, slug: str, total: int = 12) -> int:
+    """One RSS post + score from the default `simonwillison` source."""
+    item_id, _ = upsert_item(
+        conn,
+        make_item(
+            external_id=slug,
+            url=f"https://simonwillison.net/2026/Jul/15/{slug}/",
+            title=f"Post {slug}",
+        ),
+    )
+    per_dimension, remainder = divmod(total, 3)
+    _insert_score(
+        conn,
+        item_id,
+        signal=per_dimension + remainder,
+        relevance=per_dimension,
+        novelty=per_dimension,
+    )
+    return item_id
+
+
+def test_github_repo_limit_collapses_a_version_pile_to_one(conn: sqlite3.Connection) -> None:
+    """Four versions of one library landing in one window is one piece of news,
+    not four — and must not eat four of the digest's slots."""
+    for tag, total in [("3.2.0", 15), ("3.1.1", 14), ("3.1.0", 14), ("3.0.4", 14)]:
+        _insert_release(
+            conn,
+            repo="stanfordnlp/dspy",
+            tag=tag,
+            published_at=datetime(2026, 4, 21, tzinfo=UTC),
+            total=total,
+        )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+    # The other three are still kept items — hidden, never silently dropped.
+    assert context.hidden_kept_count == 3
+    assert context.kept_count == 4
+
+
+def test_github_repo_limit_keeps_the_best_release_not_the_newest(
+    conn: sqlite3.Connection,
+) -> None:
+    """The regression this rule exists for: a prerelease publishes *after* the
+    stable release it follows, so picking by recency hands the slot to a beta
+    and drops the release that earned the score."""
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.2.0",
+        published_at=datetime(2026, 4, 21, tzinfo=UTC),
+        total=15,
+    )
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.3.0b1",
+        published_at=datetime(2026, 5, 28, tzinfo=UTC),
+        total=10,
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+
+
+def test_github_repo_limit_is_per_repo_not_across_repos(conn: sqlite3.Connection) -> None:
+    """Two repos each shipping a release are two separate pieces of news."""
+    _insert_release(
+        conn, repo="ollama/ollama", tag="v0.32.0", published_at=datetime(2026, 7, 14, tzinfo=UTC)
+    )
+    _insert_release(
+        conn, repo="stanfordnlp/dspy", tag="3.2.0", published_at=datetime(2026, 7, 15, tzinfo=UTC)
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert len(context.items) == 2
+
+
+def test_github_repo_limit_leaves_non_github_items_alone(conn: sqlite3.Connection) -> None:
+    """The rule is about release piles; two posts from one blog are both still
+    news. `daily_max_per_source` is what bounds those."""
+    for n in range(3):
+        _insert_post(conn, slug=f"post-{n}")
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_github_repo=1
+    )
+
+    assert len(context.items) == 3
+
+
+def test_max_per_source_caps_a_prolific_source_and_promotes_the_tail(
+    conn: sqlite3.Connection,
+) -> None:
+    """The whole point: a link blog sweeping the top of the ranking must not
+    crowd out a lower-ranked item from a different source."""
+    for rank in range(3):
+        _insert_post(conn, slug=f"sw-{rank}", total=15)
+
+    other, _ = upsert_item(
+        conn,
+        make_item(
+            source_id="jxnl",
+            external_id="lessons",
+            url="https://jxnl.co/writing/lessons/",
+            title="Lessons from industry leaders",
+        ),
+    )
+    _insert_score(conn, other, signal=4, relevance=5, novelty=4)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15, max_per_source=2)
+
+    assert [line.title for line in context.items] == [
+        "Post sw-0",
+        "Post sw-1",
+        "Lessons from industry leaders",
+    ]
+    assert context.hidden_kept_count == 1
+
+
+def test_max_per_source_keeps_each_source_s_best(conn: sqlite3.Connection) -> None:
+    """The cap drops a source's *weakest* items — it takes the top slice of the
+    ranking within a source, never an arbitrary slice."""
+    for slug, total in [("weak", 9), ("best", 15), ("mid", 12)]:
+        _insert_post(conn, slug=slug, total=total)
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15, max_per_source=2)
+
+    assert [line.title for line in context.items] == ["Post best", "Post mid"]
+
+
+def test_limits_are_off_by_default(conn: sqlite3.Connection) -> None:
+    """Absent config changes nothing — every kept item still renders."""
+    for rank in range(3):
+        _insert_post(conn, slug=f"sw-{rank}")
+    for tag in ["3.2.0", "3.1.1"]:
+        _insert_release(
+            conn, repo="stanfordnlp/dspy", tag=tag, published_at=datetime(2026, 4, 21, tzinfo=UTC)
+        )
+
+    context = build_digest_context(conn, target_date=TARGET_DATE, max_items=15)
+
+    assert len(context.items) == 5
+
+
+def test_github_repo_limit_wins_over_the_looser_per_source_limit(
+    conn: sqlite3.Connection,
+) -> None:
+    """A repo is also a source, so both limits match it. The tighter one must
+    decide — otherwise `daily_max_per_github_repo: 1` would be a no-op."""
+    for tag, total in [("3.2.0", 15), ("3.1.1", 14), ("3.1.0", 13)]:
+        _insert_release(
+            conn,
+            repo="stanfordnlp/dspy",
+            tag=tag,
+            published_at=datetime(2026, 4, 21, tzinfo=UTC),
+            total=total,
+        )
+
+    context = build_digest_context(
+        conn,
+        target_date=TARGET_DATE,
+        max_items=15,
+        max_per_source=2,
+        max_per_github_repo=1,
+    )
+
+    assert [line.title for line in context.items] == ["stanfordnlp/dspy 3.2.0"]
+
+
+def test_limits_never_reorder_the_ranking(conn: sqlite3.Connection) -> None:
+    """Filtering must leave a sub-sequence of the ranking — a crowded-out item
+    must not promote a lower-ranked one above a higher-ranked one."""
+    _insert_post(conn, slug="sw-best", total=15)
+    _insert_post(conn, slug="sw-second", total=14)
+    _insert_post(conn, slug="sw-third", total=13)
+    _insert_release(
+        conn,
+        repo="stanfordnlp/dspy",
+        tag="3.2.0",
+        published_at=datetime(2026, 4, 21, tzinfo=UTC),
+        total=12,
+    )
+
+    context = build_digest_context(
+        conn, target_date=TARGET_DATE, max_items=15, max_per_source=2, max_per_github_repo=1
+    )
+
+    titles = [line.title for line in context.items]
+    assert titles == ["Post sw-best", "Post sw-second", "stanfordnlp/dspy 3.2.0"]
+
+
+def test_crowding_limits_are_deterministic_across_re_renders(conn: sqlite3.Connection) -> None:
+    """Filtering must never turn re-rendering into a shuffle (CLAUDE.md §3)."""
+    for rank in range(4):
+        _insert_post(conn, slug=f"sw-{rank}")
+    _insert_release(
+        conn, repo="stanfordnlp/dspy", tag="3.2.0", published_at=datetime(2026, 4, 21, tzinfo=UTC)
+    )
+
+    kwargs = {"max_items": 15, "max_per_source": 2, "max_per_github_repo": 1}
+    first = build_digest_context(conn, target_date=TARGET_DATE, **kwargs)  # type: ignore[arg-type]
+    second = build_digest_context(conn, target_date=TARGET_DATE, **kwargs)  # type: ignore[arg-type]
+
+    assert first == second
+    assert render_digest(first) == render_digest(second)
+
+
+# --------------------------------------------------------------------------- #
+# Timezone — the reader's local day, resolved from a UTC store (settings.yaml)
+# --------------------------------------------------------------------------- #
+
+SYDNEY = ZoneInfo("Australia/Sydney")  # UTC+10, no DST in July
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def test_utc_day_window_utc_is_plain_midnights() -> None:
+    start, end = utc_day_window(date(2026, 7, 16), UTC)
+    assert start == "2026-07-16T00:00:00+00:00"
+    assert end == "2026-07-17T00:00:00+00:00"
+
+
+def test_utc_day_window_shifts_for_a_positive_offset_zone() -> None:
+    # Sydney is UTC+10, so local 2026-07-18 spans UTC 2026-07-17T14:00 .. 18T14:00.
+    start, end = utc_day_window(date(2026, 7, 18), SYDNEY)
+    assert start == "2026-07-17T14:00:00+00:00"
+    assert end == "2026-07-18T14:00:00+00:00"
+
+
+def test_utc_day_window_is_dst_correct_not_a_fixed_24h() -> None:
+    # US spring-forward: 2026-03-08 is a 23-hour day in New York. The window
+    # must be that real calendar day, not start+24h.
+    start, end = utc_day_window(date(2026, 3, 8), NEW_YORK)
+    span = datetime.fromisoformat(end) - datetime.fromisoformat(start)
+    assert span.total_seconds() == 23 * 3600
+
+
+def test_digest_day_uses_the_configured_zone_not_utc(conn: sqlite3.Connection) -> None:
+    """The actual 2026-07-18 bug: an item scored at 22:23 UTC on the 17th is
+    08:23 on the 18th in Sydney, so it belongs to the Sydney-local 18th digest —
+    exactly the day the old UTC logic left empty."""
+    item_id, _ = upsert_item(conn, make_item(external_id="late", title="Late-night item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T22:23:59+00:00")
+
+    on_the_18th = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    on_the_17th = build_digest_context(conn, target_date=date(2026, 7, 17), tz=SYDNEY, max_items=15)
+
+    assert [line.title for line in on_the_18th.items] == ["Late-night item"]
+    assert on_the_17th.items == ()
+
+
+def test_utc_default_preserves_the_old_calendar(conn: sqlite3.Connection) -> None:
+    """With no zone (tz defaults to UTC), the same item files under its UTC date —
+    proving the range query is backward compatible with the date-prefix logic."""
+    item_id, _ = upsert_item(conn, make_item(external_id="late", title="Late-night item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T22:23:59+00:00")
+
+    assert [
+        line.title
+        for line in build_digest_context(conn, target_date=date(2026, 7, 17), max_items=15).items
+    ] == ["Late-night item"]
+    assert build_digest_context(conn, target_date=date(2026, 7, 18), max_items=15).items == ()
+
+
+def test_local_midnight_belongs_to_the_new_day_not_the_old(conn: sqlite3.Connection) -> None:
+    """Half-open [start, end): an item at exactly local midnight is the first
+    item of the new day, never the last of the previous one."""
+    # Sydney midnight 2026-07-18T00:00+10:00 == 2026-07-17T14:00:00 UTC.
+    item_id, _ = upsert_item(conn, make_item(external_id="mid", title="Midnight item"))
+    _insert_score(conn, item_id, scored_at="2026-07-17T14:00:00+00:00")
+
+    assert (
+        build_digest_context(conn, target_date=date(2026, 7, 17), tz=SYDNEY, max_items=15).items
+        == ()
+    )
+    assert [
+        line.title
+        for line in build_digest_context(
+            conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15
+        ).items
+    ] == ["Midnight item"]
+
+
+def test_fractional_seconds_at_the_window_seam(conn: sqlite3.Connection) -> None:
+    """The whole range-comparison rests on lexical order matching time order at
+    the seam: stored values carry microseconds (`...SS.ffffff+00:00`) while the
+    bounds are whole-second (`...SS+00:00`), and `.` (0x2E) > `+` (0x2B) is what
+    keeps a sub-second-into-the-day item on the new day. Lock that ordering in —
+    a bound that regained fractional digits would break it silently."""
+    # Sydney 2026-07-18 starts at 2026-07-17T14:00:00 UTC (the `start` bound).
+    just_in, _ = upsert_item(
+        conn, make_item(external_id="in", url="https://example.com/in", title="Just inside")
+    )
+    _insert_score(conn, just_in, scored_at="2026-07-17T14:00:00.000001+00:00")
+    just_out, _ = upsert_item(
+        conn, make_item(external_id="out", url="https://example.com/out", title="Just outside")
+    )
+    _insert_score(conn, just_out, scored_at="2026-07-17T13:59:59.999999+00:00")
+
+    ctx = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    assert [line.title for line in ctx.items] == ["Just inside"]
+
+
+def test_killed_count_shares_the_digest_window(conn: sqlite3.Connection) -> None:
+    """The footer's killed count must use the same local-day window as the kept
+    items, or the counts stop reconciling across the UTC-midnight seam."""
+    kept, _ = upsert_item(
+        conn, make_item(external_id="k", url="https://example.com/kept", title="Kept")
+    )
+    _insert_score(conn, kept, scored_at="2026-07-17T22:00:00+00:00")
+    killed, _ = upsert_item(
+        conn, make_item(external_id="x", url="https://example.com/killed", title="Killed")
+    )
+    _insert_score(conn, killed, triage="kill", scored_at="2026-07-17T23:00:00+00:00")
+
+    ctx = build_digest_context(conn, target_date=date(2026, 7, 18), tz=SYDNEY, max_items=15)
+    assert ctx.killed_count == 1
+    assert ctx.kept_count == 1
+    assert ctx.scored_count == 2

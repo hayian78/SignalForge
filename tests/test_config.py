@@ -21,12 +21,14 @@ import pytest
 from pydantic import SecretStr
 
 from signalforge.config import (
+    SETTINGS_FILENAME,
     ConfigError,
-    Secrets,
+    SettingsConfig,
     SourceDefaults,
     Thresholds,
     get_secret,
     load_interests,
+    load_settings,
     load_sources,
 )
 
@@ -425,7 +427,9 @@ def test_shipped_sources_yaml_names_env_vars_not_tokens(repo_config_dir: Path) -
     config = load_sources(repo_config_dir)
     assert config.github is not None
     assert config.github.token_env == config.github.token_env.upper()
-    assert not config.github.token_env.lower().startswith(("ghp", "github_pat"))
+    assert not config.github.token_env.lower().startswith(
+        ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_")
+    )
 
 
 def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
@@ -437,6 +441,15 @@ def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
     assert 1 <= config.thresholds.weekly_min_relevance <= 5
     assert 3 <= config.thresholds.weekly_min_total <= 15
     assert config.thresholds.daily_max_items >= 1
+    # The crowding limits are what stop one prolific source (a link blog, a
+    # release watch shipping four versions) from sweeping the digest. They are
+    # optional in the model, so assert the shipped file actually sets them —
+    # deleting either key is a silent revert, not a failure.
+    assert config.thresholds.daily_max_per_source is not None
+    assert config.thresholds.daily_max_per_github_repo is not None
+    assert config.thresholds.daily_max_per_github_repo <= config.thresholds.daily_max_per_source, (
+        "the per-repo limit is the tighter of the two; above the per-source cap it is a no-op"
+    )
     assert config.priority_topics, "interests.yaml defines 'relevant to me' — it cannot be empty"
 
 
@@ -531,31 +544,6 @@ def test_secret_is_not_stringified_by_repr_or_str(monkeypatch: pytest.MonkeyPatc
     assert "ghp_realtokenvalue" not in str(secret)
 
 
-def test_secrets_model_reads_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-
-    assert secrets.github_token is not None
-    assert secrets.github_token.get_secret_value() == "ghp_x"
-    assert secrets.anthropic_api_key is not None
-    assert secrets.anthropic_api_key.get_secret_value() == "sk-ant-x"
-
-
-def test_secrets_default_to_none_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-    assert (secrets.github_token, secrets.anthropic_api_key) == (None, None)
-
-
-def test_secrets_repr_does_not_leak_values(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-supersecret")
-    secrets = Secrets(_env_file=None)  # type: ignore[call-arg]
-    assert "sk-ant-supersecret" not in repr(secrets)
-    assert "sk-ant-supersecret" not in str(secrets.model_dump())
-
-
 def test_secrets_are_not_settable_from_yaml(tmp_path: Path) -> None:
     # A token in git-tracked YAML is the leak NEVER rule 16 exists to prevent.
     # SourcesConfig has no field to receive one, so extra="forbid" rejects it.
@@ -595,6 +583,116 @@ def test_plausible_env_var_names_are_accepted(tmp_path: Path) -> None:
     assert config.github.token_env == "MY_GH_TOKEN_2"
 
 
+@pytest.mark.parametrize("name", ["GITHUB_PAT", "GITHUB_TOKEN", "GH_PAT", "MY_GITHUB_TOKEN"])
+def test_env_var_names_resembling_a_token_prefix_are_accepted(tmp_path: Path, name: str) -> None:
+    # The guard matches token SHAPES (`<prefix>_<body>`), not name prefixes, so
+    # `GITHUB_PAT` — a natural env-var NAME that lowercases to `github_pat` — must
+    # not be mistaken for a pasted `github_pat_<body>` token. Regression for the
+    # false-positive the old bare-prefix check produced. (A name that literally
+    # begins `ghp_`/`gho_` is still rejected — that shape is indistinguishable
+    # from a real token and no one names an env var that.)
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + f"github:\n  token_env: {name}\n")
+    config = load_sources(tmp_path)
+    assert config.github is not None
+    assert config.github.token_env == name
+
+
+@pytest.mark.parametrize(
+    "token",
+    ["ghp_abc123", "gho_abc123", "ghu_abc123", "ghs_abc123", "ghr_abc123", "github_pat_11ABCDEF"],
+)
+def test_pasted_github_tokens_are_rejected(tmp_path: Path, token: str) -> None:
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + f"github:\n  token_env: {token}\n")
+    with pytest.raises(ConfigError, match="NAME of an environment variable"):
+        load_sources(tmp_path)
+
+
 def test_secret_str_is_the_declared_type(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "ghp_x")
     assert isinstance(get_secret("GITHUB_TOKEN"), SecretStr)
+
+
+@pytest.mark.parametrize("knob", ["daily_max_per_source", "daily_max_per_github_repo"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_crowding_limits_reject_meaningless_values(knob: str, bad: int) -> None:
+    # A limit of 0 would render an empty digest rather than "no limit" — the
+    # off switch is omitting the key, so the model must not accept a count
+    # that silently empties the report.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+        knob: bad,
+    }
+    with pytest.raises(ValueError, match=knob):
+        Thresholds(**values)
+
+
+@pytest.mark.parametrize("knob", ["daily_max_per_source", "daily_max_per_github_repo"])
+def test_crowding_limits_are_optional(knob: str) -> None:
+    # Unlike the four required thresholds, these default to "no limit" — an
+    # existing interests.yaml stays valid and behaves exactly as before.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
+    assert getattr(Thresholds(**values), knob) is None
+
+
+# --------------------------------------------------------------------------- #
+# settings.yaml — app & locale (the timezone that resolves the reader's day)
+# --------------------------------------------------------------------------- #
+
+
+def test_settings_defaults_to_utc() -> None:
+    # UTC is the safe global default: an operator who never sets a zone gets
+    # correct (if not local) behaviour, not a crash.
+    settings = SettingsConfig()
+    assert settings.timezone == "UTC"
+    assert settings.tzinfo.key == "UTC"
+
+
+def test_settings_accepts_a_valid_iana_zone() -> None:
+    settings = SettingsConfig(timezone="Australia/Sydney")
+    assert settings.tzinfo.key == "Australia/Sydney"
+
+
+@pytest.mark.parametrize("bad", ["Mars/Phobos", "GMT+10", "Sydney", ""])
+def test_settings_rejects_an_unknown_zone_at_load(bad: str) -> None:
+    # A typo'd zone silently falling back to UTC is the invisible-config failure
+    # _StrictModel exists to prevent — it must raise, naming the field.
+    with pytest.raises(ValueError, match="timezone"):
+        SettingsConfig(timezone=bad)
+
+
+def test_settings_rejects_unknown_keys() -> None:
+    with pytest.raises(ValueError, match="locale"):
+        SettingsConfig(locale="en_AU")  # type: ignore[call-arg]
+
+
+def test_load_settings_missing_file_is_not_an_error(tmp_path: Path) -> None:
+    # Unlike sources/interests, a wholly-absent settings.yaml is tolerated and
+    # yields UTC defaults — existing installs predating the file still run.
+    assert not (tmp_path / SETTINGS_FILENAME).exists()
+    assert load_settings(tmp_path).timezone == "UTC"
+
+
+def test_load_settings_present_file_is_validated_strictly(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text("timezone: Pluto/Nowhere\n", encoding="utf-8")
+    with pytest.raises(ConfigError, match="timezone"):
+        load_settings(tmp_path)
+
+
+def test_load_settings_reads_the_zone(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text("timezone: America/New_York\n", encoding="utf-8")
+    assert load_settings(tmp_path).tzinfo.key == "America/New_York"
+
+
+def test_shipped_settings_yaml_parses(repo_config_dir: Path) -> None:
+    # The shipped file must load and name a real zone — a broken settings.yaml
+    # would break every digest's day boundary.
+    settings = load_settings(repo_config_dir)
+    assert settings.tzinfo is not None
