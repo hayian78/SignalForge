@@ -12,6 +12,7 @@ config/settings.yaml
 data/signalforge.db
 data/signalforge.db-*
 data/http_cache/
+data/cron.log
 
 # Python
 __pycache__/
