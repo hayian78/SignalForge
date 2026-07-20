@@ -650,7 +650,7 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 - [x] Batched Haiku triage + 3-dimension scoring on titles + summaries only
 - [x] Daily digest → vault, with per-source / per-repo crowding limits
 - [x] Timezone-aware day boundary (UTC storage, configurable reader locale)
-- [x] Cron installed (06:00 daily via crontab; digests landing in the configured `vault_dir` since 2026-07-18)
+- [x] Cron installed (06:00 daily via crontab; digests land in the configured `vault_dir`)
 - [ ] Read 5 mornings straight and it saved time
 - [ ] Live double-run = zero duplicates (run `signalforge daily` twice back-to-back: second run must add 0 rows, spend 0 tokens, and re-render the digest byte-identically)
 
