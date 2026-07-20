@@ -64,7 +64,7 @@ a WSL pipeline targeting a Windows vault at `/mnt/c/Users/<you>/Obsidian/...`.
 ```bash
 uv run signalforge ingest    # fetch from all configured sources into SQLite
 uv run signalforge score     # batched Haiku triage + scoring of unscored items
-uv run signalforge digest    # render today's Daily Digest into vault/daily/
+uv run signalforge digest    # render today's Daily Digest into <vault_dir>/daily/
 uv run signalforge daily     # ingest -> score -> digest, in one call (cron 06:00)
 uv run signalforge status    # last-run health, per-source freshness, token spend
 ```
@@ -88,7 +88,7 @@ prompts ad hoc.
 ```
 config/     YAML config — what to ingest, what you care about
 src/        the pipeline: ingest → enrich → score → synth → report
-vault/      the Obsidian vault — THE PRODUCT (git-tracked)
+vault/      frozen pre-`vault_dir` digests; the live vault is wherever settings.yaml points
 data/       SQLite + HTTP cache (gitignored, regenerable)
 tests/      pytest, with recorded HTTP fixtures — never live network
 ```
