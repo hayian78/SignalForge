@@ -33,11 +33,13 @@ __all__ = [
     "count_killed_items",
     "finish_run",
     "get_digest_items",
+    "get_feedback",
     "get_item",
     "get_item_by_canonical_url",
     "get_latest_run",
     "insert_score",
     "migrate",
+    "record_feedback",
     "start_run",
     "upsert_item",
 ]
@@ -124,7 +126,23 @@ _MIGRATION_0001_PHASE0 = Migration(
     ),
 )
 
-MIGRATIONS: Final[tuple[Migration, ...]] = (_MIGRATION_0001_PHASE0,)
+_MIGRATION_0002_FEEDBACK_DEDUP = Migration(
+    version=2,
+    name="feedback_dedup_index",
+    statements=(
+        # Non-destructive: adds a unique index only, leaving the Phase 0
+        # `feedback` table untouched (migrations are append-only — CLAUDE.md §3).
+        # One row per distinct (item, verdict) is what makes harvesting the same
+        # vault checkbox twice a no-op: `record_feedback` writes ON CONFLICT DO
+        # NOTHING against this index (DESIGN §11 "harvest-then-overwrite").
+        "CREATE UNIQUE INDEX ux_feedback_item_verdict ON feedback (item_id, verdict)",
+    ),
+)
+
+MIGRATIONS: Final[tuple[Migration, ...]] = (
+    _MIGRATION_0001_PHASE0,
+    _MIGRATION_0002_FEEDBACK_DEDUP,
+)
 """Ordered, append-only. Never edit an applied migration — add a new one."""
 
 SCHEMA_VERSION: Final[int] = MIGRATIONS[-1].version
@@ -712,4 +730,56 @@ def get_latest_run(conn: sqlite3.Connection, *, kind: str) -> RunRecord | None:
         status=row["status"],
         items_new=row["items_new"] or 0,
         errors=errors,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# feedback — human-in-the-loop marks (DESIGN §11, Phase 1 capture)
+# --------------------------------------------------------------------------- #
+
+_INSERT_FEEDBACK = """
+    INSERT INTO feedback (item_id, verdict, note, created_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(item_id, verdict) DO NOTHING
+"""
+
+
+def record_feedback(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    verdict: str,
+    note: str | None,
+    created_at: datetime,
+) -> bool:
+    """Record one `(item_id, verdict)` mark, returning True only when it is new.
+
+    Idempotent by construction (CLAUDE.md §3, NEVER rule 4): the
+    `ux_feedback_item_verdict` unique index (migration 2) plus `ON CONFLICT DO
+    NOTHING` collapse a re-harvested checkbox — or a `mark` repeated on the CLI —
+    to a single stored row. `cursor.rowcount == 1` is True on the insert that
+    created the row and False on the conflicting no-op, which is what lets both
+    the harvester count *new* marks and the CLI say "recorded" vs "already
+    marked".
+
+    Marks are the ground-truth set Phase 2 tuning will aggregate; this function
+    only *stores* one — nothing here changes scoring (adaptation is Phase 2,
+    DESIGN §11).
+    """
+    cursor = conn.execute(_INSERT_FEEDBACK, (item_id, verdict, note, _to_iso(created_at)))
+    recorded = cursor.rowcount == 1
+    logger.debug(
+        "recorded feedback" if recorded else "feedback already present",
+        extra={"item_id": item_id, "verdict": verdict},
+    )
+    return recorded
+
+
+def get_feedback(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
+    """Every stored `feedback` row for `item_id`, ordered by verdict then time."""
+    return list(
+        conn.execute(
+            "SELECT * FROM feedback WHERE item_id = ? ORDER BY verdict, created_at",
+            (item_id,),
+        ).fetchall()
     )

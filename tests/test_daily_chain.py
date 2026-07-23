@@ -246,6 +246,84 @@ def test_daily_command_runs_all_three_steps_in_one_invocation(
     assert "alpha post" in today_digests[0].read_text(encoding="utf-8")
 
 
+def test_daily_harvests_a_vault_mark_once_and_re_renders_byte_identically(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The Phase 1 harvest-then-overwrite loop, end to end (DESIGN §11):
+
+    * a checked box in an OLD digest file (a date today's run won't re-render)
+      is harvested into exactly one `feedback` row on the first `daily` run;
+    * a second `daily` run adds ZERO new feedback rows (the unique index makes
+      re-harvest a no-op) and re-renders today's digest byte-for-byte identically
+      (CLAUDE.md §3).
+    """
+    batch_result = TriageBatchResult(
+        results={
+            1: TriageResult(triage="keep", signal=5, relevance=5, novelty=4, reasoning="Good.")
+        },
+        input_tokens=1,
+        output_tokens=1,
+    )
+    monkeypatch.setattr("signalforge.llm.run_triage_batch", lambda *a, **k: batch_result)
+
+    # An OLD digest with a ticked "useful" box for item 1 (the alpha post the
+    # chain ingests). Written before any run; item 1 comes to exist during the
+    # first run's ingest, before that run's digest harvest reads this file.
+    old_daily = vault_dir / "daily"
+    old_daily.mkdir(parents=True, exist_ok=True)
+    (old_daily / "2020-01-01.md").write_text(
+        "# Daily Digest — 2020-01-01\n\n"
+        "**Link:** https://example.com/alpha/post-1\n"
+        "- [x] useful <!-- sf:item=1 v=useful -->\n"
+        "- [ ] noise <!-- sf:item=1 v=noise -->\n",
+        encoding="utf-8",
+    )
+
+    def _daily() -> Result:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.get(FEED_URL).mock(
+                return_value=httpx.Response(200, text=FEED, headers={"etag": '"a-1"'})
+            )
+            return _run(
+                "daily",
+                "--config-dir",
+                str(config_dir),
+                "--db",
+                str(db_path),
+                "--cache-dir",
+                str(cache_dir),
+                "--vault-dir",
+                str(vault_dir),
+            )
+
+    assert _daily().exit_code == 0
+
+    with connection(db_path) as conn:
+        feedback_after_first = conn.execute(
+            "SELECT item_id, verdict FROM feedback ORDER BY item_id, verdict"
+        ).fetchall()
+    assert [tuple(row) for row in feedback_after_first] == [(1, "useful")]
+
+    today_files = list((vault_dir / "daily").glob("*.md"))
+    today_digest = next(p for p in today_files if p.name != "2020-01-01.md")
+    first_render = today_digest.read_text(encoding="utf-8")
+
+    # Second full pass: same everything.
+    assert _daily().exit_code == 0
+
+    with connection(db_path) as conn:
+        feedback_after_second = conn.execute(
+            "SELECT item_id, verdict FROM feedback ORDER BY item_id, verdict"
+        ).fetchall()
+    # Zero new rows — the same checked box harvested twice stays one row.
+    assert [tuple(row) for row in feedback_after_second] == [(1, "useful")]
+    assert today_digest.read_text(encoding="utf-8") == first_render
+
+
 def test_daily_command_surfaces_a_config_error_but_still_exits(tmp_path: Path) -> None:
     result = _run(
         "daily",

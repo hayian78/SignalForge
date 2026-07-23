@@ -177,6 +177,43 @@ def test_dry_run_still_records_a_run(db_path: Path, vault_dir: Path, config_dir:
     assert run["status"] == "ok"
 
 
+def test_dry_run_does_not_harvest_feedback(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """A preview must not mutate ground-truth: `--dry-run` skips harvesting, so a
+    checked mark in the vault records zero `feedback` rows (DESIGN §11)."""
+    _seed(db_path)  # item 1 exists
+    daily = vault_dir / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-07-16.md").write_text(
+        "- [x] useful <!-- sf:item=1 v=useful -->\n", encoding="utf-8"
+    )
+
+    assert _invoke(db_path, vault_dir, config_dir, "--dry-run").exit_code == 0
+
+    with connection(db_path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+
+
+def test_digest_harvests_a_vault_mark_into_feedback(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """The counterpart: a real (non-dry) digest run harvests the checked mark
+    before it overwrites the file, recording one `feedback` row."""
+    _seed(db_path)  # item 1 exists
+    daily = vault_dir / "daily"
+    daily.mkdir(parents=True)
+    (daily / "2026-07-16.md").write_text(
+        "- [x] useful <!-- sf:item=1 v=useful -->\n", encoding="utf-8"
+    )
+
+    assert _invoke(db_path, vault_dir, config_dir).exit_code == 0
+
+    with connection(db_path) as conn:
+        rows = conn.execute("SELECT item_id, verdict FROM feedback").fetchall()
+    assert [tuple(r) for r in rows] == [(1, "useful")]
+
+
 def test_digest_defaults_to_todays_date_when_omitted(
     db_path: Path, vault_dir: Path, config_dir: Path
 ) -> None:

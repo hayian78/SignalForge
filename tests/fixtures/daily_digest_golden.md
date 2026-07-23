@@ -13,6 +13,8 @@ Directly touches agent memory, a stated learning goal, with a credible new mecha
 
 **Scores:** signal 4 · relevance 5 · novelty 4
 **Link:** https://example.com/agent-memory
+- [ ] useful <!-- sf:item=2 v=useful -->
+- [ ] noise <!-- sf:item=2 v=noise -->
 
 ## 2. MCP sampling lands everywhere
 
@@ -20,6 +22,8 @@ Working code and benchmarks showing real throughput gains on production MCP serv
 
 **Scores:** signal 5 · relevance 4 · novelty 3
 **Link:** https://simonwillison.net/2026/Jul/15/mcp-sampling/
+- [ ] useful <!-- sf:item=1 v=useful -->
+- [ ] noise <!-- sf:item=1 v=noise -->
 
 ---
 

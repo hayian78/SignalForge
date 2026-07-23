@@ -39,6 +39,7 @@ from pathlib import Path
 import jinja2
 
 from signalforge.db import DigestItem, count_killed_items, get_digest_items, get_latest_run
+from signalforge.feedback import checkbox_marker
 from signalforge.models import SourceType
 
 __all__ = [
@@ -73,6 +74,11 @@ per-source failures, so these are excluded rather than shown as a "source"."""
 class DigestLine:
     """One rendered item — title, why-it-matters, scores, and its citation link."""
 
+    id: int | None
+    """The `items.id`, embedded in the template's feedback-checkbox markers so a
+    harvested mark can be tied back to a row (DESIGN §11). None only for a row
+    with no primary key (structurally impossible for a stored item), in which
+    case no checkbox renders."""
     title: str
     url: str
     why_it_matters: str
@@ -136,6 +142,7 @@ def _to_line(scored: DigestItem) -> DigestLine | None:
         )
         return None
     return DigestLine(
+        id=scored.item.id,
         title=scored.item.title,
         url=scored.item.url,
         why_it_matters=_trim_reasoning(scored.reasoning),
@@ -292,13 +299,19 @@ def build_digest_context(
 
 
 def _template_env() -> jinja2.Environment:
-    return jinja2.Environment(
+    env = jinja2.Environment(
         loader=jinja2.FileSystemLoader(str(_TEMPLATES_DIR)),
         autoescape=False,
         trim_blocks=True,
         lstrip_blocks=True,
         keep_trailing_newline=True,
     )
+    # Render the feedback checkbox through the same function `feedback.py`
+    # parses, so the template and the harvester share one wire format and cannot
+    # drift (DESIGN §11). This is a pure formatting helper — no DB write crosses
+    # the report/ boundary (CLAUDE.md §2).
+    env.globals["checkbox_marker"] = checkbox_marker
+    return env
 
 
 def render_digest(context: DigestContext) -> str:

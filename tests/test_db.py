@@ -20,9 +20,11 @@ from signalforge.db import (
     connect,
     connection,
     finish_run,
+    get_feedback,
     get_item,
     get_item_by_canonical_url,
     migrate,
+    record_feedback,
     start_run,
     upsert_item,
 )
@@ -118,6 +120,98 @@ def test_migrations_are_append_only_and_ordered() -> None:
     versions = [migration.version for migration in MIGRATIONS]
     assert versions == sorted(set(versions))
     assert versions[0] == 1
+
+
+def test_schema_version_is_two_after_the_feedback_dedup_migration() -> None:
+    # Migration 2 (feedback dedup index) is the last one; SCHEMA_VERSION derives
+    # from it. If this drops, a fresh DB stops getting the unique index.
+    assert SCHEMA_VERSION == 2
+    assert MIGRATIONS[-1].version == 2
+
+
+def test_feedback_dedup_unique_index_exists(conn: sqlite3.Connection) -> None:
+    indexes = {
+        row["name"]
+        for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'index'").fetchall()
+    }
+    assert "ux_feedback_item_verdict" in indexes
+
+
+# --------------------------------------------------------------------------- #
+# feedback — Phase 1 mark capture (DESIGN §11)
+# --------------------------------------------------------------------------- #
+
+FEEDBACK_AT = datetime(2026, 7, 23, 8, 0, 0, tzinfo=UTC)
+
+
+def test_record_feedback_inserts_a_new_row_and_returns_true(conn: sqlite3.Connection) -> None:
+    item_id, _ = upsert_item(conn, make_item())
+
+    recorded = record_feedback(
+        conn, item_id=item_id, verdict="useful", note=None, created_at=FEEDBACK_AT
+    )
+
+    assert recorded is True
+    rows = get_feedback(conn, item_id)
+    assert len(rows) == 1
+    assert rows[0]["verdict"] == "useful"
+
+
+def test_record_feedback_is_idempotent_on_the_same_item_and_verdict(
+    conn: sqlite3.Connection,
+) -> None:
+    item_id, _ = upsert_item(conn, make_item())
+
+    first = record_feedback(
+        conn, item_id=item_id, verdict="useful", note=None, created_at=FEEDBACK_AT
+    )
+    second = record_feedback(
+        conn, item_id=item_id, verdict="useful", note="second try", created_at=FEEDBACK_AT
+    )
+
+    assert first is True
+    assert second is False  # ON CONFLICT DO NOTHING — no new row
+    assert len(get_feedback(conn, item_id)) == 1
+
+
+def test_record_feedback_allows_two_distinct_verdicts_on_one_item(
+    conn: sqlite3.Connection,
+) -> None:
+    item_id, _ = upsert_item(conn, make_item())
+
+    # Distinct `created_at`: the migration-1 PRIMARY KEY is (item_id, created_at),
+    # so two verdicts for one item need distinct timestamps to coexist. The new
+    # unique index (item_id, verdict) is what blocks a *duplicate* verdict.
+    later = FEEDBACK_AT.replace(hour=FEEDBACK_AT.hour + 1)
+    assert record_feedback(
+        conn, item_id=item_id, verdict="useful", note=None, created_at=FEEDBACK_AT
+    )
+    assert record_feedback(conn, item_id=item_id, verdict="noise", note=None, created_at=later)
+
+    verdicts = {row["verdict"] for row in get_feedback(conn, item_id)}
+    assert verdicts == {"useful", "noise"}
+
+
+def test_record_feedback_stores_the_note(conn: sqlite3.Connection) -> None:
+    item_id, _ = upsert_item(conn, make_item())
+
+    record_feedback(
+        conn,
+        item_id=item_id,
+        verdict="missed",
+        note="should have been surfaced",
+        created_at=FEEDBACK_AT,
+    )
+
+    assert get_feedback(conn, item_id)[0]["note"] == "should have been surfaced"
+
+
+def test_record_feedback_for_a_nonexistent_item_raises(conn: sqlite3.Connection) -> None:
+    # The FK to items(id) is enforced (PRAGMA foreign_keys = ON), so writing a
+    # mark for an unknown id raises rather than storing an orphan — which is why
+    # the harvester and the CLI both pre-check the item exists (CLAUDE.md §7).
+    with pytest.raises(sqlite3.IntegrityError):
+        record_feedback(conn, item_id=9999, verdict="useful", note=None, created_at=FEEDBACK_AT)
 
 
 def test_items_table_has_both_unique_constraints(conn: sqlite3.Connection) -> None:

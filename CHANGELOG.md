@@ -20,6 +20,14 @@ is met.
 - Configurable reader-facing timezone in `config/settings.yaml` — the digest
   day is resolved through one IANA zone while all storage stays UTC.
 - Company engineering blogs and six release watches added to `sources.yaml`.
+- Phase 1 `mark` feedback capture: a `signalforge mark <item-id> useful|noise|missed`
+  CLI command plus two GFM checkboxes per digest item, harvested out of the vault
+  markdown before each re-render ("harvest-then-overwrite") into the `feedback`
+  table via a non-destructive `UNIQUE(item_id, verdict)` index (migration 2).
+  Scoring is unchanged — a mark only stores ground-truth; adaptation is Phase 2.
+  Built ahead of a formally-ticked Phase 0 gate as a conscious operator decision:
+  five mornings of real digest use satisfy Phase 0's "read 5 mornings" human
+  acceptance, leaving only the mechanical double-run idempotency proof pending.
 
 ### Changed
 - `RUBRIC_VERSION` bumped `triage-v1` → `triage-v2`: the keep-rule now names the

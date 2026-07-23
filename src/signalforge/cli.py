@@ -59,6 +59,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from signalforge import feedback
 from signalforge.config import (
     ConfigError,
     InterestsConfig,
@@ -68,7 +69,8 @@ from signalforge.config import (
     load_settings,
     load_sources,
 )
-from signalforge.db import connection, finish_run, start_run, upsert_item
+from signalforge.db import connection, finish_run, get_item, record_feedback, start_run, upsert_item
+from signalforge.feedback import harvest_marks
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY
 from signalforge.ingest.hackernews import HN_SOURCE_ID
@@ -76,7 +78,7 @@ from signalforge.models import Item
 from signalforge.report.daily import build_digest_context, digest_path, render_digest
 from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "daily", "digest", "ingest", "score", "status"]
+__all__ = ["app", "daily", "digest", "ingest", "mark", "score", "status"]
 
 logger = logging.getLogger(__name__)
 
@@ -672,8 +674,31 @@ def digest(
     with connection(db) as conn:
         run_id = start_run(conn, RUN_KIND_DIGEST, started_at=datetime.now(UTC))
         run_level_error: dict[str, str] | None = None
+        harvest_error: dict[str, str] | None = None
         status_value = "failed"
         item_count = 0
+
+        # Harvest thumbs-up/down marks out of the vault *before* the render
+        # overwrites today's file (DESIGN §11 harvest-then-overwrite). Skipped on
+        # --dry-run: a preview must never write ground-truth feedback rows. Run
+        # after start_run and non-fatally, so a broken harvest is captured into
+        # this run's `runs.errors` — surfaced by `status` (DESIGN §7's monitoring
+        # channel), not just cron.log — while the digest still renders (§7). Vault
+        # markdown is only read here, never written (NEVER rule 8).
+        if not dry_run:
+            try:
+                result = harvest_marks(conn, effective_vault_dir)
+                if result.rows_recorded:
+                    console.print(
+                        f"[green]harvested feedback[/green]: {result.rows_recorded} new mark(s) "
+                        f"after scanning {result.files_scanned} vault file(s)."
+                    )
+            except Exception as exc:
+                logger.exception(
+                    "harvesting vault feedback failed; continuing to the digest render"
+                )
+                harvest_error = _run_level_error(exc)
+
         try:
             context = build_digest_context(
                 conn,
@@ -711,11 +736,63 @@ def digest(
                 items_new=0,  # digest writes no `items` rows.
                 llm_input_tokens=0,
                 llm_output_tokens=0,
-                errors=[run_level_error] if run_level_error is not None else None,
+                # A non-fatal harvest failure rides alongside a fatal render
+                # error so both reach `runs.errors` (DESIGN §7). A harvest error
+                # with a clean render leaves `status` "ok" with a visible error
+                # count — the render (the product) succeeded, the side-channel
+                # didn't.
+                errors=[e for e in (harvest_error, run_level_error) if e is not None] or None,
             )
 
     if status_value == "failed":
         raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# mark
+# --------------------------------------------------------------------------- #
+
+
+@app.command()
+def mark(
+    item_ref: Annotated[
+        int, typer.Argument(help="The `items.id` to mark (shown in the digest's checkbox markers).")
+    ],
+    verdict: Annotated[str, typer.Argument(help=f"One of: {', '.join(feedback.VERDICTS)}.")],
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
+    note: Annotated[
+        str | None, typer.Option("--note", help="Optional free-text note stored with the mark.")
+    ] = None,
+) -> None:
+    """Record a human `useful|noise|missed` mark on an item (DESIGN §11, Phase 1).
+
+    A mark is a human action, not a pipeline run — so it writes no `runs` row and
+    spends no tokens. Idempotent (CLAUDE.md §3): marking the same item with the
+    same verdict twice stores one row, and the second call says "already marked".
+    Nothing about scoring changes; a mark only stores ground-truth for Phase 2
+    tuning (adaptation is out of scope here).
+    """
+    if verdict not in feedback.VERDICTS:
+        raise typer.BadParameter(
+            f"verdict must be one of {', '.join(feedback.VERDICTS)}, not {verdict!r}",
+            param_hint="verdict",
+        )
+
+    with connection(db) as conn:
+        if get_item(conn, item_ref) is None:
+            err_console.print(
+                f"[red]unknown item[/red] {item_ref}; nothing recorded. "
+                "Check the id in the digest's checkbox marker."
+            )
+            raise typer.Exit(code=2)
+        recorded = record_feedback(
+            conn, item_id=item_ref, verdict=verdict, note=note, created_at=datetime.now(UTC)
+        )
+
+    if recorded:
+        console.print(f"[green]recorded[/green]: item {item_ref} marked {verdict}.")
+    else:
+        console.print(f"[yellow]already marked[/yellow]: item {item_ref} is already {verdict}.")
 
 
 # --------------------------------------------------------------------------- #
