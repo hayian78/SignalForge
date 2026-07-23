@@ -25,9 +25,9 @@ is met.
   markdown before each re-render ("harvest-then-overwrite") into the `feedback`
   table via a non-destructive `UNIQUE(item_id, verdict)` index (migration 2).
   Scoring is unchanged — a mark only stores ground-truth; adaptation is Phase 2.
-  Built ahead of a formally-ticked Phase 0 gate as a conscious operator decision:
-  five mornings of real digest use satisfy Phase 0's "read 5 mornings" human
-  acceptance, leaving only the mechanical double-run idempotency proof pending.
+  Landed as Phase 0's acceptance gate closed (2026-07-23): five mornings of
+  real digest use plus a verified live double-run (second `daily` added 0 rows,
+  spent 0 tokens, re-rendered byte-identically).
 
 ### Changed
 - `RUBRIC_VERSION` bumped `triage-v1` → `triage-v2`: the keep-rule now names the
