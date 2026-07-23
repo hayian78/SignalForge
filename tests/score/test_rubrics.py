@@ -37,7 +37,7 @@ def test_prompt_is_deterministic_for_the_same_config() -> None:
 
 def test_prompt_contains_the_rubric_anchors() -> None:
     prompt = build_triage_system_prompt(make_interests())
-    assert "Signal vs hype" in prompt
+    assert "Signal — substance vs noise" in prompt
     assert "Personal relevance" in prompt
     assert "Novelty" in prompt
     assert "keep" in prompt and "kill" in prompt

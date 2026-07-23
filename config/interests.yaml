@@ -5,34 +5,46 @@
 # feedback — never editing prompts (CLAUDE.md §4).
 #
 # Validated by `InterestsConfig` in src/signalforge/config.py.
+#
+# Profile: an executive-quality briefing on where AI is heading — industry
+# direction & thought leadership, frontier-lab breakthroughs, enterprise AI
+# adoption, and AI policy. Engineering/tooling is now a minor lane (the
+# operator still builds SignalForge day to day), not the main lens.
 
-# Keys from taxonomy.yaml, in `group.leaf` form.
+# Free `group.leaf` labels. taxonomy.yaml doesn't exist yet and isn't
+# validated against this list — these are readable labels, not keys looked
+# up elsewhere.
 priority_topics:
-  - agents.mcp
-  - engineering.code-gen
-  - engineering.context
-  - models.local
-  - retrieval.rag
+  - industry.strategy
+  - frontier.capabilities
+  - enterprise.adoption
+  - agents.autonomy
+  - policy.regulation
+  - ai.research-direction
 
 interests:
-  - python
-  - fastapi
-  - sqlite
-  - duckdb
+  - ai-strategy
+  - frontier-models
+  - enterprise-ai
+  - ai-policy
+  - agents
+  - thought-leadership
   - claude-code
-  - trading-systems
   - local-first
+  - trading-systems
 
+# The minor engineering lane: the operator still builds SignalForge itself.
 stack:
   - python
   - typescript
-  - fastapi
   - sqlite
-  - postgres
   - docker
   - wsl
 
 learning_goals:
+  - where AI capabilities are heading over the next 6-24 months
+  - enterprise AI adoption and business impact
+  - AI policy and governance
   - agent memory architectures
   - production llm evaluation
 
@@ -44,7 +56,10 @@ ignore:
   topics:
     - crypto
     - web3
-    - model-release-hype
+    # `model-release-hype` was intentionally REMOVED from this list — frontier-lab
+    # announcements now matter to the profile, and the rewritten `signal` rubric
+    # dimension is what penalizes contentless hype, instead of a blanket topic
+    # ignore that would have thrown out real breakthroughs with the noise.
   people: []
   repos: []
 

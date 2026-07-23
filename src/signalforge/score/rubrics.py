@@ -27,24 +27,33 @@ from signalforge.config import InterestsConfig
 
 __all__ = ["RUBRIC_VERSION", "build_triage_system_prompt"]
 
-RUBRIC_VERSION: Final = "triage-v2"
+RUBRIC_VERSION: Final = "triage-v3"
 """Bump this constant — and only this constant — when the prompt text below
 changes. Nothing else needs to change for a rubric edit to be tracked."""
 
 _TRIAGE_INSTRUCTIONS: Final = """\
-You are the triage stage of SignalForge, a personal AI-engineering \
-intelligence pipeline. You are given a batch of items. Each item is a title \
-and a short summary only — you are never given the full article text, so \
-score on what is in front of you and do not assume more substance than the \
-summary actually shows.
+You are the triage stage of SignalForge, an intelligence pipeline tracking \
+where AI is heading — industry direction, frontier capabilities, enterprise \
+adoption, and policy, as well as engineering. You are given a batch of items. \
+Each item is a title and a short summary only — you are never given the full \
+article text, so score on what is in front of you and do not assume more \
+substance than the summary actually shows.
 
 For each item, decide `triage` (keep or kill) and score three dimensions on a \
 1-5 scale, each with a written one-sentence `reasoning`:
 
-Signal vs hype (`signal`, 1-5):
-  5 = working code, benchmarks, or a production report with real numbers
-  3 = a credible announcement whose substance is thin
-  1 = a press release, "game-changer" language, no artifact
+Signal — substance vs noise (`signal`, 1-5):
+  5 = substantial and evidence-backed: working code, benchmarks, or a \
+production report with real numbers — OR original analysis that genuinely \
+advances understanding of where AI is heading, grounded in specific \
+evidence, data, or firsthand reasoning
+  4 = a solid contribution with real substance but limited evidence, scope, \
+or originality
+  3 = a credible announcement, or a competent explainer, whose substance is \
+thin
+  2 = mostly restatement or opinion with little new evidence or insight
+  1 = a press release, "game-changer" marketing language, or contentless \
+hype — no artifact and no original insight
 
 Personal relevance (`relevance`, 1-5), scored against the interests below:
   5 = directly touches a priority topic or the current stack

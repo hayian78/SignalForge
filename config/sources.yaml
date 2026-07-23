@@ -29,32 +29,56 @@ rss:
     url: https://www.interconnects.ai/feed
   - id: karpathy
     url: https://karpathy.bearblog.dev/feed/
-  - id: sebastian-raschka
-    url: https://magazine.sebastianraschka.com/feed
   - id: chip-huyen
     url: https://huyenchip.com/feed.xml
   - id: hamel-husain
     url: https://hamel.dev/index.xml
   - id: swyx
     url: https://www.swyx.io/rss.xml
-  - id: jason-liu
-    url: https://jxnl.co/feed_rss_created.xml
   # Company engineering blogs (added 2026-07-17). Higher volume and more product
-  # marketing than the personal blogs above — triage plus
-  # `ignore.topics: model-release-hype` in interests.yaml are the filter.
+  # marketing than the personal blogs above — triage against the `signal`
+  # rubric dimension (which scores contentless hype at 1) is the filter.
   - id: openai-news
     url: https://openai.com/news/rss.xml
   - id: deepmind
     url: https://deepmind.google/blog/rss.xml
-  - id: cloudflare-ai
-    # Tag-scoped feed: AI/inference/Workers-AI posts only, not the full firehose.
-    url: https://blog.cloudflare.com/tag/ai/rss/
   - id: microsoft-research
     url: https://www.microsoft.com/en-us/research/feed/
-  - id: together-ai
-    url: https://www.together.ai/blog/rss.xml
-  - id: modal
-    url: https://modal.com/blog/atom.xml
+  # Removed 2026-07-24 as part of the executive-briefing rebalance: engineering
+  # bloggers and inference-infra vendors (jason-liu, sebastian-raschka,
+  # together-ai, modal, cloudflare-ai) traded for direction/analyst signal.
+  # Thought-leadership / analyst sources (added 2026-07-24) — industry direction,
+  # frontier-lab watching, and policy commentary rather than implementation
+  # detail. Weighted up per the operator's explicit ask to elevate these voices.
+  - id: import-ai
+    url: https://importai.substack.com/feed
+    weight: 1.3
+  - id: one-useful-thing
+    url: https://www.oneusefulthing.org/feed
+    weight: 1.3
+  - id: mit-tech-review-ai
+    url: https://www.technologyreview.com/topic/artificial-intelligence/feed
+    weight: 1.0
+  - id: ben-evans
+    url: https://www.ben-evans.com/benedictevans?format=rss
+    weight: 1.2
+  - id: ai-snake-oil
+    # aisnakeoil.com/feed 301s to normaltech.ai/feed — Kapoor & Narayanan
+    # rebranded the newsletter ("AI as Normal Technology"); same authors/voice.
+    url: https://www.aisnakeoil.com/feed
+    weight: 1.2
+  - id: latent-space
+    # www.latent.space, not swyx.io — distinct host/feed from the `swyx` entry
+    # above, no collision.
+    url: https://www.latent.space/feed
+    weight: 1.0
+  # Skipped (2026-07-24 validation): the-batch — deeplearning.ai/the-batch/rss.xml
+  # 404s, as do /feed, /feed/, /rss/, /rss.xml fallbacks; the page itself is a
+  # JS-rendered SPA with no <link rel="alternate"> or feedburner reference
+  # found. No working feed exists. stratechery — feed/ parses fine, but 7 of
+  # the last 10 items are one-sentence teaser stubs (~100-150 chars, no article
+  # body; only the weekly "This Week in Stratechery" roundup emails carry real
+  # content) — paywalled to uselessness as expected for a members-only pub.
 # Anthropic's engineering blog publishes no RSS feed (every plausible path 404s
 # as of 2026-07-16). Its posts reach HN within hours, and `hackernews.keywords`
 # below already covers them — same reasoning DESIGN §7 applies to X/Twitter.
@@ -67,13 +91,7 @@ rss:
 github:
   token_env: GITHUB_TOKEN
   releases:
-    - Aider-AI/aider
-    - langchain-ai/langgraph
-    - modelcontextprotocol/specification
-    - vllm-project/vllm
     - anthropics/claude-code
-    - stanfordnlp/dspy
-    - huggingface/transformers
     # Dropped 2026-07-24 on a week of `mark` feedback: each below scored 0 useful
     # against >=3 noise, all bare version-bump / CI-build tags the digest can't
     # act on (llama.cpp b10068.. are per-commit CI tags; litellm were dev/rc
@@ -85,38 +103,44 @@ github:
     #   - BerriAI/litellm        # 0 useful / 3 noise (dev/rc prereleases)
     #   - pydantic/pydantic-ai   # 0 useful / 3 noise
     #   - ggml-org/llama.cpp     # 0 useful / 4 noise (CI build tags)
-    # Added 2026-07-17. modelcontextprotocol/servers carries implementation
-    # changes the spec repo doesn't; duckdb is an interests.yaml interest
-    # (SignalForge itself is SQLite). Considered and skipped: microsoft/autogen
-    # (dormant — no release since 2025-09), astral-sh/uv + ruff (tooling churn,
-    # not AI signal; revisit on felt need).
+    # Pruned 2026-07-24 as part of the executive-briefing rebalance: this list
+    # is now paradigm/workflow repos only (Aider-AI/aider, langchain-ai/langgraph,
+    # vllm-project/vllm, stanfordnlp/dspy, huggingface/transformers,
+    # microsoft/markitdown, modelcontextprotocol/servers, duckdb/duckdb removed).
+    # Those are framework/library release-note noise for an exec briefing;
+    # majors surface via HN and the thought-leadership RSS sources above anyway.
     - OpenHands/OpenHands
-    - block/goose
     - continuedev/continue
-    - microsoft/markitdown
-    - modelcontextprotocol/servers
-    - duckdb/duckdb
+    - block/goose
+    - modelcontextprotocol/specification
   # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
   awesome_lists:
     - e2b-dev/awesome-ai-agents
     - punkpeye/awesome-mcp-servers
 
 # Phase 1 — modeled and configured now, ingested when the phase gate opens.
+# This block is staging only: `arxiv` isn't wired into any ingestor yet, so
+# editing `require_keywords` today has zero effect on a running pipeline
+# (NEVER rule 15) — it's here so the phase-gate flip is a config no-op.
+# Updated 2026-07-24 for the executive-briefing rebalance: research-agenda
+# keywords over low-level inference/fine-tuning terms.
 arxiv:
   categories: [cs.AI, cs.CL, cs.LG, cs.SE]
   require_keywords:
-    - agent
-    - context
-    - retrieval
-    - inference
-    - evaluation
-    - fine-tuning
-    - quantization
     - reasoning
-    - embedding
+    - agents
     - tool use
+    - planning
+    - memory
+    - alignment
+    - evaluation
+    - multimodal
+    - coding agents
 
 # Hacker News via the Algolia API (Phase 0) — free, no auth.
 # Front page >= defaults.min_hn_points, plus one search per keyword.
+# Updated 2026-07-24 for the executive-briefing rebalance: dropped low-level
+# infra keywords (rag, inference, ollama, vllm, mcp) for frontier/direction/
+# policy terms.
 hackernews:
-  keywords: [llm, claude, mcp, agent, rag, inference, ollama, vllm]
+  keywords: [llm, claude, gemini, openai, anthropic, reasoning, agent, agi, policy]
