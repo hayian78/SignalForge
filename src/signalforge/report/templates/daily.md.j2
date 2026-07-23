@@ -15,6 +15,10 @@ kept_count: {{ context.kept_count }}
 
 **Scores:** signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
 **Link:** {{ line.url }}
+{% if line.id is not none %}
+{{ checkbox_marker(line.id, "useful") }}
+{{ checkbox_marker(line.id, "noise") }}
+{% endif %}
 
 {% endfor %}
 {% else %}
