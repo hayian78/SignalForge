@@ -79,16 +79,19 @@ SOURCES_YAML = textwrap.dedent("""
 """)
 
 DESIGN_INTERESTS_YAML = textwrap.dedent("""
-    priority_topics: [agents.mcp, engineering.code-gen, engineering.context,
-                      models.local, retrieval.rag]
-    interests: [python, fastapi, sqlite, duckdb, claude-code, trading-systems, local-first]
-    stack: [python, typescript, fastapi, sqlite, postgres, docker, wsl]
-    learning_goals: [agent memory architectures, production llm evaluation]
+    priority_topics: [industry.strategy, frontier.capabilities, enterprise.adoption,
+                      agents.autonomy, policy.regulation, ai.research-direction]
+    interests: [ai-strategy, frontier-models, enterprise-ai, ai-policy, agents,
+                thought-leadership, claude-code, local-first, trading-systems]
+    stack: [python, typescript, sqlite, docker, wsl]
+    learning_goals: [where AI capabilities are heading over the next 6-24 months,
+                     enterprise AI adoption and business impact, AI policy and governance,
+                     agent memory architectures, production llm evaluation]
     architecture_philosophy: >
       Local-first, deterministic pipelines, low operational cost, monolith-by-default,
       boring technology, human-in-the-loop.
     ignore:
-      topics: [crypto, web3, model-release-hype]
+      topics: [crypto, web3]
       people: []
       repos: []
     thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,
@@ -298,22 +301,23 @@ def test_design_section_11_interests_yaml_parses(tmp_path: Path) -> None:
     write_interests(tmp_path, DESIGN_INTERESTS_YAML)
     config = load_interests(tmp_path)
 
-    assert "agents.mcp" in config.priority_topics
+    assert "industry.strategy" in config.priority_topics
     assert config.stack == [
         "python",
         "typescript",
-        "fastapi",
         "sqlite",
-        "postgres",
         "docker",
         "wsl",
     ]
     assert config.learning_goals == [
+        "where AI capabilities are heading over the next 6-24 months",
+        "enterprise AI adoption and business impact",
+        "AI policy and governance",
         "agent memory architectures",
         "production llm evaluation",
     ]
     assert "Local-first" in config.architecture_philosophy
-    assert config.ignore.topics == ["crypto", "web3", "model-release-hype"]
+    assert config.ignore.topics == ["crypto", "web3"]
     assert config.ignore.people == []
     assert config.thresholds.weekly_min_signal == 3
     assert config.thresholds.weekly_min_relevance == 3

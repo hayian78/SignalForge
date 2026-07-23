@@ -30,6 +30,21 @@ is met.
   spent 0 tokens, re-rendered byte-identically).
 
 ### Changed
+- Executive-briefing rebalance (2026-07-24): shifted the profile from an
+  AI-engineering/framework tracker toward where AI is heading — industry
+  direction & thought leadership, frontier labs, enterprise adoption, and
+  policy. `interests.yaml` rewritten (new `priority_topics`/`interests`,
+  trimmed `stack`, `model-release-hype` dropped from `ignore`); `sources.yaml`
+  swapped five engineering/inference-infra RSS feeds for six analyst /
+  thought-leadership feeds (Import AI, One Useful Thing, MIT Tech Review AI,
+  Ben Evans, AI Snake Oil, Latent Space, weighted up), pruned GitHub release
+  watches 13→5 (paradigm/workflow repos only), and retargeted HN keywords
+  (and the Phase-1 arXiv keyword staging) to frontier/direction/policy terms.
+- `RUBRIC_VERSION` bumped `triage-v2` → `triage-v3`: the `signal` dimension was
+  broadened from an engineering-artifact-only scale to a 5-point substance-vs-noise
+  scale that also rewards original, evidence-backed analysis, so thought-leadership
+  is no longer structurally scored down. Kill-on-hype (`signal=1`) is retained,
+  now the filter for contentless marketing in place of the removed `ignore` topic.
 - Dropped four zero-yield GitHub release watches (`ggml-org/llama.cpp`,
   `ollama/ollama`, `BerriAI/litellm`, `pydantic/pydantic-ai`) from `sources.yaml`
   after a week of `mark` feedback: each scored 0 useful against ≥3 noise, all

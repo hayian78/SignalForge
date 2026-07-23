@@ -300,9 +300,9 @@ def test_shipped_sources_yaml_validates() -> None:
     assert config.rss
     assert config.github is not None
     assert config.github.token_env == "GITHUB_TOKEN"
-    assert "Aider-AI/aider" in config.github.releases
+    assert "anthropics/claude-code" in config.github.releases
     assert config.hackernews is not None
-    assert "mcp" in config.hackernews.keywords
+    assert "policy" in config.hackernews.keywords
 
 
 def test_shipped_sources_yaml_carries_no_inline_secret() -> None:
@@ -318,7 +318,7 @@ def test_shipped_interests_yaml_validates() -> None:
     assert interests.thresholds.weekly_min_signal == 3
     assert interests.thresholds.weekly_min_relevance == 3
     assert interests.thresholds.weekly_min_total == 10
-    assert "agents.mcp" in interests.priority_topics
+    assert "industry.strategy" in interests.priority_topics
     assert "crypto" in interests.ignore.topics
     assert interests.architecture_philosophy
 

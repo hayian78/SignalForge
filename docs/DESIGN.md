@@ -437,7 +437,7 @@ Prompt-caching discipline (from day one, it's free to get right): system prompt 
 
 | Dimension | Rubric anchor points |
 |---|---|
-| **Signal vs hype** | 5 = working code/benchmarks/production report with numbers · 3 = credible announcement, substance thin · 1 = press release, "game-changer" language, no artifact |
+| **Signal — substance vs noise** | 5 = working code/benchmarks/production numbers, OR original analysis grounded in specific evidence · 3 = credible announcement or competent explainer, substance thin · 1 = press release, "game-changer" marketing, no artifact or insight (full 5-point scale in `score/rubrics.py`) |
 | **Personal relevance** | 5 = directly touches priority topics or the current stack · 3 = adjacent, worth awareness · 1 = ignored topics or irrelevant domain |
 | **Novelty** | 5 = new capability/approach not previously possible · 3 = meaningful increment on known approach · 1 = restatement of known material |
 
@@ -493,15 +493,15 @@ Tagging: lowercase keyword match first (free, covers ~80%); unmatched items get 
 `interests.yaml` — the knobs the spec asks for, all in one reviewable file:
 
 ```yaml
-priority_topics: [agents.mcp, engineering.code-gen, engineering.context, models.local, retrieval.rag]
-interests: [python, fastapi, sqlite, duckdb, claude-code, trading-systems, local-first]
-stack: [python, typescript, fastapi, sqlite, postgres, docker, wsl]
-learning_goals: [agent memory architectures, production llm evaluation]
+priority_topics: [industry.strategy, frontier.capabilities, enterprise.adoption, agents.autonomy, policy.regulation, ai.research-direction]
+interests: [ai-strategy, frontier-models, enterprise-ai, ai-policy, agents, thought-leadership, claude-code, local-first, trading-systems]
+stack: [python, typescript, sqlite, docker, wsl]
+learning_goals: [where AI capabilities are heading over the next 6-24 months, enterprise AI adoption and business impact, AI policy and governance, agent memory architectures, production llm evaluation]
 architecture_philosophy: >
   Local-first, deterministic pipelines, low operational cost, monolith-by-default,
   boring technology, human-in-the-loop.
 ignore:
-  topics: [crypto, web3, model-release-hype]
+  topics: [crypto, web3]
   people: []
   repos: []
 thresholds:
