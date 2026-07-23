@@ -70,14 +70,21 @@ github:
     - Aider-AI/aider
     - langchain-ai/langgraph
     - modelcontextprotocol/specification
-    - ollama/ollama
     - vllm-project/vllm
-    - BerriAI/litellm
     - anthropics/claude-code
     - stanfordnlp/dspy
-    - pydantic/pydantic-ai
-    - ggml-org/llama.cpp
     - huggingface/transformers
+    # Dropped 2026-07-24 on a week of `mark` feedback: each below scored 0 useful
+    # against >=3 noise, all bare version-bump / CI-build tags the digest can't
+    # act on (llama.cpp b10068.. are per-commit CI tags; litellm were dev/rc
+    # prereleases). The score can't filter them — useful and noise items scored
+    # identically (avg rel 4.4 either way), so the source is the only lever.
+    # Majors still reach us via HN (same reasoning as Anthropic's blog above).
+    # Re-add if a felt gap appears.
+    #   - ollama/ollama          # 0 useful / 3 noise
+    #   - BerriAI/litellm        # 0 useful / 3 noise (dev/rc prereleases)
+    #   - pydantic/pydantic-ai   # 0 useful / 3 noise
+    #   - ggml-org/llama.cpp     # 0 useful / 4 noise (CI build tags)
     # Added 2026-07-17. modelcontextprotocol/servers carries implementation
     # changes the spec repo doesn't; duckdb is an interests.yaml interest
     # (SignalForge itself is SQLite). Considered and skipped: microsoft/autogen
