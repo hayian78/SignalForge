@@ -30,6 +30,12 @@ is met.
   spent 0 tokens, re-rendered byte-identically).
 
 ### Changed
+- Dropped four zero-yield GitHub release watches (`ggml-org/llama.cpp`,
+  `ollama/ollama`, `BerriAI/litellm`, `pydantic/pydantic-ai`) from `sources.yaml`
+  after a week of `mark` feedback: each scored 0 useful against ≥3 noise, all
+  bare version-bump / CI-build tags. The 3-dimension score could not separate
+  them (useful and noise items averaged the same relevance), so the source list
+  — not a threshold — was the only lever. Majors still arrive via HN.
 - `RUBRIC_VERSION` bumped `triage-v1` → `triage-v2`: the keep-rule now names the
   `thresholds` config keys instead of hardcoding the numeric bar, so tuning
   `interests.yaml` can no longer silently contradict the prompt.
