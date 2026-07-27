@@ -9,6 +9,7 @@ throwaway under `tmp_path` (CLAUDE.md §8).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -52,7 +53,7 @@ def _mark(db_path: Path, item_ref: str, verdict: str, *extra: str) -> Result:
     )
 
 
-def _feedback_rows(db_path: Path, item_id: int) -> list[object]:
+def _feedback_rows(db_path: Path, item_id: int) -> list[sqlite3.Row]:
     with connection(db_path) as conn:
         return list(get_feedback(conn, item_id))
 
