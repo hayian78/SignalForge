@@ -15,6 +15,7 @@ Directly touches agent memory, a stated learning goal, with a credible new mecha
 **Link:** https://example.com/agent-memory
 - [ ] useful <!-- sf:item=2 v=useful -->
 - [ ] noise <!-- sf:item=2 v=noise -->
+- [ ] exceptional <!-- sf:item=2 v=exceptional -->
 
 ## 2. MCP sampling lands everywhere
 
@@ -24,6 +25,7 @@ Working code and benchmarks showing real throughput gains on production MCP serv
 **Link:** https://simonwillison.net/2026/Jul/15/mcp-sampling/
 - [ ] useful <!-- sf:item=1 v=useful -->
 - [ ] noise <!-- sf:item=1 v=noise -->
+- [ ] exceptional <!-- sf:item=1 v=exceptional -->
 
 ---
 

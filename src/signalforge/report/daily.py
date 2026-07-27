@@ -39,7 +39,7 @@ from pathlib import Path
 import jinja2
 
 from signalforge.db import DigestItem, count_killed_items, get_digest_items, get_latest_run
-from signalforge.feedback import checkbox_marker
+from signalforge.feedback import CHECKBOX_VERDICTS, checkbox_marker
 from signalforge.models import SourceType
 
 __all__ = [
@@ -311,6 +311,10 @@ def _template_env() -> jinja2.Environment:
     # drift (DESIGN §11). This is a pure formatting helper — no DB write crosses
     # the report/ boundary (CLAUDE.md §2).
     env.globals["checkbox_marker"] = checkbox_marker
+    # Which boxes render is the vocabulary's decision, not the template's, so
+    # adding a rung stays a one-line change in `feedback.py` and the parser can
+    # never fall out of step with what the digest offers.
+    env.globals["checkbox_verdicts"] = CHECKBOX_VERDICTS
     return env
 
 

@@ -19,6 +19,9 @@ import pytest
 
 from signalforge.db import get_feedback, upsert_item
 from signalforge.feedback import (
+    CHECKBOX_VERDICTS,
+    LADDER,
+    VERDICTS,
     HarvestResult,
     Mark,
     checkbox_marker,
@@ -103,6 +106,26 @@ def test_checkbox_marker_round_trips_through_parse_marks() -> None:
     # Flip the rendered (always-empty) box to checked, as a reader would.
     checked = line.replace("- [ ]", "- [x]", 1)
     assert parse_marks(checked) == [Mark(item_id=42, verdict="useful")]
+
+
+@pytest.mark.parametrize("verdict", CHECKBOX_VERDICTS)
+def test_every_checkbox_verdict_round_trips(verdict: str) -> None:
+    """Whatever the vocabulary offers as a box, the parser must recover — so a
+    new rung can never render without being harvestable."""
+    checked = checkbox_marker(42, verdict).replace("- [ ]", "- [x]", 1)
+    assert parse_marks(checked) == [Mark(item_id=42, verdict=verdict)]
+
+
+def test_ladder_is_ordinal_and_excludes_missed() -> None:
+    """The rungs are ranked weakest-first and `missed` sits off the ladder.
+
+    Guards the Phase 1 gate trap (DESIGN §16): aggregations must reduce an item
+    to its highest rung, which is only definable if this order is stable.
+    """
+    assert LADDER == ("noise", "useful", "exceptional")
+    assert "missed" not in LADDER
+    assert set(LADDER) == set(CHECKBOX_VERDICTS)
+    assert set(CHECKBOX_VERDICTS) < set(VERDICTS)
 
 
 def test_rendered_digest_marker_round_trips(conn: sqlite3.Connection) -> None:
@@ -211,8 +234,17 @@ def test_harvest_marks_run_twice_records_zero_new_rows_the_second_time(
     assert path.read_bytes() == original_bytes
 
 
+@pytest.mark.parametrize(
+    ("first_verdict", "second_verdict"),
+    [
+        ("useful", "noise"),
+        # Two rungs of the same ladder: the case an aggregation must collapse to
+        # the highest rather than counting twice (DESIGN §11).
+        ("useful", "exceptional"),
+    ],
+)
 def test_harvest_marks_records_both_verdicts_on_one_item(
-    conn: sqlite3.Connection, tmp_path: Path
+    conn: sqlite3.Connection, tmp_path: Path, first_verdict: str, second_verdict: str
 ) -> None:
     """Both boxes ticked on one item: the harvest must record BOTH rows (matching
     the CLI path) without raising, despite the migration-1 PK (item_id,
@@ -223,15 +255,20 @@ def test_harvest_marks_records_both_verdicts_on_one_item(
     _write_daily(
         vault,
         TARGET_DATE_STR,
-        f"- [x] useful <!-- sf:item={item_id} v=useful -->\n"
-        f"- [x] noise <!-- sf:item={item_id} v=noise -->\n",
+        f"- [x] {first_verdict} <!-- sf:item={item_id} v={first_verdict} -->\n"
+        f"- [x] {second_verdict} <!-- sf:item={item_id} v={second_verdict} -->\n",
     )
 
     first = harvest_marks(conn, vault)
 
     assert first.marks_found == 2
     assert first.rows_recorded == 2
-    assert {row["verdict"] for row in get_feedback(conn, item_id)} == {"useful", "noise"}
+    verdicts = {row["verdict"] for row in get_feedback(conn, item_id)}
+    assert verdicts == {first_verdict, second_verdict}
+    # Two rungs coexist as separate rows, so an item's rating is the highest of
+    # them — the reduction every aggregation owes the Phase 1 gate (DESIGN §16).
+    rungs = [v for v in verdicts if v in LADDER]
+    assert max(rungs, key=LADDER.index) == max((first_verdict, second_verdict), key=LADDER.index)
 
     # Idempotency still holds with distinct timestamps: the UNIQUE(item_id,
     # verdict) index makes a re-harvest a no-op.

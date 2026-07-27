@@ -36,6 +36,8 @@ from typing import Final
 from signalforge import db
 
 __all__ = [
+    "CHECKBOX_VERDICTS",
+    "LADDER",
     "MARK_RE",
     "VERDICTS",
     "HarvestResult",
@@ -47,23 +49,45 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-VERDICTS: Final = ("useful", "noise", "missed")
-"""The `feedback.verdict` vocabulary (DESIGN §5). `useful`/`noise` render as
-digest checkboxes; `missed` — "this should have been surfaced" — is CLI-only,
-because a rendered item was, by definition, surfaced."""
+VERDICTS: Final = ("useful", "noise", "exceptional", "missed")
+"""The `feedback.verdict` vocabulary (DESIGN §5). `useful`/`noise`/`exceptional`
+render as digest checkboxes; `missed` — "this should have been surfaced" — is
+CLI-only, because a rendered item was, by definition, surfaced."""
 
-_CHECKBOX_VERDICTS: Final = ("useful", "noise")
-"""The verdicts that render as a checkbox affordance. Not `missed`."""
+LADDER: Final = ("noise", "useful", "exceptional")
+"""The ordinal strength ladder, weakest first. `missed` is absent — it describes
+an item the digest *didn't* show, so it sits off the ladder rather than below it.
+
+An item may hold several rungs at once (`UNIQUE(item_id, verdict)` stores each
+separately), so aggregations reduce it to its highest — never `verdict =
+'useful'`. Rationale and the acceptance gate that depends on it: DESIGN §11, §16."""
+
+CHECKBOX_VERDICTS: Final = ("useful", "noise", "exceptional")
+"""The verdicts that render as a checkbox affordance, in render order. Not
+`missed`. The daily template iterates this, so it is the single place that
+decides which boxes a digest offers — same reason `checkbox_marker` is the
+single place that decides how one looks.
+
+Render order is deliberately *not* ladder order: new rungs append, so the box
+layout of every already-published digest stays stable and readers keep their
+muscle memory for which line is which."""
 
 # The marker the template emits and this module parses. Anchored to a task-list
 # item so a bare mention of the comment elsewhere in prose can never be mistaken
 # for a mark. Groups: the checkbox state, the id, and the verdict — the id and
 # verdict are captured twice (checkbox label + comment) and cross-checked so a
 # hand-edited half-marker is ignored rather than half-trusted.
+#
+# The alternation is built from `CHECKBOX_VERDICTS` so the vocabulary and the
+# parser cannot drift. The vocabulary is kept prefix-free (no verdict is a
+# prefix of another) so the label capture stays unambiguous regardless of the
+# tuple's order.
+_VERDICT_ALT: Final = "|".join(CHECKBOX_VERDICTS)
+
 MARK_RE: Final = re.compile(
     r"^\s*-\s*\[(?P<state>[ xX])\]\s*"
-    r"(?P<label>useful|noise)\s*"
-    r"<!--\s*sf:item=(?P<item>\d+)\s+v=(?P<verdict>useful|noise)\s*-->\s*$"
+    rf"(?P<label>{_VERDICT_ALT})\s*"
+    rf"<!--\s*sf:item=(?P<item>\d+)\s+v=(?P<verdict>{_VERDICT_ALT})\s*-->\s*$"
 )
 
 

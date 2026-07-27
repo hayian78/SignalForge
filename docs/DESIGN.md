@@ -293,7 +293,7 @@ CREATE TABLE runs (
 );
 CREATE TABLE feedback (                      -- human-in-the-loop signal for tuning
     item_id     INTEGER REFERENCES items(id),
-    verdict     TEXT NOT NULL,               -- useful | noise | missed (added manually/via CLI)
+    verdict     TEXT NOT NULL,               -- noise < useful < exceptional (ordinal) | missed (off-ladder)
     note        TEXT,
     created_at  TEXT NOT NULL,
     PRIMARY KEY (item_id, created_at)
@@ -515,7 +515,7 @@ This file is injected (cached) into every scoring and synthesis prompt. It is th
 
 The `feedback` table (§5) is the sensor; this is the servo. Design constraint up front: **never per-mark reactive** — a single thumbs-down changes nothing except a stored row. Adaptation is batch, aggregated, capped, and *proposed rather than auto-applied*.
 
-**Capture (Phase 1).** `signalforge mark <id> useful|noise|missed` (+ optional note). `missed` — "this should have been surfaced" — is the highest-value verdict; the weekly brief footer lists near-miss items (scored just below threshold) to make it easy to give. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table.
+**Capture (Phase 1).** `signalforge mark <id> useful|noise|exceptional|missed` (+ optional note). The first three form an **ordinal ladder** — `noise < useful < exceptional` — where `exceptional` means "not merely worth surfacing; worth remembering". An item may carry more than one rung (`UNIQUE(item_id, verdict)` stores each separately), so **an item's rating is its highest rung, and every aggregation must reduce to that** rather than testing `verdict = 'useful'` — otherwise the Phase 1 acceptance gate below deflates as marks migrate to the top rung. `missed` sits off the ladder — it describes an item the digest *didn't* show — and is CLI-only, because a rendered item was by definition surfaced; it is the highest-value verdict; the weekly brief footer lists near-miss items (scored just below threshold) to make it easy to give. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table.
 
 **Adaptation (Phase 2), monthly, alongside the monthly report:**
 
@@ -660,7 +660,7 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 ### Phase 1 — MVP: the weekly question (4–6 more weekends)
 **Status — not started** (gated on Phase 0's acceptance).
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml`; arXiv + awesome-list diffing; 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands.
-**Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated `useful`.
+**Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated **`useful` or better** — an item's rating is its highest rung on the §11 ladder, so an item marked only `exceptional` counts toward this gate.
 
 ### Phase 2 — Intelligence layer (months 3–5) → *V2*
 **Status — not started.**

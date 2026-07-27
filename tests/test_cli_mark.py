@@ -9,6 +9,7 @@ throwaway under `tmp_path` (CLAUDE.md §8).
 from __future__ import annotations
 
 import logging
+import sqlite3
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from typer.testing import CliRunner, Result
 
 from signalforge.cli import app
 from signalforge.db import connection, get_feedback, upsert_item
+from signalforge.feedback import VERDICTS
 from tests.conftest import make_item
 
 runner = CliRunner()
@@ -52,7 +54,7 @@ def _mark(db_path: Path, item_ref: str, verdict: str, *extra: str) -> Result:
     )
 
 
-def _feedback_rows(db_path: Path, item_id: int) -> list[object]:
+def _feedback_rows(db_path: Path, item_id: int) -> list[sqlite3.Row]:
     with connection(db_path) as conn:
         return list(get_feedback(conn, item_id))
 
@@ -93,6 +95,19 @@ def test_marking_the_same_item_twice_is_idempotent_and_says_so(db_path: Path) ->
     assert second.exit_code == 0
     assert "already marked" in second.output
     assert len(_feedback_rows(db_path, item_id)) == 1
+
+
+@pytest.mark.parametrize("verdict", VERDICTS)
+def test_mark_accepts_every_verdict_in_the_vocabulary(db_path: Path, verdict: str) -> None:
+    """Including `exceptional` — the CLI validates against `VERDICTS`, so a new
+    rung must be markable from the terminal, not only via a vault checkbox."""
+    item_id = _seed_item(db_path)
+
+    result = _mark(db_path, str(item_id), verdict)
+
+    assert result.exit_code == 0, result.output
+    rows = _feedback_rows(db_path, item_id)
+    assert [row["verdict"] for row in rows] == [verdict]
 
 
 def test_mark_rejects_an_unknown_verdict_with_exit_2(db_path: Path) -> None:
