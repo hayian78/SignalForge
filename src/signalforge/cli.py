@@ -764,7 +764,7 @@ def mark(
         str | None, typer.Option("--note", help="Optional free-text note stored with the mark.")
     ] = None,
 ) -> None:
-    """Record a human `useful|noise|missed` mark on an item (DESIGN §11, Phase 1).
+    """Record a human `useful|noise|exceptional|missed` mark on an item (DESIGN §11, Phase 1).
 
     A mark is a human action, not a pipeline run — so it writes no `runs` row and
     spends no tokens. Idempotent (CLAUDE.md §3): marking the same item with the
