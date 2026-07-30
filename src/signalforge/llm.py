@@ -755,19 +755,20 @@ def run_source_scout(
     not "fix" it (DESIGN §8).
 
     **Exactly one API request. A paused turn is not resumed.** That is a cost
-    decision, and it is what makes this call's ceiling provable rather than
-    estimated. `max_tokens` bounds output *per request*, so resuming multiplies it:
-    with two resumes the enforced ceiling is 3 × 16,384 output tokens ≈ $6.52/month,
-    well past this feature's ≤$2.50 budget, and no `max_tokens` that avoids
-    truncation fixes that while resumes exist. One request bounds the absolute worst
-    case at ~$2.35/month from code constants alone — no assumption about how much
-    the model actually writes.
+    decision, and it is what makes this call's ceiling provable rather than estimated.
+    `max_tokens` bounds output *per request*, so resuming multiplies it — enough to
+    put the enforced ceiling several times past this feature's budget, and no
+    `max_tokens` low enough to fix that is high enough to avoid truncating a run that
+    has already paid for its searches. One request bounds the worst case from code
+    constants alone; the arithmetic lives with those constants, in
+    `SCOUT_MONTHLY_CEILING_USD`, rather than being restated here where it would drift
+    out of step with them.
 
-    What that costs: a turn that pauses yields nothing that week. Acceptable here
-    because the searches are capped at 6 (so the server-side loop rarely reaches a
-    pause at all), the pause is recorded and surfaces in the next digest, and the
-    run simply happens again next Sunday. If pauses turn out to be common, that will
-    be visible in `runs.errors` and is the moment to revisit with real data.
+    What that costs: a turn that pauses yields nothing that week. Acceptable because
+    searches are capped low enough that the server-side loop rarely reaches a pause,
+    the pause is recorded and surfaces in the next digest, and the run happens again
+    next Sunday. If pauses turn out to be common, that will be visible in
+    `runs.errors` and is the moment to revisit with real data.
 
     **Never raises for an API failure** — deliberate, and unlike `run_triage_batch`.
     Searches and tokens are spent before the response is read, so an exception would

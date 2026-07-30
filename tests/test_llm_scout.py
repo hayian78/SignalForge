@@ -324,14 +324,15 @@ def _search_budget(request: dict[str, Any]) -> int:
 def test_the_scout_makes_exactly_one_api_request() -> None:
     """One request per run is the fact that makes this call's ceiling provable.
 
-    `max_tokens` bounds output *per request*, so resuming a paused turn multiplies
-    it: at two resumes the enforced ceiling is 3 x 16,384 output tokens ~ $6.52/month,
-    past this feature's budget, and no `max_tokens` that avoids truncation fixes
-    that while resumes exist. With one request the absolute worst case is ~$2.35/month
-    from code constants alone.
+    `max_tokens` bounds output *per request*, so resuming a paused turn multiplies the
+    enforced ceiling — several times past this feature's budget, with no `max_tokens`
+    low enough to fix it that is high enough to avoid truncating a paid-for run. The
+    live arithmetic lives in `llm.SCOUT_MONTHLY_CEILING_USD` and is enforced by
+    `test_the_worst_case_cost_stays_within_the_recorded_ceiling`; it is not restated
+    here, because a second copy of a dollar figure is a second thing to keep in step.
 
     Asserted rather than commented because re-adding a resume loop is a natural
-    "improvement" that would silently triple the ceiling.
+    "improvement" that would silently multiply the ceiling.
     """
     _, client = _run([_message(proposals=[_proposal()])])
 
