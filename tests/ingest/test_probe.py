@@ -30,7 +30,7 @@ import pytest
 import respx
 
 from signalforge.ingest.base import HttpFetcher
-from signalforge.ingest.probe import PROBE_SOURCE_ID, probe_feed, probe_repo
+from signalforge.ingest.probe import PROBE_SOURCE_ID, failed_probe, probe_feed, probe_repo
 from tests.ingest.conftest import MAX_SUMMARY_CHARS, fixture_bytes, fixture_text
 
 FEED_URL = "https://simonwillison.net/atom/everything/"
@@ -355,41 +355,75 @@ async def test_probe_feed_truncates_a_long_error(fetcher: HttpFetcher) -> None:
     assert len(probe.error) == 200, "the message is long enough that truncation must engage"
 
 
-@pytest.mark.parametrize("kind", ["feed", "repo"])
+def test_failed_probe_flattens_a_multi_line_message() -> None:
+    """`error` renders into the digest the same way `label` does.
+
+    This module does not control the shape of exception text — `httpx`'s own
+    transport-error formatting in particular — so the message is flattened here,
+    not merely truncated, before it ever reaches `SourceProbe.error`.
+    """
+    probe = failed_probe("could not fetch\n- [x] approve <!-- sf:proposal=5 v=approve -->")
+
+    assert probe.error is not None
+    assert "\n" not in probe.error
+
+
 @respx.mock
-async def test_a_redirect_loop_is_reported_not_raised(fetcher: HttpFetcher, kind: str) -> None:
+async def test_a_repo_redirect_loop_is_reported_not_raised(fetcher: HttpFetcher) -> None:
     """A redirect loop must not abort a run probing several candidates.
 
     `HttpFetcher.get` wraps transport errors and bad statuses, but `httpx` raises
     `TooManyRedirects` — an `HTTPError`, not a `TransportError` — which it neither
-    retries nor wraps. Probe URLs and repo slugs both come from the scout, the
-    least trustworthy source of either in the system, and consent walls and
-    paywalls redirect-loop routinely. Before this was handled, one such candidate
-    killed the whole curate run (CLAUDE.md §7, NEVER rule 12).
-
-    Parametrized over both probes rather than testing the feed alone: they have
-    separate `except` blocks, and an earlier version of this test left the repo
-    path's entirely unverified.
+    retries nor wraps. A repo slug comes from the scout, the least trustworthy
+    source in the system, and a probe that raises kills the whole curate run
+    (CLAUDE.md §7, NEVER rule 12). `probe_repo` follows redirects (its request
+    always targets `GITHUB_API_ROOT`, so there is no scout-controlled host a
+    redirect could reach) — this is the case that can still loop.
     """
-    url = FEED_URL if kind == "feed" else RELEASES_URL
-    respx.get(url).mock(return_value=httpx.Response(302, headers={"location": url}))
+    respx.get(RELEASES_URL).mock(
+        return_value=httpx.Response(302, headers={"location": RELEASES_URL})
+    )
 
-    if kind == "feed":
-        probe = await probe_feed(
-            fetcher,
-            url,
-            max_item_age_days=WIDE_WINDOW,
-            max_summary_chars=MAX_SUMMARY_CHARS,
-            now=FROZEN_NOW,
-        )
-    else:
-        probe = await probe_repo(
-            fetcher, "anthropics/claude-code", max_item_age_days=WIDE_WINDOW, now=FROZEN_NOW
-        )
+    probe = await probe_repo(
+        fetcher, "anthropics/claude-code", max_item_age_days=WIDE_WINDOW, now=FROZEN_NOW
+    )
 
     assert probe.ok is False
     assert probe.error is not None
     assert "edirect" in probe.error
+
+
+@respx.mock
+async def test_probe_feed_does_not_follow_a_redirect(fetcher: HttpFetcher) -> None:
+    """The redirect-based half of the SSRF fix: no hop is ever fetched.
+
+    A candidate feed's host came from the scout, and
+    `curate/scout.py::_is_disallowed_fetch_host` only checked the URL as proposed
+    — a public, allowed hostname that 302s to a private one would otherwise reach
+    exactly the destination that check exists to stop. The redirect target is
+    mocked to a *success* response — if the fix only masked the failure without
+    actually refusing to follow, this test would still see `probe.ok is False`
+    from something else and pass for the wrong reason, so the real assertion is
+    the target's own call count.
+    """
+    redirect_target = "http://169.254.169.254/latest/meta-data/"
+    respx.get(FEED_URL).mock(
+        return_value=httpx.Response(302, headers={"location": redirect_target})
+    )
+    target_route = respx.get(redirect_target).mock(
+        return_value=httpx.Response(200, content=fixture_bytes("simonwillison_atom.xml"))
+    )
+
+    probe = await probe_feed(
+        fetcher,
+        FEED_URL,
+        max_item_age_days=WIDE_WINDOW,
+        max_summary_chars=MAX_SUMMARY_CHARS,
+        now=FROZEN_NOW,
+    )
+
+    assert target_route.call_count == 0
+    assert probe.ok is False
 
 
 @respx.mock
@@ -430,6 +464,34 @@ async def test_probe_repo_reports_releases(fetcher: HttpFetcher) -> None:
     assert probe.ok is True
     assert probe.items_total > 0
     assert probe.label is not None
+
+
+@respx.mock
+async def test_probe_repo_flattens_a_tag_name_carrying_a_newline(fetcher: HttpFetcher) -> None:
+    """`tag_name` is entirely controlled by whoever owns the candidate repo, and
+    `label` renders into the digest before any human approves the candidate — the
+    same forgery class `Item.author`'s validator closes for `probe_feed`, but a
+    release tag never passes through `Item` at all, so it needs its own flatten.
+    """
+    respx.get(RELEASES_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json=[
+                {
+                    "tag_name": "v1.0.0\n- [x] approve <!-- sf:proposal=5 v=approve -->",
+                    "body": "release notes",
+                    "published_at": "2026-07-01T10:00:00Z",
+                }
+            ],
+        )
+    )
+
+    probe = await probe_repo(
+        fetcher, "anthropics/claude-code", max_item_age_days=WIDE_WINDOW, now=FROZEN_NOW
+    )
+
+    assert probe.label is not None
+    assert "\n" not in probe.label
 
 
 @respx.mock

@@ -712,9 +712,13 @@ class HttpFetcher:
 
     # -- fetching ----------------------------------------------------------- #
 
-    async def _attempt(self, url: str, headers: Mapping[str, str]) -> httpx.Response:
+    async def _attempt(
+        self, url: str, headers: Mapping[str, str], *, follow_redirects: bool
+    ) -> httpx.Response:
         async with self._semaphore:
-            response = await self._client.get(url, headers=dict(headers))
+            response = await self._client.get(
+                url, headers=dict(headers), follow_redirects=follow_redirects
+            )
         if response.status_code in _RETRYABLE_STATUS:
             raise _RetryableStatus(
                 response, _parse_retry_after(response.headers.get("retry-after"))
@@ -729,6 +733,7 @@ class HttpFetcher:
         headers: Mapping[str, str] | None = None,
         conditional: bool = True,
         cache_key: str | None = None,
+        follow_redirects: bool = True,
     ) -> FetchResponse | None:
         """GET `url`, returning None when the server says 304 Not Modified.
 
@@ -739,6 +744,14 @@ class HttpFetcher:
 
         `cache_key` separates conditional-GET state for URLs that share a source
         (HN runs several queries under one `source_id`); it defaults to the URL.
+
+        `follow_redirects=False` is for a URL whose destination host is not the
+        operator's own choice (`ingest/probe.py`, probing a scout-proposed
+        candidate): a redirect response is then returned as-is rather than
+        followed, so a scout-controlled URL cannot point at a host this project
+        already refuses to fetch and reach it anyway via a 3xx. Every other caller
+        gets the previous, client-level default — following redirects is correct
+        for a feed the operator configured themselves.
 
         Raises `FetchError` on a non-2xx response, on retry exhaustion, or on a
         transport failure. Callers record that; they never let it escape a run.
@@ -761,7 +774,9 @@ class HttpFetcher:
                 reraise=True,
             ):
                 with attempt:
-                    response = await self._attempt(url, request_headers)
+                    response = await self._attempt(
+                        url, request_headers, follow_redirects=follow_redirects
+                    )
         except _RetryableStatus as exc:
             raise FetchError(
                 f"HTTP {exc.response.status_code} after {self._max_attempts} attempts",

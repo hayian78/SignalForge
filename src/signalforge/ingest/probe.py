@@ -43,6 +43,16 @@ that it was ever considered.
 body has nothing to measure. It also keeps probe traffic out of the validator
 store: a candidate that is never approved must not leave conditional-GET state
 behind for a `source_id` that does not exist.
+
+### `probe_feed` does not follow redirects
+
+`curate/scout.py::_is_disallowed_fetch_host` checks a candidate feed URL's host
+once, before the first fetch — the host the scout proposed, not necessarily the
+one the fetch would end up talking to. A public, allowed hostname that 302s to a
+private one would otherwise reach exactly the destination that check exists to
+stop. `probe_repo` keeps the default (`follow_redirects=True`): its request always
+targets `GITHUB_API_ROOT` regardless of what the candidate slug names, so there is
+no scout-controlled host in that request to redirect away from.
 """
 
 from __future__ import annotations
@@ -62,6 +72,7 @@ from signalforge.ingest.github import (
     parse_github_timestamp,
 )
 from signalforge.ingest.rss import parse_feed
+from signalforge.models import flatten_to_single_line
 
 __all__ = [
     "PROBE_SOURCE_ID",
@@ -185,7 +196,12 @@ def failed_probe(message: str, *, status_code: int | None = None) -> SourceProbe
     """
     return SourceProbe(
         ok=False,
-        error=message[:_MAX_ERROR_CHARS],
+        # Flattened like `label` below: `message` can carry exception text this
+        # module does not control the shape of (`httpx`'s own `TransportError`
+        # formatting, in particular), and `error` renders into the digest the same
+        # way `label` does. Flattened before truncating so the character cap means
+        # what it says about the text actually shown.
+        error=flatten_to_single_line(message)[:_MAX_ERROR_CHARS],
         status_code=status_code,
         items_total=0,
         items_in_window=0,
@@ -213,7 +229,14 @@ async def probe_feed(
     """
     stamp = now or datetime.now(UTC)
     try:
-        response = await fetcher.get(url, source_id=PROBE_SOURCE_ID, conditional=False)
+        # `follow_redirects=False`: this URL's host came from the scout, not the
+        # operator, and `curate/scout.py::_is_disallowed_fetch_host` only checked
+        # the URL as proposed. A redirect is exactly how that check would
+        # otherwise be walked around — a public, allowed hostname that 302s to an
+        # internal address. Reported as a failed probe rather than followed.
+        response = await fetcher.get(
+            url, source_id=PROBE_SOURCE_ID, conditional=False, follow_redirects=False
+        )
     except FetchError as exc:
         logger.info("feed probe failed", extra={"url": url, "error": str(exc)})
         return failed_probe(str(exc), status_code=exc.status_code)
@@ -353,7 +376,11 @@ async def probe_repo(
         items_in_window=len(in_window),
         median_summary_chars=int(statistics.median(body_lengths)),
         newest_published_at=max(published, default=None),
-        label=str(newest.get("tag_name") or "") or None,
+        # Flattened: `tag_name` is entirely controlled by whoever owns the candidate
+        # repo, and it renders into the digest before any human approves the
+        # candidate — the same forgery class `Item.author`'s validator closes for
+        # `probe_feed`, but a release tag never passes through `Item` at all.
+        label=flatten_to_single_line(str(newest.get("tag_name") or "")) or None,
     )
 
 
