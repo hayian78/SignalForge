@@ -527,15 +527,10 @@ Three constraints make this safe:
 - **Nothing changes without a tick.** There is no auto-apply path, and no confidence
   threshold that bypasses the operator.
 
-  That guarantee has a non-obvious dependency: **no stored proposal text may contain a
-  control character**, enforced in `db.insert_proposal`. The digest renders the scout's
-  rationale and evidence notes into a markdown file where a *line* is structure, and the
-  harvester reads a decision from any line matching its checkbox pattern — so a rationale
-  free to contain a newline can carry a pre-ticked approval for an arbitrary proposal id,
-  which the next harvest records as the operator's decision. Prose is flattened; identity
-  fields (`dedup_key`, citation URLs) are refused, because rewriting those changes what
-  the row means. `report/daily.py` flattens again at the render boundary, which is a no-op
-  for anything the pipeline wrote and covers a row edited by hand.
+  That guarantee rests on a rule with wider scope than curation — see **§13.1, a line in
+  the vault is structure**. In short: nothing rendered into a vault file may contain a
+  control character, because the harvesters read a decision from any line that matches
+  their checkbox pattern.
 - **Applying only appends or comments out.** `sources.yaml` is a document whose comments
   carry the reasoning behind every past pruning decision; a YAML round-trip would erase
   them. An add appends a dated entry, a retirement comments the existing lines out in place —
@@ -619,6 +614,44 @@ Two notes for §8's accounting:
   the next run, so a breakpoint would pay the 1.25× write premium for exactly zero reads.
 
 ---
+
+### 13.1 A line in the vault is structure
+
+The digest is not only output — it is also **input**. `feedback.py` harvests an item mark
+and `curate/approvals.py` harvests a proposal decision by scanning every line of every
+`vault/daily/*.md` for a checkbox pattern, and neither can tell which lines the template
+wrote from which came from data. So any text that renders into a vault file and can contain
+a newline can *fabricate a decision the operator never made*.
+
+Three fields make that reachable, in descending order of how easy they are to reach:
+
+- **`items.title`** — controlled outright by whoever publishes the feed. No LLM and no
+  prompt injection required: a feed publishing a title containing a newline followed by
+  `- [x] useful <!-- sf:item=1 v=useful -->` records that mark on the next digest run, for
+  any item id it can guess, corrupting the ground-truth set relevance tuning depends on
+  (§11) and that the curation scout reasons over (§7.1).
+- **`proposals.rationale` and evidence notes** — the scout's own prose, so reachable by
+  prompt injection from any page its web search reads.
+- **`scores.reasoning` and `runs.errors` messages** — LLM- and exception-authored text on
+  the same page.
+
+The rule: **flatten model- and world-authored text to a single line at the boundary where
+it is stored**, and refuse rather than repair for identity fields, where a rewrite would
+change what the record means. `models.flatten_to_single_line` and
+`models.has_control_characters` are the two primitives; `Item._flatten_title`,
+`db.insert_proposal`, and `db._cited_proposals` are the three places that apply them.
+
+Two notes for anyone extending this:
+
+- A defence at the *render* boundary is only worth adding where the read path can hand back
+  unsanitized text. It can for proposals (`_row_to_proposal` reads columns into a
+  dataclass) and it cannot for items (`_row_to_item` reconstructs an `Item`, so the
+  validator runs again). `report/daily.py` therefore re-flattens proposal prose and does
+  not re-flatten titles — an unreachable defence is one nobody can test.
+- Both harvesters treat a matching line as authoritative. Making the marker itself
+  unforgeable (a signature) was considered and rejected: it adds a key to manage for a
+  single-user local tool, and denying newlines at the source closes the hole completely
+  because a marker must begin a line.
 
 ## 8. Deterministic vs LLM Boundary
 

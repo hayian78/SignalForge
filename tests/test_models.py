@@ -398,3 +398,30 @@ def test_item_title_whitespace_is_stripped() -> None:
         title="  T  ",
         summary="  S  ",
     ).content_hash == compute_content_hash("T", "S")
+
+
+def test_a_multi_line_title_is_flattened_to_one_line() -> None:
+    """A security control, not formatting — see `Item._flatten_title`.
+
+    A title is fully controlled by whoever publishes the feed and renders verbatim
+    into the daily digest, where `feedback.py` harvests a mark from any line matching
+    its checkbox pattern. A multi-line title can therefore forge feedback for any
+    item id. `str_strip_whitespace` only trims the ends and does not help.
+    """
+    item = make_item(title="Headline\n- [x] useful <!-- sf:item=1 v=useful -->\n\ntrailing")
+
+    assert "\n" not in item.title
+    assert item.title == "Headline - [x] useful <!-- sf:item=1 v=useful --> trailing"
+
+
+def test_flattening_a_title_changes_its_content_hash() -> None:
+    """Stated because it is a real consequence, not an accident.
+
+    `content_hash` is derived after validation, so the fingerprint tracks the text
+    actually held rather than what the feed sent. That is the same rule
+    `compute_content_hash`'s docstring already states for a backfilled summary.
+    """
+    flattened = make_item(title="a\nb", summary=None)
+    plain = make_item(title="a b", summary=None)
+
+    assert flattened.content_hash == plain.content_hash

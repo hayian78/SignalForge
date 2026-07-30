@@ -213,8 +213,15 @@ class DigestContext:
 
 
 def _trim_reasoning(text: str, *, limit: int = _WHY_IT_MATTERS_MAX_CHARS) -> str:
-    """Collapse whitespace and cap length for a one-line skim, never regenerate it."""
-    cleaned = " ".join(text.split())
+    """Collapse to one line and cap length for a skim, never regenerate it.
+
+    The flattening is load-bearing, not cosmetic: this text renders into a vault file
+    whose lines `feedback.py` harvests marks from, so a multi-line value here could
+    forge a tick. It was previously safe only as a side effect of joining on
+    whitespace for the "60-second read" format — an explicit call means a future
+    reformat cannot quietly remove the protection.
+    """
+    cleaned = flatten_to_single_line(text)
     if len(cleaned) <= limit:
         return cleaned
     truncated = cleaned[:limit].rsplit(" ", 1)[0]
@@ -237,6 +244,10 @@ def _to_line(scored: DigestItem) -> DigestLine | None:
         return None
     return DigestLine(
         id=scored.item.id,
+        # Not flattened here, unlike the proposal fields below: every read path
+        # reconstructs an `Item`, so `Item._flatten_title` runs even for a title
+        # edited directly in the database. A second call here would be genuinely
+        # unreachable code, and an unreachable defence is one nobody can test.
         title=scored.item.title,
         url=scored.item.url,
         why_it_matters=_trim_reasoning(scored.reasoning),
@@ -260,8 +271,12 @@ def _source_failures(conn: sqlite3.Connection) -> tuple[SourceFailure, ...]:
         return ()
     return tuple(
         SourceFailure(
-            source_id=str(record.get("source_id", "?")),
-            message=str(record.get("message", "")),
+            # Flattened because this text comes from an exception message, which can
+            # quote a server response — and it renders into the same vault file whose
+            # lines carry decisions. Nothing reachable today writes a multi-line one;
+            # this is so that stays true without depending on which run kinds feed it.
+            source_id=flatten_to_single_line(str(record.get("source_id", "?"))),
+            message=flatten_to_single_line(str(record.get("message", ""))),
         )
         for record in run.errors
         if record.get("source_id") != _RUN_LEVEL_SOURCE_ID

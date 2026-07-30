@@ -326,6 +326,9 @@ class Item(BaseModel):
     """Derived from `url` when blank. UNIQUE in the DB."""
 
     title: str = Field(min_length=1)
+    """Flattened to one line by `_flatten_title` — see there for why that is a
+    security control and not formatting."""
+
     author: str | None = None
     published_at: datetime | None = None
     fetched_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -341,6 +344,32 @@ class Item(BaseModel):
     lang: str = "en"
     raw_path: str | None = None
     """Pointer into `data/http_cache/`."""
+
+    @field_validator("title", mode="after")
+    @classmethod
+    def _flatten_title(cls, value: str) -> str:
+        """Collapse a title to a single line.
+
+        **This is a security control.** A title is entirely controlled by whoever
+        publishes the feed, and it renders verbatim into the daily digest — a vault
+        markdown file where a *line* is structure. `feedback.py` then harvests a mark
+        from any line matching `MARK_RE`, so a feed publishing a title containing
+
+            Totally normal headline\n- [x] useful <!-- sf:item=1 v=useful -->
+
+        silently records `useful` feedback for any item id it can guess, including
+        its own, on the next digest run. That corrupts the ground-truth set relevance
+        tuning depends on (CLAUDE.md §4) and that the curation scout reasons over.
+
+        Flattened here, at the model boundary, so no consumer can hold a multi-line
+        title — the same shape `db.insert_proposal` uses for proposal prose.
+        `str_strip_whitespace` only trims the ends and does not help.
+
+        Note this changes `content_hash` for a title that contained newlines, since
+        the hash is derived after validation. That is correct: the hash should
+        fingerprint the text actually held.
+        """
+        return flatten_to_single_line(value)
 
     @field_validator("published_at", "fetched_at")
     @classmethod

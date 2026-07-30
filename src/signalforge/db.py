@@ -999,8 +999,35 @@ def _cited_proposals(rows: Sequence[sqlite3.Row]) -> list[Proposal]:
                 extra={"proposal_id": proposal.id, "kind": proposal.kind.value},
             )
             continue
+        if _unsafe_identity(proposal):
+            continue
         proposals.append(proposal)
     return proposals
+
+
+def _unsafe_identity(proposal: Proposal) -> bool:
+    """Whether a row's identity fields carry a control character. Drops it if so.
+
+    The read-side counterpart to `insert_proposal`'s refusal, and for the same
+    reason: `dedup_key` and every citation URL render into a vault markdown file
+    whose *lines* a later harvest reads decisions from, so a newline in either can
+    forge an approval for an arbitrary proposal.
+
+    Here rather than in `report/` because the digest is not the only consumer — the
+    `curate` CLI lists these and the applier writes them into `sources.yaml` — and a
+    defence that lives in one of three consumers is not a defence. Dropped rather
+    than repaired, matching the write side: rewriting an identity field changes what
+    the row means, and a row in this state was hand-edited or written by an older
+    shape, never produced by the pipeline.
+    """
+    unsafe = [proposal.dedup_key, *(entry["url"] for entry in proposal.evidence)]
+    if not any(has_control_characters(value) for value in unsafe):
+        return False
+    logger.warning(
+        "dropping a proposal whose identity fields carry a control character",
+        extra={"proposal_id": proposal.id, "kind": proposal.kind.value},
+    )
+    return True
 
 
 _INSERT_PROPOSAL = """
