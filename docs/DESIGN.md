@@ -463,14 +463,30 @@ Weekly, `signalforge curate` runs four ordered stages:
    lack — and reaching past our own sources. It never parses, counts, or normalizes.
 3. **Probe (deterministic).** Every candidate feed or repo is fetched and parsed *before it
    is ever shown*: item count inside `max_item_age_days`, median body length, HTTP status.
-   A candidate that 404s or serves only teaser stubs is recorded `invalid` and never
-   surfaces. This is the automated form of two failures already recorded in `sources.yaml`
-   by hand (`the-batch`: no feed exists; `stratechery`: paywalled to teaser stubs).
+
+   **`invalid` covers mechanical failure only** — the fetch failed, or nothing parseable
+   came back. Of the two failures already recorded in `sources.yaml` by hand, that catches
+   `the-batch` (no feed exists at any plausible path) and deliberately does *not* catch
+   `stratechery` (the feed parses; its entries are teasers because it is members-only).
+   Whether thin entries are worth a slot is a judgment, and encoding it would mean inventing
+   a threshold for "enough text" — which under NEVER rule 6 would have to be a `curation:`
+   knob. So the probe reports `median_summary_chars` and the human at the gate decides. The
+   cost is precise and accepted: a stub candidate consumes one of
+   `max_proposals_per_run` and a few lines of digest space. The alternative failure is worse
+   — a machine-invented threshold silently dropping a publication the operator wanted, with
+   no record it was considered.
+
    **`invalid` is not a permanent blacklist.** Probes also fail transiently — timeouts,
    503s, rate limits — and `ux_proposals_kind_key` means the scout can never re-suggest a
    candidate on its own, so one bad Sunday would otherwise remove a good feed forever. The
-   probe stage therefore re-probes existing `invalid` rows each run and reopens any that now
-   pass, and the failure reason is recorded in `probe` so the operator can see which it was.
+   probe stage therefore re-probes **every** existing `invalid` row each run and reopens any
+   that now pass, and the failure reason is recorded in `probe` so the operator can see which
+   it was. No reason is treated as durable enough to skip: `no parseable entries` is exactly
+   what a consent interstitial or a bad deploy serving HTML at the feed path produces, and a
+   repo that has not cut its first release yet is a candidate worth reopening in a month. The
+   cost of re-probing is one HTTP request per invalid row per week; the cost of skipping is
+   permanent, because the unique index means the scout can never re-suggest the candidate
+   itself.
 4. **Propose.** At most `curation.max_proposals_per_run` rows written to `proposals`,
    each carrying a rationale and at least one evidence URL.
 

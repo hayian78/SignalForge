@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A members-only publication's public feed: valid RSS, real dates, real links,
+  and entries whose bodies are one-sentence teasers rather than articles.
+
+  Modelled on the `stratechery` case recorded by hand in config/sources.yaml
+  ("feed/ parses fine, but 7 of the last 10 items are one-sentence teaser stubs
+  (~100-150 chars, no article body)"). This is the payload that proves a probe
+  must report `median_summary_chars` rather than only pass/fail: nothing here is
+  broken, so no mechanical check rejects it, yet it is worth almost nothing in a
+  digest. The judgment belongs to the operator, and this is the number that
+  informs it.
+-->
+<rss version="2.0">
+  <channel>
+    <title>Members Only Daily</title>
+    <link>https://members-only.example.com</link>
+    <description>Daily analysis for subscribers.</description>
+    <item>
+      <title>The Platform Shift Nobody Priced In</title>
+      <link>https://members-only.example.com/2026/07/platform-shift/</link>
+      <guid>https://members-only.example.com/2026/07/platform-shift/</guid>
+      <pubDate>Mon, 27 Jul 2026 11:00:00 GMT</pubDate>
+      <author>A. Analyst</author>
+      <description>Today's Article is for subscribers only.</description>
+    </item>
+    <item>
+      <title>Interconnects And Incentives</title>
+      <link>https://members-only.example.com/2026/07/interconnects/</link>
+      <guid>https://members-only.example.com/2026/07/interconnects/</guid>
+      <pubDate>Fri, 24 Jul 2026 11:00:00 GMT</pubDate>
+      <author>A. Analyst</author>
+      <description>This Article is available to Members. Subscribe to read on.</description>
+    </item>
+    <item>
+      <title>An Interview About Inference Costs</title>
+      <link>https://members-only.example.com/2026/07/inference-interview/</link>
+      <guid>https://members-only.example.com/2026/07/inference-interview/</guid>
+      <pubDate>Wed, 22 Jul 2026 11:00:00 GMT</pubDate>
+      <author>A. Analyst</author>
+      <description>Today's Article is for subscribers only.</description>
+    </item>
+    <item>
+      <title>This Week In Members Only</title>
+      <link>https://members-only.example.com/2026/07/this-week/</link>
+      <guid>https://members-only.example.com/2026/07/this-week/</guid>
+      <pubDate>Sun, 19 Jul 2026 11:00:00 GMT</pubDate>
+      <author>A. Analyst</author>
+      <description><![CDATA[
+        <p>The weekly roundup is the one public post that carries real text, which is
+        exactly why the median matters more than the maximum. This week covered the
+        shift in inference pricing, why the analyst consensus on agent frameworks
+        moved twice in a month, and what the latest round of enterprise pilots says
+        about where budget is actually going. The through-line: the interesting
+        constraint has moved from model capability to organisational absorption, and
+        the companies furthest along are the ones that treated the rollout as a
+        process-design problem rather than a procurement one. Subscribers get the
+        full version daily; this roundup is deliberately a sample of it.</p>
+      ]]></description>
+    </item>
+  </channel>
+</rss>
