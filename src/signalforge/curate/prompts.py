@@ -31,6 +31,7 @@ from typing import Final
 
 from signalforge.config import InterestsConfig, SourcesConfig
 from signalforge.db import RejectedProposal, SourceYield
+from signalforge.ingest.hackernews import HN_SOURCE_ID
 from signalforge.llm import SCOUT_PROPOSE_TOOL_NAME
 from signalforge.models import ProposalKind
 
@@ -128,7 +129,29 @@ not support any change this week.
 """
 
 
-def _format_yield(rows: list[SourceYield], feedback_by_source: dict[str, dict[str, int]]) -> str:
+def _configured_source_ids(sources: SourcesConfig) -> set[str]:
+    """Every `source_id` the config would currently produce items under.
+
+    Needed because yield is derived from `items`, not from config, so the table
+    below legitimately includes sources the operator retired weeks ago — their items
+    are still inside the window. Useful context, but left unmarked it invites the
+    scout to propose retiring something already gone, which fails validation and
+    burns one of a handful of proposal slots. Spotted on a real prompt before the
+    first paid run: 10 of 32 rows named sources no longer in the file.
+    """
+    configured = {source.id for source in sources.rss}
+    if sources.github is not None:
+        configured.update(sources.github.releases)
+    if sources.hackernews is not None:
+        configured.add(HN_SOURCE_ID)
+    return configured
+
+
+def _format_yield(
+    rows: list[SourceYield],
+    feedback_by_source: dict[str, dict[str, int]],
+    configured: set[str],
+) -> str:
     """One line per source: what it delivered and what the operator made of it.
 
     Rendered as a compact table rather than JSON because it is read by a model
@@ -143,9 +166,10 @@ def _format_yield(rows: list[SourceYield], feedback_by_source: dict[str, dict[st
         mark_text = (
             ", ".join(f"{count} {rung}" for rung, count in sorted(marks.items()) if count) or "none"
         )
+        gone = "" if row.source_id in configured else "  [already removed — do not propose]"
         lines.append(
             f"{row.source_id} | {row.source_type.value} | {row.items_total} | "
-            f"{row.kept} | {row.killed} | {mark_text}"
+            f"{row.kept} | {row.killed} | {mark_text}{gone}"
         )
     return "\n".join(lines)
 
@@ -214,7 +238,11 @@ def build_scout_user_prompt(
     return f"""\
 # How the current sources performed over the last {window_days} days
 
-{_format_yield(yield_rows, feedback_by_source)}
+{_format_yield(yield_rows, feedback_by_source, _configured_source_ids(sources))}
+
+Rows marked `[already removed]` are sources whose items are still inside the window
+but which the operator has since deleted from the config — context for what they
+have already decided, never a retirement to propose.
 
 A high `killed` count against a low `kept` count means the source is delivering
 material that does not survive triage. Operator marks are stronger evidence than

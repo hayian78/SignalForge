@@ -1088,3 +1088,51 @@ async def test_an_invalid_row_of_a_kind_with_nothing_to_fetch_is_left_alone(
     )
 
     assert outcome.probed == 0
+
+
+@respx.mock
+async def test_a_source_already_removed_from_the_config_is_marked_in_the_prompt(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Yield comes from `items`, not from config, so retired sources still appear.
+
+    Their numbers are useful context — "you removed this and it was delivering
+    nothing" — but unmarked they invite a retirement proposal for something already
+    gone, which fails validation and burns one of five slots. Found on a real prompt
+    before the first paid run: 10 of 32 rows named sources no longer in the file.
+    """
+    from tests.conftest import make_item  # noqa: PLC0415 - test-only helper
+
+    for source_id in ("deepmind", "retired-blog"):
+        item_id, _ = db.upsert_item(
+            conn,
+            make_item(
+                source_id=source_id,
+                external_id=f"{source_id}-1",
+                url=f"https://{source_id}.example.com/post",
+            ),
+        )
+        db.insert_score(
+            conn,
+            item_id=item_id,
+            triage="kill",
+            signal=1,
+            relevance=1,
+            novelty=1,
+            reasoning="no",
+            rubric_version="triage-v3",
+            model="claude-haiku-4-5",
+            scored_at=FROZEN_NOW,
+        )
+    seen = fake_scout(monkeypatch, [])
+
+    await run_scout(conn, interests, cache_dir)
+
+    prompt = str(seen["user_prompt"])
+    assert "retired-blog" in prompt
+    assert "retired-blog | rss | 1 | 0 | 1 | none  [already removed" in prompt
+    # `deepmind` *is* configured in this test's sources, so it carries no marker.
+    assert "deepmind | rss | 1 | 0 | 1 | none\n" in prompt
