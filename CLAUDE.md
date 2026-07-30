@@ -31,9 +31,10 @@ vault. Stack: **Python 3.12+, uv, typer, pydantic v2, SQLite (no ORM),
 Anthropic SDK**. One package, one process, one database, cron-driven.
 Full design: `docs/DESIGN.md`.
 
-Current phase: **Phase 0 — prove the loop** (see DESIGN §16). Do not build
-Phase 2/3 components (embeddings, clustering, MCP server, impact engine)
-until the earlier phase's acceptance gate is met. When in doubt, build less.
+Current phase: **Phase 1 — the weekly question** (see DESIGN §16); Phase 0's
+gate was met 2026-07-23. Do not build Phase 2/3 components (embeddings,
+clustering, MCP server, impact engine) until the earlier phase's acceptance gate
+is met. When in doubt, build less.
 
 ## 2. Module boundaries (the core invariant)
 
