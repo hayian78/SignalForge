@@ -1038,6 +1038,16 @@ def curate_run(
             # `BaseException`, matching `ingest`/`score`: a Ctrl-C'd run should still
             # close its row *with a reason*, not just close it. Re-raised, so the
             # interrupt still stops the process.
+            #
+            # A Ctrl-C mid-probe does lose the *spend figure* — `_shape_candidates`
+            # catches `Exception`, so `KeyboardInterrupt` propagates past it and
+            # `spent` stays zero. That is a deliberate trade, not an oversight: the
+            # row is still written with `KeyboardInterrupt` as its reason, the amount
+            # at risk is cents on a human-initiated action, and the person who hit
+            # Ctrl-C knows what they just spent. **Do not "fix" it by moving the
+            # accounting guarantee back into this function** — reading spend off a
+            # raised exception is the contract that produced the bug two reviews
+            # found, and `scout_for_proposals` now owns the promise instead.
             logger.exception("curate run failed")
             errors.append(_run_level_error(exc))
             raise

@@ -800,3 +800,23 @@ def test_the_cadence_guard_does_not_look_at_the_apply_runs(
     result = _curate_run(db_path, config_dir, tmp_path / "cache", "--dry-run")
 
     assert "--force" not in result.output
+
+
+@respx.mock
+def test_a_dry_run_is_guarded_by_the_cadence_check_too(
+    db_path: Path, config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Because a dry run spends the same money as a real one.
+
+    The guard sits before the `dry_run` branch, so this holds by construction rather
+    than by a second code path — pinned so a future reorder cannot quietly make the
+    preview the cheap way to spend $0.25 a day.
+    """
+    _mock_feed()
+    _fake_scout(monkeypatch, proposals=[make_scout_proposal(target=FEED_URL)])
+    assert _curate_run(db_path, config_dir, tmp_path / "cache").exit_code == 0
+
+    result = _curate_run(db_path, config_dir, tmp_path / "cache", "--dry-run")
+
+    assert result.exit_code == 1
+    assert "too soon" in result.output

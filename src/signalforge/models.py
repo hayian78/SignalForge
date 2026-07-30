@@ -149,8 +149,8 @@ def flatten_to_single_line(text: str) -> str:
     """Collapse `text` to one line: whitespace runs become single spaces, other
     control characters are dropped.
 
-    Used wherever model-authored prose is stored or rendered. A newline inside a
-    rationale is not a formatting quirk — the digest renders these fields into a
+    Used wherever model-authored prose is stored or rendered (NEVER rule 17). A
+    newline inside a rationale is not a formatting quirk — the digest renders these fields into a
     markdown file whose *lines* carry meaning, and `curate/approvals.py` harvests a
     decision from any line matching its checkbox pattern. A rationale free to contain
     newlines can therefore forge an approval for any proposal, which is the human
