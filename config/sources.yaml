@@ -56,9 +56,6 @@ rss:
   - id: one-useful-thing
     url: https://www.oneusefulthing.org/feed
     weight: 1.3
-  - id: mit-tech-review-ai
-    url: https://www.technologyreview.com/topic/artificial-intelligence/feed
-    weight: 1.0
   - id: ben-evans
     url: https://www.ben-evans.com/benedictevans?format=rss
     weight: 1.2
