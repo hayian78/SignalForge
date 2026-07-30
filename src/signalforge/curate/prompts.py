@@ -113,7 +113,13 @@ errors. Your contribution is judgment the numbers cannot supply:
 6. Keep to sources that publish a machine-readable feed or GitHub releases. A
    Twitter account, a Discord, or a podcast without transcripts cannot be ingested
    and is not a proposal, however good it is.
-7. Proposals of kind {", ".join(_STAGED_KINDS)} are staged only — the operator's
+7. **A weight is optional and usually wrong to set.** For an added feed you may
+   suggest a `weight` — a score multiplier where 1.0 means no adjustment — but only
+   when the author's specific track record justifies it, and keep it close to 1.0.
+   Most additions should carry no weight at all. The operator sees the number you
+   pick and will change it if they disagree, so an honest 1.0 is more useful than an
+   optimistic 1.4.
+8. Proposals of kind {", ".join(_STAGED_KINDS)} are staged only — the operator's
    pipeline does not read that block yet, so propose them sparingly if at all.
 
 When you have finished searching, call the `{SCOUT_PROPOSE_TOOL_NAME}` tool
@@ -248,21 +254,27 @@ better. An empty list is a valid answer for a quiet week.
 """
 
 
-def proposal_payload(*, source_id: str | None, url: str | None, target: str) -> dict[str, object]:
+def proposal_payload(
+    *, source_id: str | None, url: str | None, target: str, weight: float | None = None
+) -> dict[str, object]:
     """The `proposals.payload` JSON for one accepted scout proposal.
 
     Carries `prompt_version` so a suggestion can be traced back to the wording
     that produced it without adding a column for it.
 
-    No `weight` key: the scout does not choose scoring multipliers, so an added
-    feed lands at the identity element and stays there until the operator moves it
-    by hand. See `llm.ScoutProposal` for why.
+    `weight` is omitted when the scout proposed none, which is the common case and
+    means the identity element. Absent rather than an explicit `1.0` so that
+    `apply.py` writes no `weight:` line at all — the shipped config only spells out a
+    weight where it differs from 1.0, and a proposal should read like the file it
+    edits.
     """
     payload: dict[str, object] = {"target": target, "prompt_version": SCOUT_PROMPT_VERSION}
     if source_id:
         payload["id"] = source_id
     if url:
         payload["url"] = url
+    if weight is not None:
+        payload["weight"] = weight
     return payload
 
 

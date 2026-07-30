@@ -122,26 +122,90 @@ async def test_an_added_feed_gets_a_canonical_dedup_key_and_a_source_id(
 
 
 @respx.mock
-async def test_a_scout_chosen_weight_cannot_reach_the_payload(
+async def test_a_suggested_weight_reaches_the_payload(
     conn: sqlite3.Connection,
     interests: InterestsConfig,
     cache_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Relevance tuning is not the scout's to do (CLAUDE.md §4, DESIGN §11).
+    """A scout arguing an author is worth trusting can say so with a number.
 
-    `ScoutProposal` forbids extras, so a model returning a weight is a validation
-    error inside `llm.py` rather than a multiplier riding along on a checkbox the
-    operator ticks to mean "add this source".
+    The operator reads it in the digest and changes it in the applied diff if they
+    disagree, so the suggestion is cheap to overrule — which is what makes it safe to
+    offer at all.
     """
-    with pytest.raises(ValueError, match="weight"):
-        make_scout_proposal(weight=1.3)
+    mock_healthy_feed()
+    fake_scout(monkeypatch, [make_scout_proposal(target=FEED_URL, weight=1.3)])
 
+    outcome = await run_scout(conn, interests, cache_dir)
+
+    assert outcome.candidates[0].payload["weight"] == 1.3
+
+
+@respx.mock
+async def test_no_weight_key_when_the_scout_suggests_none(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent, not an explicit 1.0, so `apply.py` writes no `weight:` line.
+
+    The shipped config only spells out a weight where it differs from 1.0, and a
+    proposal should read like the file it edits.
+    """
     mock_healthy_feed()
     fake_scout(monkeypatch, [make_scout_proposal(target=FEED_URL)])
+
     outcome = await run_scout(conn, interests, cache_dir)
 
     assert "weight" not in outcome.candidates[0].payload
+
+
+@pytest.mark.parametrize(
+    ("suggested", "expected"),
+    [(9.0, 1.5), (1.6, 1.5), (0.1, 0.8), (1.5, 1.5), (0.8, 0.8), (1.0, 1.0)],
+)
+@respx.mock
+async def test_a_suggested_weight_is_clamped_into_the_reviewable_band(
+    suggested: float,
+    expected: float,
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clamp is about how the suggestion is reviewed, not about tuning.
+
+    A visible 1.3 gets judged on its merits by someone skimming a digest. Nothing in
+    the loop would catch a quietly-proposed 9.0 before it reweighted one source
+    against everything else in the feed — so a model cannot propose one, while the
+    operator can still set any weight they like by hand (NEVER rule 6).
+    """
+    mock_healthy_feed()
+    fake_scout(monkeypatch, [make_scout_proposal(target=FEED_URL, weight=suggested)])
+
+    outcome = await run_scout(conn, interests, cache_dir)
+
+    assert outcome.candidates[0].payload["weight"] == expected
+
+
+@respx.mock
+async def test_a_clamped_weight_is_recorded_rather_than_applied_silently(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The number in the digest must be the number that would be written."""
+    mock_healthy_feed()
+    fake_scout(monkeypatch, [make_scout_proposal(target=FEED_URL, weight=4.0)])
+
+    outcome = await run_scout(conn, interests, cache_dir)
+
+    assert any("outside the 0.8-1.5 band" in error["message"] for error in outcome.errors)
+    # Clamped, not dropped: the addition itself was still worth showing.
+    assert len(outcome.candidates) == 1
 
 
 @respx.mock

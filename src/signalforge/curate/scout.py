@@ -108,6 +108,20 @@ _GENERIC_HOST_LABELS: Final = frozenset({"www", "blog", "feed", "feeds", "rss", 
 _MAX_ID_SUFFIX: Final = 9
 """How far to count when disambiguating a derived source id."""
 
+_WEIGHT_BAND: Final = (0.8, 1.5)
+"""The range a *scout-suggested* weight is clamped into.
+
+Not a tuning knob, and not a limit on the operator: `RssSource.weight` accepts any
+positive number and `sources.yaml` is theirs to set (NEVER rule 6). This bounds only
+what a model may suggest, and it exists because of how the suggestion is reviewed —
+a human skimming a digest over coffee. A visible 1.3 gets judged on its merits;
+nothing in the loop would catch a quietly-proposed 9.0 before it reweighted a source
+against everything else in the feed.
+
+The band is drawn around the identity element, a little wider than the 1.0-1.3 the
+operator's own config uses, so a genuine "trust this author" or "read but discount"
+suggestion still survives the clamp intact."""
+
 
 def _error(target: str, message: str) -> dict[str, str]:
     """One `runs.errors` record, shaped as `apply.py` shapes them."""
@@ -237,6 +251,29 @@ def _available_source_id(proposed: str | None, url: str, sources: SourcesConfig)
     raise ValueError(f"could not find a free source id near {base!r}")
 
 
+def _clamp_weight(weight: float | None, errors: list[dict[str, str]], target: str) -> float | None:
+    """Bring a suggested weight into `_WEIGHT_BAND`, recording any clamp.
+
+    Clamped rather than refused: the proposal is "add this source", and throwing away
+    a well-argued addition over an over-enthusiastic multiplier would waste a slot the
+    run has already paid for. Recorded rather than silent, because the number the
+    operator reads in the digest has to be the number that would be written.
+    """
+    if weight is None:
+        return None
+    low, high = _WEIGHT_BAND
+    clamped = min(max(weight, low), high)
+    if clamped != weight:
+        errors.append(
+            _error(
+                target,
+                f"suggested weight {weight} is outside the {low}-{high} band a proposal "
+                f"may use; showing {clamped} instead",
+            )
+        )
+    return clamped
+
+
 def _clean_keyword(value: str) -> str:
     """Validate a keyword and return its canonical (lowercase) form."""
     keyword = " ".join(value.split()).casefold()
@@ -261,7 +298,7 @@ def _configured_keywords(kind: ProposalKind, sources: SourcesConfig) -> list[str
 
 
 def _normalize_add_rss(
-    proposal: llm.ScoutProposal, sources: SourcesConfig
+    proposal: llm.ScoutProposal, sources: SourcesConfig, errors: list[dict[str, str]]
 ) -> tuple[str, dict[str, object], str]:
     url = (proposal.url or proposal.target).strip()
     if not _is_http_url(url):
@@ -270,7 +307,12 @@ def _normalize_add_rss(
     if canonical in {canonicalize_url(source.url) for source in sources.rss}:
         raise ValueError(f"{url} is already configured")
     source_id = _available_source_id(proposal.source_id, url, sources)
-    return canonical, proposal_payload(source_id=source_id, url=url, target=url), url
+    weight = _clamp_weight(proposal.weight, errors, canonical)
+    return (
+        canonical,
+        proposal_payload(source_id=source_id, url=url, target=url, weight=weight),
+        url,
+    )
 
 
 def _normalize_retire_rss(
@@ -336,7 +378,11 @@ def _normalize_keyword(
 
 
 def _normalize(
-    proposal: llm.ScoutProposal, sources: SourcesConfig, *, corpus_only: bool
+    proposal: llm.ScoutProposal,
+    sources: SourcesConfig,
+    *,
+    corpus_only: bool,
+    errors: list[dict[str, str]],
 ) -> Candidate:
     """Turn one validated model proposal into a storable candidate, or raise.
 
@@ -360,7 +406,7 @@ def _normalize(
     locator: str | None
     match proposal.kind:
         case ProposalKind.ADD_RSS:
-            dedup_key, payload, locator = _normalize_add_rss(proposal, sources)
+            dedup_key, payload, locator = _normalize_add_rss(proposal, sources, errors)
         case ProposalKind.RETIRE_RSS:
             dedup_key, payload, locator = _normalize_retire_rss(proposal, sources)
         case ProposalKind.ADD_GITHUB_REPO | ProposalKind.RETIRE_GITHUB_REPO:
@@ -462,7 +508,9 @@ async def scout_for_proposals(
     candidates: list[Candidate] = []
     for proposal in proposals:
         try:
-            candidates.append(_normalize(proposal, sources, corpus_only=corpus_only))
+            candidates.append(
+                _normalize(proposal, sources, corpus_only=corpus_only, errors=outcome.errors)
+            )
         except ValueError as exc:
             outcome.errors.append(
                 _error(f"{proposal.kind.value}:{proposal.target[:60]}", f"dropped: {exc}")

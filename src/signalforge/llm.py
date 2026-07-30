@@ -152,21 +152,23 @@ them. Enforced by three facts, all checkable from code:
 * `max_uses` caps searches server-side at `SCOUT_MAX_SEARCHES_CEILING` or below;
 * `SCOUT_MAX_TOKENS` caps output for that single request.
 
-Absolute worst case — at the **search ceiling** rather than the shipped default, and
-with a pessimistic 6k input tokens per search rather than the ~2k dynamic filtering
-is expected to deliver, because that figure is an assumption about model behaviour
-and everything else here is code-enforced:
+The worst case is deliberately **not written out here.** Every arithmetic error found
+while reviewing this feature was a figure that had drifted from what it described,
+including an earlier version of this very docstring. It is computed instead, by
+`test_the_worst_case_cost_stays_within_the_recorded_ceiling`, which sums four terms
+it *reads* rather than assumes:
 
-    input   2.5k prompt + 7 searches x 6k results = 44.5k  -> $0.223
-    output  10,240 tokens (the enforced ceiling)           -> $0.256
-    search  7 x $0.01                                      -> $0.070
-    = $0.549/run x 4.33 weeks = ~$2.38/month, under the ceiling
+    input   the rendered prompt (measured from curate/prompts.py, at full evidence)
+            + SCOUT_MAX_SEARCHES_CEILING x a pessimistic 6k tokens per search
+    output  SCOUT_MAX_TOKENS, the enforced ceiling
+    search  SCOUT_MAX_SEARCHES_CEILING x $0.01
+    x 4.33 weeks, asserted <= this budget
 
-On the expected ~2k-per-search figure the same worst case is ~$1.77/month, and a
-realistic run (6 searches, ~4k output) is ~$1.00/month.
-
-The margin is deliberately robust to the input assumption being wrong by 3x, because
-that is the one number here that no code enforces."""
+Only the per-search input volume is an assumption, and it is pitched at 3x what
+dynamic filtering is expected to deliver, because it is the one term no code
+enforces. Raising a knob, editing the config, or growing the prompt past what this
+budget affords fails that test rather than the invoice. A realistic run — the shipped
+6 searches, expected search volume, ~4k of output — is ~$1.00/month."""
 
 TRIAGE_BATCH_SIZE: Final = 25
 """Items grouped into one Messages request within the batch (DESIGN §8)."""
@@ -509,15 +511,15 @@ class ScoutProposal(BaseModel):
     against `ProposalKind` — an invented kind is a rejected proposal, never a new
     edit shape the applier has never heard of.
 
-    **There is deliberately no `weight` field.** An added feed lands at
-    `RssSource.weight`'s identity element of 1.0, which is inert rather than tuned.
-    A scout-chosen multiplier would be a relevance-tuning decision made outside the
-    system that owns relevance tuning — `interests.yaml` plus `mark` feedback
-    (CLAUDE.md §4), with DESIGN §11's ±0.1/month cap and Phase 2's `tune` job — and
-    it would arrive bundled into a checkbox the operator ticks to mean "add this
-    source". The applier can still write a weight; nothing proposes one. An operator
-    who wants a trusted author weighted up edits the line the same way they always
-    have, which is a thing they can see themselves doing.
+    `weight` is a *suggestion*, and bounded (`curate/scout.py` clamps it). The
+    operator asked for it on the reasoning that a scout arguing "this author is
+    worth trusting" should be able to say so, and that the number is trivial to
+    change while approving — it renders in the digest block and lands in an
+    uncommitted `sources.yaml` diff either way. The bound exists because that
+    review is a human skimming over coffee: a visible 1.3 gets judged, whereas
+    nothing in the loop would catch a quietly-proposed 9.0 before it reweighted a
+    source. Ongoing weight *tuning* is still Phase 2's `tune` job under DESIGN §11's
+    ±0.1/month cap; this is only the value a new source starts at.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -533,6 +535,10 @@ class ScoutProposal(BaseModel):
 
     url: str | None = None
     """The feed URL for an added RSS source, when `target` is not itself the URL."""
+
+    weight: float | None = Field(default=None, gt=0)
+    """Suggested score multiplier for an added feed. Clamped by the caller; absent
+    means the identity element (1.0), which is what most additions should get."""
 
     rationale: str = Field(min_length=1)
     evidence: list[ScoutEvidence] = Field(min_length=1)
@@ -616,6 +622,16 @@ def _propose_tool_schema(max_proposals: int) -> ToolParam:
                                 ),
                             },
                             "url": {"type": "string"},
+                            "weight": {
+                                "type": "number",
+                                "description": (
+                                    "Optional score multiplier for an added feed, where "
+                                    "1.0 means no adjustment. Only propose one when the "
+                                    "author's track record specifically justifies it, and "
+                                    "keep it near 1.0 — the operator reads this number and "
+                                    "will change it if they disagree."
+                                ),
+                            },
                             "rationale": {
                                 "type": "string",
                                 "description": (

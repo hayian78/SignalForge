@@ -828,3 +828,32 @@ def test_a_control_character_in_a_rationale_is_dropped_from_the_comment(
     assert result is not None
     assert not any(ord(char) < 0x20 or ord(char) == 0x7F for char in "".join(result.splitlines()))
     assert "Cited[31m four times by items you marked useful." in result
+
+
+def test_a_suggested_weight_is_written_beside_the_added_feed(repo_config_dir: Path) -> None:
+    """The operator's lever for overruling it: a line in a diff they already read."""
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            payload={"id": "newvoice", "url": "https://newvoice.example.com/feed", "weight": 1.3}
+        ),
+        today=TODAY,
+        current=load_sources(repo_config_dir),
+    )
+
+    assert result is not None
+    assert "    weight: 1.3" in result
+
+
+def test_no_weight_line_is_written_when_none_was_suggested(repo_config_dir: Path) -> None:
+    """A feed at the identity element should look like every other unweighted entry."""
+    before = (repo_config_dir / "sources.yaml").read_text(encoding="utf-8")
+    result = apply_to_text(
+        before,
+        make_proposal(payload={"id": "newvoice", "url": "https://newvoice.example.com/feed"}),
+        today=TODAY,
+        current=load_sources(repo_config_dir),
+    )
+
+    assert result is not None
+    assert result.count("weight:") == before.count("weight:")

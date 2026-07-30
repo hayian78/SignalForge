@@ -539,13 +539,25 @@ Three constraints make this safe:
   the status guard in `db.py` cannot prevent it.
 - **Every applied change is a reviewable git diff** on `sources.yaml`, uncommitted, same
   promise as §11's proposed tuning nudges.
-- **The scout cannot propose a weight.** There is no `weight` field in its tool schema, so
-  an added feed lands at `RssSource.weight`'s identity element of 1.0. A model-chosen
-  multiplier would be a relevance-tuning decision made outside the system that owns
-  relevance tuning (§11's ±0.1/month cap, Phase 2's `tune`), and it would arrive bundled
-  into a checkbox the operator ticks to mean "add this source". An operator who wants a
-  trusted author weighted up edits the line themselves, which is a thing they can see
-  themselves doing.
+- **The scout may suggest a starting weight, within a bounded band.** A scout arguing that
+  an author is worth trusting should be able to say so with a number, and the number is
+  cheap to overrule: it renders in the digest block and lands in an uncommitted
+  `sources.yaml` diff, so changing it is one edit in a file the operator is already
+  reading. Most additions should carry none, which means the identity element and no
+  `weight:` line at all.
+
+  The band (`curate/scout._WEIGHT_BAND`) is drawn a little wider than the 1.0–1.3 the
+  operator's own config uses, and a suggestion outside it is clamped and recorded rather
+  than dropped — the proposal is "add this source", so an over-enthusiastic multiplier
+  should not cost a well-argued addition its slot. The bound exists because of *how* the
+  suggestion is reviewed: a human skimming a digest over coffee will judge a visible 1.3
+  on its merits, but nothing else in the loop would catch a quietly-proposed 9.0 before it
+  reweighted one source against everything else in the feed. It bounds only what a model
+  may propose; `RssSource.weight` still accepts any positive number the operator sets by
+  hand (NEVER rule 6).
+
+  Ongoing weight *tuning* remains Phase 2's `tune` job under §11's ±0.1/month cap. This is
+  only the value a newly added source starts at.
 
 ### Boundary exception
 
