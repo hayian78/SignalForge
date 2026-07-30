@@ -21,7 +21,15 @@ from datetime import date as Date
 from pathlib import Path
 from typing import Final
 
-from signalforge.models import Item, ProposalKind, ProposalStatus, ProposalTier, SourceType
+from signalforge.models import (
+    Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
+    SourceType,
+    flatten_to_single_line,
+    has_control_characters,
+)
 
 __all__ = [
     "MIGRATIONS",
@@ -1041,6 +1049,17 @@ def insert_proposal(
     through a guarded transition, so no caller — including a future one — can
     mint an `approved` or `applied` row and bypass the human gate that DESIGN
     §7.1 says has no bypass.
+
+    **No stored text may contain a control character**, and that is a security
+    invariant, not tidiness. These fields are rendered into a vault markdown file
+    where a *line* is structure, and `curate/approvals.py` harvests a decision from
+    any line matching its checkbox pattern. A rationale free to contain a newline can
+    therefore carry a pre-ticked approval marker for an arbitrary proposal id, which
+    the next harvest records as the operator's decision — the same bypass the
+    paragraph above forbids, arriving through prose instead of through a status.
+    Prose (`rationale`, evidence notes) is flattened; identity fields (`dedup_key`,
+    citation URLs) are refused, because rewriting them would change what the row
+    means.
     """
     if status not in (ProposalStatus.PENDING, ProposalStatus.INVALID):
         raise ValueError(
@@ -1048,7 +1067,10 @@ def insert_proposal(
             "approval and application are guarded transitions (DESIGN §7.1)"
         )
     cited = [
-        {"url": str(entry["url"]).strip(), "note": str(entry.get("note", ""))}
+        {
+            "url": str(entry["url"]).strip(),
+            "note": flatten_to_single_line(str(entry.get("note", ""))),
+        }
         for entry in evidence
         if str(entry.get("url", "")).strip()
     ]
@@ -1059,6 +1081,19 @@ def insert_proposal(
         )
     if not dedup_key.strip():
         raise ValueError(f"proposal {kind.value} has an empty dedup_key")
+    # Identity fields are refused rather than repaired: silently rewriting a dedup
+    # key or a citation changes what the row *means*. Prose fields are flattened
+    # just above and just below.
+    if has_control_characters(dedup_key):
+        raise ValueError(
+            f"proposal {kind.value} has a dedup_key containing a control character: {dedup_key!r}"
+        )
+    for entry in cited:
+        if has_control_characters(entry["url"]):
+            raise ValueError(
+                f"proposal {kind.value} {dedup_key!r} cites a URL containing a control "
+                f"character: {entry['url']!r}"
+            )
 
     cursor = conn.execute(
         _INSERT_PROPOSAL,
@@ -1067,7 +1102,7 @@ def insert_proposal(
             kind.value,
             dedup_key,
             json.dumps(dict(payload), sort_keys=True),
-            rationale,
+            flatten_to_single_line(rationale),
             json.dumps(cited),
             json.dumps(dict(probe), sort_keys=True) if probe is not None else None,
             tier.value,

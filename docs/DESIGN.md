@@ -526,6 +526,16 @@ Three constraints make this safe:
 
 - **Nothing changes without a tick.** There is no auto-apply path, and no confidence
   threshold that bypasses the operator.
+
+  That guarantee has a non-obvious dependency: **no stored proposal text may contain a
+  control character**, enforced in `db.insert_proposal`. The digest renders the scout's
+  rationale and evidence notes into a markdown file where a *line* is structure, and the
+  harvester reads a decision from any line matching its checkbox pattern — so a rationale
+  free to contain a newline can carry a pre-ticked approval for an arbitrary proposal id,
+  which the next harvest records as the operator's decision. Prose is flattened; identity
+  fields (`dedup_key`, citation URLs) are refused, because rewriting those changes what
+  the row means. `report/daily.py` flattens again at the render boundary, which is a no-op
+  for anything the pipeline wrote and covers a row edited by hand.
 - **Applying only appends or comments out.** `sources.yaml` is a document whose comments
   carry the reasoning behind every past pruning decision; a YAML round-trip would erase
   them. An add appends a dated entry, a retirement comments the existing lines out in place —

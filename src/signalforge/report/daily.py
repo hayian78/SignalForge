@@ -48,7 +48,7 @@ from signalforge.db import (
     get_proposals,
 )
 from signalforge.feedback import CHECKBOX_VERDICTS, checkbox_marker
-from signalforge.models import ProposalStatus, SourceType
+from signalforge.models import ProposalStatus, SourceType, flatten_to_single_line
 
 __all__ = [
     "DigestContext",
@@ -302,11 +302,12 @@ def _settled_note(proposal: Proposal, *, tz: tzinfo) -> str:
     Dated in the operator's zone from `decided_at`, so the note matches the day they
     remember ticking it rather than a UTC date that can be a day off.
     """
-    when = proposal.decided_at or proposal.applied_at
-    stamp = f" {when.astimezone(tz).date().isoformat()}" if when is not None else ""
     if proposal.status is ProposalStatus.INVALID:
+        # No date: an `invalid` row was never decided, so there is nothing to date.
         reason = str((proposal.probe or {}).get("error") or "failed validation")
         return f"not shown — {reason}"
+    when = proposal.decided_at or proposal.applied_at
+    stamp = f" {when.astimezone(tz).date().isoformat()}" if when is not None else ""
     note = f"{proposal.status.value}{stamp}"
     return f"{note} — {proposal.decision_note}" if proposal.decision_note else note
 
@@ -347,9 +348,16 @@ def _proposal_lines(
                 id=proposal.id,
                 action=proposal.kind.action_label,
                 target=proposal.dedup_key,
-                rationale=proposal.rationale,
+                # Flattened again here, deliberately. `db.insert_proposal` already
+                # guarantees single-line text, so for anything the pipeline wrote this
+                # is a no-op — but this is the boundary where text becomes *lines of a
+                # vault file that a later harvest parses for decisions*, and a row
+                # written by hand or by an older shape must not be able to forge one.
+                # Two cheap layers beat one load-bearing one.
+                rationale=flatten_to_single_line(proposal.rationale),
                 evidence=tuple(
-                    (entry["url"], entry.get("note", "")) for entry in proposal.evidence
+                    (entry["url"], flatten_to_single_line(entry.get("note", "")))
+                    for entry in proposal.evidence
                 ),
                 tier=proposal.tier.value,
                 pending=pending,

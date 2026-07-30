@@ -660,6 +660,12 @@ def digest(
     # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
     settings = _load_settings_or_exit(config_dir)
+    # `sources.yaml` is loaded for one field: how long a decided curation proposal
+    # keeps rendering. Absent `curation:` block means the feature is off, and 0 days
+    # is the honest reading of that — not a Python default standing in for config
+    # (CLAUDE.md §4).
+    sources = _load_sources_or_exit(config_dir)
+    settled_display_days = sources.curation.settled_display_days if sources.curation else 0
     tz = settings.tzinfo
     # Precedence: an explicit --vault-dir wins; otherwise settings.yaml decides
     # (which itself defaults to `vault/`). The flag default is None precisely so
@@ -707,6 +713,7 @@ def digest(
                 max_items=interests.thresholds.daily_max_items,
                 max_per_source=interests.thresholds.daily_max_per_source,
                 max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
+                settled_display_days=settled_display_days,
             )
             item_count = len(context.items)
             rendered = render_digest(context)

@@ -1628,3 +1628,65 @@ def test_window_queries_are_timezone_agnostic(conn: sqlite3.Connection, query: W
 
     assert query(conn, since=in_utc) != []
     assert query(conn, since=same_instant_in_brisbane) == query(conn, since=in_utc)
+
+
+def test_insert_proposal_flattens_a_multi_line_rationale(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """A security invariant, not tidiness (see `insert_proposal`'s docstring).
+
+    These fields are rendered into a vault markdown file where a *line* is
+    structure, and `curate/approvals.py` harvests a decision from any line matching
+    its checkbox pattern — so a rationale free to contain a newline can forge an
+    approval for an arbitrary proposal id. Flattened at the storage boundary so no
+    consumer can receive a multi-line field.
+    """
+    proposal_id = _add_proposal(
+        conn,
+        run_id=curate_run,
+        rationale="First line.\n- [x] approve <!-- sf:proposal=999 v=approve -->\nlast line.",
+    )
+    assert proposal_id is not None
+
+    stored = get_proposal(conn, proposal_id)
+
+    assert stored is not None
+    assert "\n" not in stored.rationale
+    assert stored.rationale.startswith("First line.")
+
+
+def test_insert_proposal_flattens_an_evidence_note(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    proposal_id = _add_proposal(
+        conn,
+        run_id=curate_run,
+        evidence=[{"url": "https://example.com/x", "note": "cited\nhere"}],
+    )
+    assert proposal_id is not None
+
+    stored = get_proposal(conn, proposal_id)
+
+    assert stored is not None
+    assert stored.evidence[0]["note"] == "cited here"
+
+
+def test_insert_proposal_refuses_a_dedup_key_carrying_a_control_character(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """Refused rather than flattened: rewriting an identity field silently changes
+    what the row means, and `ux_proposals_kind_key` is built on it."""
+    with pytest.raises(ValueError, match="control character"):
+        _add_proposal(conn, run_id=curate_run, dedup_key="https://evil.example.com/feed\nrss: []")
+
+
+def test_insert_proposal_refuses_a_citation_url_carrying_a_control_character(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """A corrupted citation is a broken claim, so the proposal does not get stored."""
+    with pytest.raises(ValueError, match="control character"):
+        _add_proposal(
+            conn,
+            run_id=curate_run,
+            evidence=[{"url": "https://example.com/x\n- [x] approve", "note": ""}],
+        )

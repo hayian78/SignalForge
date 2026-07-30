@@ -50,7 +50,12 @@ from typing import Final
 
 from signalforge import db
 from signalforge.config import SOURCES_FILENAME, ConfigError, SourcesConfig, load_sources
-from signalforge.models import ProposalKind, ProposalStatus, canonicalize_url
+from signalforge.models import (
+    ProposalKind,
+    ProposalStatus,
+    canonicalize_url,
+    flatten_to_single_line,
+)
 
 __all__ = [
     "ApplyOutcome",
@@ -106,8 +111,7 @@ def _one_line_note(text: str) -> str:
     later code reads, so losing a stray byte from it costs nothing, while raising
     would discard an approved change over a cosmetic flaw in its explanation.
     """
-    collapsed = " ".join(text.split())
-    collapsed = "".join(char for char in collapsed if ord(char) >= 0x20 and ord(char) != 0x7F)
+    collapsed = flatten_to_single_line(text)
     if len(collapsed) <= _MAX_NOTE_CHARS:
         return collapsed
     return collapsed[:_MAX_NOTE_CHARS].rsplit(" ", 1)[0] + "…"

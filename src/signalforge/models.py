@@ -28,6 +28,8 @@ __all__ = [
     "SourceType",
     "canonicalize_url",
     "compute_content_hash",
+    "flatten_to_single_line",
+    "has_control_characters",
 ]
 
 
@@ -129,6 +131,37 @@ class ProposalTier(StrEnum):
 
     CORPUS = "corpus"
     WEB = "web"
+
+
+def has_control_characters(value: str) -> bool:
+    """Whether `value` contains any C0/C1 control character.
+
+    The predicate behind two different responses: identity fields (a `dedup_key`, a
+    citation URL) are *refused* when this is true, because silently altering them
+    changes what the record means; prose fields are flattened. Both matter for the
+    same reason — a stored newline lets content start a new line in a rendered vault
+    file, where a line is structure.
+    """
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
+
+def flatten_to_single_line(text: str) -> str:
+    """Collapse `text` to one line: whitespace runs become single spaces, other
+    control characters are dropped.
+
+    Used wherever model-authored prose is stored or rendered. A newline inside a
+    rationale is not a formatting quirk — the digest renders these fields into a
+    markdown file whose *lines* carry meaning, and `curate/approvals.py` harvests a
+    decision from any line matching its checkbox pattern. A rationale free to contain
+    newlines can therefore forge an approval for any proposal, which is the human
+    gate DESIGN §7.1 says has no bypass. Flattening at the storage boundary makes
+    that unreachable rather than merely unlikely.
+
+    Whitespace becomes a space rather than nothing so words either side of a stripped
+    newline do not run together.
+    """
+    collapsed = " ".join(text.split())
+    return "".join(char for char in collapsed if not has_control_characters(char))
 
 
 def _normalized_table(names: tuple[str, ...], *, label: str) -> tuple[str, ...]:
