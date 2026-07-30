@@ -20,8 +20,15 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from signalforge.db import upsert_item
-from signalforge.models import Item, SourceType
+from signalforge.curate.approvals import parse_proposal_marks
+from signalforge.db import decide_proposal, insert_proposal, upsert_item
+from signalforge.models import (
+    Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
+    SourceType,
+)
 from signalforge.report.daily import (
     DigestContext,
     _to_line,
@@ -881,3 +888,282 @@ def test_killed_count_shares_the_digest_window(conn: sqlite3.Connection) -> None
     assert ctx.killed_count == 1
     assert ctx.kept_count == 1
     assert ctx.scored_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# The source-curation approval block (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+PROPOSALS_GOLDEN_FIXTURE = REPO_ROOT / "fixtures" / "daily_digest_proposals_golden.md"
+SURFACE_DATE = date(2026, 7, 16)
+SETTLED_DAYS = 14
+"""Mirrors the shipped `curation.settled_display_days`; the window is config."""
+
+
+def _add_proposal(
+    conn: sqlite3.Connection,
+    *,
+    kind: ProposalKind = ProposalKind.ADD_RSS,
+    dedup_key: str = "https://newvoice.example.com/feed",
+    payload: dict[str, object] | None = None,
+    rationale: str = "Cited three times this month by items you marked useful.",
+    evidence: list[dict[str, str]] | None = None,
+    probe: dict[str, object] | None = None,
+    tier: ProposalTier = ProposalTier.WEB,
+    status: ProposalStatus = ProposalStatus.PENDING,
+    surface_date: date = SURFACE_DATE,
+) -> int:
+    proposal_id = insert_proposal(
+        conn,
+        run_id=None,
+        kind=kind,
+        dedup_key=dedup_key,
+        payload=payload if payload is not None else {"id": "newvoice", "url": dedup_key},
+        rationale=rationale,
+        evidence=evidence
+        if evidence is not None
+        else [{"url": "https://simonwillison.net/2026/Jul/12/link/", "note": "linked twice"}],
+        probe=probe,
+        tier=tier,
+        status=status,
+        surface_date=surface_date,
+        created_at=datetime(2026, 7, 16, 6, 0, tzinfo=UTC),
+    )
+    assert proposal_id is not None
+    return proposal_id
+
+
+def _proposal_context(conn: sqlite3.Connection, **kwargs: object) -> DigestContext:
+    return build_digest_context(
+        conn,
+        target_date=kwargs.pop("target_date", TARGET_DATE),  # type: ignore[arg-type]
+        max_items=MAX_ITEMS,
+        settled_display_days=kwargs.pop("settled_display_days", SETTLED_DAYS),  # type: ignore[arg-type]
+    )
+
+
+def test_a_pending_proposal_renders_both_checkboxes_that_the_harvester_parses(
+    conn: sqlite3.Connection,
+) -> None:
+    """The wire format has one definition, and this proves the round trip.
+
+    The template renders through `proposal_marker` and the harvester reads through
+    `PROPOSAL_MARK_RE`; a digest whose checkboxes the harvester cannot parse would
+    silently swallow every decision the operator makes.
+    """
+    proposal_id = _add_proposal(conn)
+
+    rendered = render_digest(_proposal_context(conn))
+
+    ticked = rendered.replace("- [ ] approve", "- [x] approve")
+    marks = parse_proposal_marks(ticked)
+    assert [(mark.proposal_id, mark.decision) for mark in marks] == [(proposal_id, "approve")]
+
+
+def test_a_settled_proposal_renders_no_checkbox(conn: sqlite3.Connection) -> None:
+    """A decided proposal is a record, not a question. Offering a box would invite a
+    second decision that `db.decide_proposal`'s pending guard would then ignore."""
+    proposal_id = _add_proposal(conn)
+    decide_proposal(
+        conn,
+        proposal_id=proposal_id,
+        status=ProposalStatus.APPROVED,
+        decided_at=datetime(2026, 7, 16, 7, 0, tzinfo=UTC),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" not in rendered
+    assert "approved 2026-07-16" in rendered
+
+
+def test_a_pending_proposal_follows_forward_into_later_digests(
+    conn: sqlite3.Connection,
+) -> None:
+    """An unanswered question must not scroll out of sight (DESIGN §7.1)."""
+    _add_proposal(conn, surface_date=date(2026, 7, 1))
+
+    rendered = render_digest(_proposal_context(conn, target_date=TARGET_DATE))
+
+    assert "sf:proposal=" in rendered
+
+
+def test_a_proposal_surfacing_tomorrow_is_not_shown_today(conn: sqlite3.Connection) -> None:
+    _add_proposal(conn, surface_date=date(2026, 7, 20))
+
+    rendered = render_digest(_proposal_context(conn, target_date=TARGET_DATE))
+
+    assert "Proposed source changes" not in rendered
+
+
+def test_a_settled_proposal_drops_out_after_its_display_window(
+    conn: sqlite3.Connection,
+) -> None:
+    """Counted from the day it surfaced, so an old digest still shows its own week."""
+    proposal_id = _add_proposal(conn, surface_date=date(2026, 7, 1))
+    decide_proposal(
+        conn,
+        proposal_id=proposal_id,
+        status=ProposalStatus.REJECTED,
+        decided_at=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+    )
+
+    within = render_digest(_proposal_context(conn, target_date=date(2026, 7, 14)))
+    beyond = render_digest(_proposal_context(conn, target_date=date(2026, 7, 16)))
+
+    assert "rejected" in within
+    assert "Proposed source changes" not in beyond
+
+
+def test_an_arxiv_proposal_is_tagged_staged(conn: sqlite3.Connection) -> None:
+    """Applying it changes a file and nothing else until the phase gate opens."""
+    _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_ARXIV_KEYWORD,
+        dedup_key="interpretability",
+        payload={"target": "interpretability"},
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "staged" in rendered
+
+
+def test_a_suggested_weight_is_shown_with_how_to_override_it(
+    conn: sqlite3.Connection,
+) -> None:
+    """It is part of what a tick approves, so it cannot be invisible."""
+    _add_proposal(
+        conn, payload={"id": "newvoice", "url": "https://newvoice.example.com/feed", "weight": 1.3}
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "suggested weight:** 1.3" in rendered
+    assert "edit it in the diff" in rendered
+
+
+def test_probe_facts_render_beside_the_proposal(conn: sqlite3.Connection) -> None:
+    _add_proposal(
+        conn,
+        probe={
+            "ok": True,
+            "items_total": 24,
+            "items_in_window": 3,
+            "median_summary_chars": 1240,
+            "newest_published_at": "2026-07-15T09:00:00+00:00",
+            "label": "Nathan Lambert",
+        },
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "24 entries, 3 recent, median 1240 chars, newest 2026-07-15" in rendered
+    assert "latest by Nathan Lambert" in rendered
+
+
+def test_an_invalid_proposal_is_recorded_as_considered_not_offered(
+    conn: sqlite3.Connection,
+) -> None:
+    """It was never shown for approval, but "we looked and it 404s" is worth a line.
+
+    Without it a candidate the operator might have wanted vanishes with no trace
+    that it was ever considered.
+    """
+    _add_proposal(
+        conn,
+        status=ProposalStatus.INVALID,
+        probe={"ok": False, "error": "HTTP 404", "status_code": 404},
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" not in rendered
+    assert "not shown — HTTP 404" in rendered
+
+
+def test_a_malformed_probe_blob_shortens_the_line_rather_than_breaking_the_digest(
+    conn: sqlite3.Connection,
+) -> None:
+    """`db._decode_probe` is tolerant on purpose; this is why (CLAUDE.md §7)."""
+    _add_proposal(conn)
+    conn.execute("UPDATE proposals SET probe = ?", ("not json at all",))
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" in rendered
+    assert "checked:" not in rendered
+
+
+def test_no_proposals_means_no_block_at_all(conn: sqlite3.Connection) -> None:
+    """A digest from before curation existed must render exactly as it did."""
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "Proposed source changes" not in rendered
+
+
+def test_the_proposal_block_matches_the_golden_fixture(conn: sqlite3.Connection) -> None:
+    """The block as a human actually reads it — pending, staged, and settled together."""
+    _add_proposal(
+        conn,
+        payload={"id": "interconnects", "url": "https://newvoice.example.com/feed", "weight": 1.2},
+        probe={
+            "ok": True,
+            "items_total": 24,
+            "items_in_window": 3,
+            "median_summary_chars": 1240,
+            "newest_published_at": "2026-07-15T09:00:00+00:00",
+            "label": "Nathan Lambert",
+        },
+    )
+    _add_proposal(
+        conn,
+        kind=ProposalKind.RETIRE_GITHUB_REPO,
+        dedup_key="block/goose",
+        payload={"target": "block/goose"},
+        rationale="0 useful against 4 noise marks this month; every release was a version bump.",
+        evidence=[{"url": "https://github.com/block/goose/releases", "note": "bare tags"}],
+        probe={"ok": True, "items_total": 12, "items_in_window": 0, "median_summary_chars": 40},
+        tier=ProposalTier.CORPUS,
+    )
+    _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_ARXIV_KEYWORD,
+        dedup_key="interpretability",
+        payload={"target": "interpretability"},
+        rationale="Three of your kept items this month were interpretability papers.",
+        evidence=[{"url": "https://arxiv.org/list/cs.AI/recent", "note": ""}],
+        tier=ProposalTier.CORPUS,
+    )
+    settled = _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_HN_KEYWORD,
+        dedup_key="evaluation",
+        payload={"target": "evaluation"},
+        rationale="Recurring theme in what you keep.",
+        evidence=[{"url": "https://news.ycombinator.com/item?id=1", "note": ""}],
+        surface_date=date(2026, 7, 10),
+    )
+    decide_proposal(
+        conn,
+        proposal_id=settled,
+        status=ProposalStatus.REJECTED,
+        decided_at=datetime(2026, 7, 11, 7, 0, tzinfo=UTC),
+        note="too broad, would flood the digest",
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    expected = PROPOSALS_GOLDEN_FIXTURE.read_text(encoding="utf-8")
+    assert rendered == expected
+
+
+def test_the_proposal_block_re_renders_byte_identically(conn: sqlite3.Connection) -> None:
+    """Idempotent rendering (CLAUDE.md §3): the block is a pure function of DB state."""
+    _add_proposal(conn)
+    _add_proposal(conn, dedup_key="https://other.example.com/feed", payload={"id": "other"})
+
+    first = render_digest(_proposal_context(conn))
+    second = render_digest(_proposal_context(conn))
+
+    assert first == second

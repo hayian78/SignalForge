@@ -38,13 +38,22 @@ from pathlib import Path
 
 import jinja2
 
-from signalforge.db import DigestItem, count_killed_items, get_digest_items, get_latest_run
+from signalforge.curate.approvals import DECISIONS, proposal_marker
+from signalforge.db import (
+    DigestItem,
+    Proposal,
+    count_killed_items,
+    get_digest_items,
+    get_latest_run,
+    get_proposals,
+)
 from signalforge.feedback import CHECKBOX_VERDICTS, checkbox_marker
-from signalforge.models import SourceType
+from signalforge.models import ProposalStatus, SourceType
 
 __all__ = [
     "DigestContext",
     "DigestLine",
+    "ProposalLine",
     "SourceFailure",
     "build_digest_context",
     "digest_path",
@@ -96,6 +105,75 @@ class SourceFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class ProposalLine:
+    """One proposed `sources.yaml` change, ready to render (DESIGN §7.1).
+
+    A view over `db.Proposal`, not the row itself: the template gets strings it can
+    print rather than JSON blobs to traverse, and `report/` keeps doing nothing but
+    read the DB and format it.
+    """
+
+    id: int
+    action: str
+    """What it would do, from `ProposalKind.action_label`."""
+
+    target: str
+    rationale: str
+    evidence: tuple[tuple[str, str], ...]
+    """`(url, note)` pairs — never empty, because `db.get_proposals` drops any row
+    without a usable citation before it reaches here (CLAUDE.md §5, NEVER rule 7)."""
+
+    tier: str
+    """`corpus` or `web`: where the candidate came from, so the reader knows how much
+    scrutiny it deserves."""
+
+    pending: bool
+    """True when the operator has not decided yet — the only state that renders
+    checkboxes. Everything else renders as a settled one-liner."""
+
+    settled_note: str
+    """The one-line record for a decided proposal (`approved 2026-08-05`, `invalid:
+    feed 404s`). Empty while pending."""
+
+    staged: bool
+    """True for a kind whose block no ingestor reads yet, tagged so the digest never
+    implies an effect it does not have (NEVER rule 15)."""
+
+    weight: float | None
+    """The scout's suggested multiplier, when it proposed one. Shown because it is
+    part of what a tick approves, and because seeing it is what makes it easy to
+    overrule in the applied diff."""
+
+    probe: str
+    """The deterministic health facts as one skimmable line, or empty for a kind with
+    nothing to fetch."""
+
+    @property
+    def heading(self) -> str:
+        """The proposal's title line, staged tag included.
+
+        Composed here rather than with inline `{% if %}` blocks in the template:
+        jinja's `trim_blocks` eats the newline after a block tag, so a conditional
+        that ends a content line silently joins it to the next one. Assembling the
+        string in Python is both correct and testable without rendering.
+        """
+        staged = " *(staged — no ingestor reads this block yet)*" if self.staged else ""
+        return f"{self.action}: {self.target}{staged}"
+
+    @property
+    def facts(self) -> str:
+        """Provenance, suggested weight, and probe result as one line."""
+        parts = [self.tier]
+        if self.weight is not None:
+            parts.append(
+                f"**suggested weight:** {self.weight} (edit it in the diff if you disagree)"
+            )
+        if self.probe:
+            parts.append(f"**checked:** {self.probe}")
+        return " · ".join(parts)
+
+
+@dataclass(frozen=True, slots=True)
 class DigestContext:
     """Everything the template needs — assembled once, rendered once."""
 
@@ -111,11 +189,27 @@ class DigestContext:
     rendered, so the digest stays a 60-second read (DESIGN §13) without hiding
     that they exist."""
 
+    proposals: tuple[ProposalLine, ...] = ()
+    """Source-curation proposals for this date's block (DESIGN §7.1). Defaulted so
+    every existing caller — and every render of a day before curation existed —
+    behaves exactly as it did."""
+
     @property
     def kept_count(self) -> int:
         """Every kept item for the date — shown plus hidden. Derived here so
         the template renders it rather than doing arithmetic in jinja."""
         return len(self.items) + self.hidden_kept_count
+
+    @property
+    def pending_proposals(self) -> tuple[ProposalLine, ...]:
+        """The ones still awaiting a tick, which is what the block is asking for."""
+        return tuple(proposal for proposal in self.proposals if proposal.pending)
+
+    @property
+    def settled_proposals(self) -> tuple[ProposalLine, ...]:
+        """Already-decided ones, kept visible so re-reading an old digest still
+        shows what was approved that week."""
+        return tuple(proposal for proposal in self.proposals if not proposal.pending)
 
 
 def _trim_reasoning(text: str, *, limit: int = _WHY_IT_MATTERS_MAX_CHARS) -> str:
@@ -171,6 +265,105 @@ def _source_failures(conn: sqlite3.Connection) -> tuple[SourceFailure, ...]:
         )
         for record in run.errors
         if record.get("source_id") != _RUN_LEVEL_SOURCE_ID
+    )
+
+
+def _probe_summary(probe: dict[str, object] | None) -> str:
+    """The health facts as one line a human can skim, or "" when there are none.
+
+    Every value is coerced defensively because `db._decode_probe` is the one
+    tolerant decoder in the read path — a probe blob is decoration on this block, so
+    a malformed one must degrade to a shorter line rather than break the digest
+    (CLAUDE.md §7).
+    """
+    if not probe:
+        return ""
+    if not probe.get("ok"):
+        reason = str(probe.get("error") or "could not be fetched")
+        status = probe.get("status_code")
+        return f"probe failed: {reason}" + (f" (HTTP {status})" if status else "")
+
+    parts = [f"{probe.get('items_total', 0)} entries"]
+    if (fresh := probe.get("items_in_window")) is not None:
+        parts.append(f"{fresh} recent")
+    if median := probe.get("median_summary_chars"):
+        parts.append(f"median {median} chars")
+    if newest := probe.get("newest_published_at"):
+        # Date only: the block is skimmed, and the hour a feed published is noise.
+        parts.append(f"newest {str(newest)[:10]}")
+    if label := probe.get("label"):
+        parts.append(f"latest by {label}")
+    return ", ".join(parts)
+
+
+def _settled_note(proposal: Proposal, *, tz: tzinfo) -> str:
+    """The one-line record shown for a proposal that is no longer pending.
+
+    Dated in the operator's zone from `decided_at`, so the note matches the day they
+    remember ticking it rather than a UTC date that can be a day off.
+    """
+    when = proposal.decided_at or proposal.applied_at
+    stamp = f" {when.astimezone(tz).date().isoformat()}" if when is not None else ""
+    if proposal.status is ProposalStatus.INVALID:
+        reason = str((proposal.probe or {}).get("error") or "failed validation")
+        return f"not shown — {reason}"
+    note = f"{proposal.status.value}{stamp}"
+    return f"{note} — {proposal.decision_note}" if proposal.decision_note else note
+
+
+def _proposal_lines(
+    conn: sqlite3.Connection,
+    *,
+    target_date: Date,
+    tz: tzinfo,
+    settled_display_days: int,
+) -> tuple[ProposalLine, ...]:
+    """Proposals to render for `target_date`, pending first. Reads only.
+
+    Two render rules, both from DESIGN §7.1:
+
+    * **A pending proposal follows forward** into every digest until it is decided,
+      so an unanswered question cannot scroll out of sight.
+    * **A settled one keeps rendering** for `settled_display_days` after the day it
+      first surfaced — not after it was decided — so re-reading a week-old digest
+      still shows what was approved that week instead of silently losing the record
+      when the file is overwritten.
+
+    `invalid` rows are included in the settled group deliberately. They were never
+    shown for approval, but "we considered this and it did not fetch" is worth one
+    line: without it, a candidate the operator might have wanted disappears with no
+    trace that it was ever looked at.
+    """
+    proposals = get_proposals(conn, surfaced_on_or_before=target_date)
+    lines: list[ProposalLine] = []
+    for proposal in proposals:
+        pending = proposal.status is ProposalStatus.PENDING
+        age = (target_date - proposal.surface_date).days
+        if not pending and age > settled_display_days:
+            continue
+        weight = proposal.payload.get("weight")
+        lines.append(
+            ProposalLine(
+                id=proposal.id,
+                action=proposal.kind.action_label,
+                target=proposal.dedup_key,
+                rationale=proposal.rationale,
+                evidence=tuple(
+                    (entry["url"], entry.get("note", "")) for entry in proposal.evidence
+                ),
+                tier=proposal.tier.value,
+                pending=pending,
+                settled_note="" if pending else _settled_note(proposal, tz=tz),
+                staged=proposal.kind.is_staged,
+                weight=float(weight) if isinstance(weight, int | float) else None,
+                probe=_probe_summary(proposal.probe),
+            )
+        )
+    # Pending first: the block exists to ask for a decision, and the settled lines
+    # are a record. Stable within each group because `get_proposals` orders by
+    # `(surface_date, id)`, so a re-render is byte-identical (CLAUDE.md §3).
+    return tuple(
+        [line for line in lines if line.pending] + [line for line in lines if not line.pending]
     )
 
 
@@ -252,6 +445,7 @@ def build_digest_context(
     max_items: int,
     max_per_source: int | None = None,
     max_per_github_repo: int | None = None,
+    settled_display_days: int = 0,
 ) -> DigestContext:
     """Assemble everything `daily.md.j2` needs for `target_date`. No writes.
 
@@ -295,6 +489,12 @@ def build_digest_context(
         killed_count=killed_count,
         scored_count=len(scored_items) + killed_count,
         hidden_kept_count=max(0, len(citable) - len(lines)),
+        proposals=_proposal_lines(
+            conn,
+            target_date=target_date,
+            tz=tz,
+            settled_display_days=settled_display_days,
+        ),
     )
 
 
@@ -315,6 +515,11 @@ def _template_env() -> jinja2.Environment:
     # adding a rung stays a one-line change in `feedback.py` and the parser can
     # never fall out of step with what the digest offers.
     env.globals["checkbox_verdicts"] = CHECKBOX_VERDICTS
+    # Same discipline for the proposal checkboxes: the line the digest writes comes
+    # from the function `curate/approvals.py` parses, so the wire format has exactly
+    # one definition (DESIGN §7.1).
+    env.globals["proposal_marker"] = proposal_marker
+    env.globals["proposal_decisions"] = DECISIONS
     return env
 
 
@@ -338,6 +543,7 @@ def write_digest(
     max_items: int,
     max_per_source: int | None = None,
     max_per_github_repo: int | None = None,
+    settled_display_days: int = 0,
 ) -> Path:
     """Render and write `target_date`'s digest, overwriting any existing file.
 
@@ -352,6 +558,7 @@ def write_digest(
         max_items=max_items,
         max_per_source=max_per_source,
         max_per_github_repo=max_per_github_repo,
+        settled_display_days=settled_display_days,
     )
     rendered = render_digest(context)
     path = digest_path(vault_dir, target_date=target_date)

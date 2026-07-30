@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
+from typing import Final
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -60,6 +61,16 @@ class ProposalKind(StrEnum):
     REMOVE_ARXIV_KEYWORD = "remove_arxiv_keyword"
 
     @property
+    def action_label(self) -> str:
+        """What this proposal would do, in the operator's words.
+
+        Lives on the enum rather than in `report/` because the digest block and the
+        `curate list` CLI both name these, and two copies of a user-facing vocabulary
+        drift — the digest would say "retire feed" while the terminal said "remove".
+        """
+        return _ACTION_LABELS[self]
+
+    @property
     def is_staged(self) -> bool:
         """True when applying this kind has no runtime effect yet.
 
@@ -69,6 +80,21 @@ class ProposalKind(StrEnum):
         these `(staged)` rather than implying an effect they don't have.
         """
         return self in (ProposalKind.ADD_ARXIV_KEYWORD, ProposalKind.REMOVE_ARXIV_KEYWORD)
+
+
+_ACTION_LABELS: Final[dict[ProposalKind, str]] = {
+    ProposalKind.ADD_RSS: "add feed",
+    ProposalKind.RETIRE_RSS: "retire feed",
+    ProposalKind.ADD_GITHUB_REPO: "watch releases",
+    ProposalKind.RETIRE_GITHUB_REPO: "stop watching releases",
+    ProposalKind.ADD_HN_KEYWORD: "add HN keyword",
+    ProposalKind.REMOVE_HN_KEYWORD: "remove HN keyword",
+    ProposalKind.ADD_ARXIV_KEYWORD: "add arXiv keyword",
+    ProposalKind.REMOVE_ARXIV_KEYWORD: "remove arXiv keyword",
+}
+"""Every kind's label, exhaustively. A `dict` rather than a `match` with a fallback
+so a ninth kind is a `KeyError` in a test, not a proposal that renders as its raw
+enum value in the operator's digest."""
 
 
 class ProposalStatus(StrEnum):
