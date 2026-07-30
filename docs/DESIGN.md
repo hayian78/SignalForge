@@ -319,10 +319,14 @@ CREATE TABLE proposals (                     -- proposed sources.yaml changes, a
     evidence      TEXT NOT NULL,             -- JSON [{url, note}] — non-empty by construction (§5 citations)
     probe         TEXT,                      -- JSON deterministic health facts; NULL for non-fetchable kinds
     tier          TEXT NOT NULL,             -- corpus | web — where the candidate came from
-    status        TEXT NOT NULL,             -- pending | approved | rejected | applied | invalid | superseded
+    status        TEXT NOT NULL,             -- pending | approved | rejected | applied | invalid
+                                             -- only pending/invalid are insertable; the rest are
+                                             -- guarded transitions, so nothing can skip the human gate
     surface_date  TEXT NOT NULL,             -- the digest date this first renders on
     created_at    TEXT NOT NULL,
     decided_at    TEXT,
+    decision_note TEXT,                      -- the operator's reason, when given (CLI only — a
+                                             -- checkbox carries no text); replayed to the scout
     applied_at    TEXT
 );
 CREATE UNIQUE INDEX ux_proposals_kind_key ON proposals (kind, dedup_key);
@@ -462,6 +466,11 @@ Weekly, `signalforge curate` runs four ordered stages:
    A candidate that 404s or serves only teaser stubs is recorded `invalid` and never
    surfaces. This is the automated form of two failures already recorded in `sources.yaml`
    by hand (`the-batch`: no feed exists; `stratechery`: paywalled to teaser stubs).
+   **`invalid` is not a permanent blacklist.** Probes also fail transiently — timeouts,
+   503s, rate limits — and `ux_proposals_kind_key` means the scout can never re-suggest a
+   candidate on its own, so one bad Sunday would otherwise remove a good feed forever. The
+   probe stage therefore re-probes existing `invalid` rows each run and reopens any that now
+   pass, and the failure reason is recorded in `probe` so the operator can see which it was.
 4. **Propose.** At most `curation.max_proposals_per_run` rows written to `proposals`,
    each carrying a rationale and at least one evidence URL.
 
@@ -482,6 +491,12 @@ Three constraints make this safe:
   them. An add appends a dated entry, a retirement comments the existing lines out in place —
   exactly the convention the file already follows. The result is re-validated through
   `load_sources` and reverted on any `ConfigError`.
+  The applier must be idempotent **against the file text**, not just against the proposal
+  row: writing the YAML and flipping `proposals.status` to `applied` are two separate
+  writes, so a crash or a validation revert between them leaves an approved row whose edit
+  is already on disk. Appending only when the entry is genuinely absent is what stops the
+  next run duplicating it — a duplicated config block is NEVER rule 4 at the file level, and
+  the status guard in `db.py` cannot prevent it.
 - **Every applied change is a reviewable git diff** on `sources.yaml`, uncommitted, same
   promise as §11's proposed tuning nudges. Weight *nudges* stay out of scope — those are
   Phase 2's `tune`.

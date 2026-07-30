@@ -8,14 +8,19 @@ dropped item, so the golden table below is the contract.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import signalforge.ingest
 from signalforge.models import (
     TRACKING_PARAM_PREFIXES,
     TRACKING_PARAMS,
     Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
     SourceType,
     canonicalize_url,
     compute_content_hash,
@@ -301,6 +306,72 @@ def test_source_type_vocabulary_matches_design_section_5() -> None:
         "youtube",
         "newsletter",
     }
+
+
+def test_proposal_kind_vocabulary_matches_design_section_5() -> None:
+    # `db._row_to_proposal` does `ProposalKind(row["kind"])`, so drift between
+    # this vocabulary and a stored row is a read-time crash.
+    assert {member.value for member in ProposalKind} == {
+        "add_rss",
+        "retire_rss",
+        "add_github_repo",
+        "retire_github_repo",
+        "add_hn_keyword",
+        "remove_hn_keyword",
+        "add_arxiv_keyword",
+        "remove_arxiv_keyword",
+    }
+
+
+def test_proposal_kinds_come_in_add_and_retire_pairs() -> None:
+    # Every block the scout may add to, it may also prune from. A one-way kind
+    # would let the source list only ever grow, which is the failure DESIGN §7.1
+    # exists to fix.
+    adds = {member.value for member in ProposalKind if member.value.startswith("add_")}
+    removes = {
+        member.value.split("_", 1)[1]
+        for member in ProposalKind
+        if member.value.startswith(("retire_", "remove_"))
+    }
+    assert {value.split("_", 1)[1] for value in adds} == removes
+
+
+def test_proposal_status_vocabulary_matches_design_section_5() -> None:
+    assert {member.value for member in ProposalStatus} == {
+        "pending",
+        "approved",
+        "rejected",
+        "applied",
+        "invalid",
+    }
+
+
+def test_proposal_tier_vocabulary() -> None:
+    assert {member.value for member in ProposalTier} == {"corpus", "web"}
+
+
+def test_only_arxiv_proposal_kinds_are_staged() -> None:
+    """`is_staged` must name exactly the kinds whose block has no ingestor.
+
+    This is a phase fact, not a preference: `arxiv` is modeled in `sources.yaml`
+    but wired to nothing (NEVER rule 15), so applying an arXiv keyword changes a
+    file and no behaviour. Asserting it against the *actual* ingestor registry
+    means the day an arXiv ingestor lands, this test fails and points at the
+    `(staged)` label that would otherwise quietly lie in every digest.
+    """
+    staged_blocks = {
+        member.value.split("_", 1)[1].removesuffix("_keyword").removesuffix("_repo")
+        for member in ProposalKind
+        if member.is_staged
+    }
+    assert staged_blocks == {"arxiv"}
+
+    ingest_package = Path(signalforge.ingest.__file__).parent
+    wired = {path.stem for path in ingest_package.glob("*.py")}
+    assert "arxiv" not in wired, (
+        "an arXiv ingestor now exists — arXiv proposals are no longer staged, "
+        "so ProposalKind.is_staged and the digest's (staged) label must be updated"
+    )
 
 
 def test_item_content_defaults_to_none() -> None:

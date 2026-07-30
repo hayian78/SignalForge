@@ -21,6 +21,9 @@ __all__ = [
     "TRACKING_PARAM_PREFIXES",
     "TRACKING_PARAMS",
     "Item",
+    "ProposalKind",
+    "ProposalStatus",
+    "ProposalTier",
     "SourceType",
     "canonicalize_url",
     "compute_content_hash",
@@ -36,6 +39,70 @@ class SourceType(StrEnum):
     HN = "hn"
     YOUTUBE = "youtube"
     NEWSLETTER = "newsletter"
+
+
+class ProposalKind(StrEnum):
+    """The `proposals.kind` vocabulary — one edit shape per `sources.yaml` block (DESIGN §7.1).
+
+    Every kind is either an add or a retire, and the applier only ever appends
+    a line or comments one out: there is deliberately no `change_weight` kind,
+    because an in-place value mutation is the one edit that cannot be expressed
+    that way. Weight nudges stay Phase 2's `tune` job (DESIGN §11).
+    """
+
+    ADD_RSS = "add_rss"
+    RETIRE_RSS = "retire_rss"
+    ADD_GITHUB_REPO = "add_github_repo"
+    RETIRE_GITHUB_REPO = "retire_github_repo"
+    ADD_HN_KEYWORD = "add_hn_keyword"
+    REMOVE_HN_KEYWORD = "remove_hn_keyword"
+    ADD_ARXIV_KEYWORD = "add_arxiv_keyword"
+    REMOVE_ARXIV_KEYWORD = "remove_arxiv_keyword"
+
+    @property
+    def is_staged(self) -> bool:
+        """True when applying this kind has no runtime effect yet.
+
+        The `arxiv` block in `sources.yaml` is modeled and configured but not
+        wired to any ingestor until the Phase 1 gate opens (NEVER rule 15), so an
+        applied arXiv keyword changes a file and nothing else. The digest tags
+        these `(staged)` rather than implying an effect they don't have.
+        """
+        return self in (ProposalKind.ADD_ARXIV_KEYWORD, ProposalKind.REMOVE_ARXIV_KEYWORD)
+
+
+class ProposalStatus(StrEnum):
+    """The `proposals.status` lifecycle (DESIGN §7.1).
+
+    `pending -> approved -> applied` is the happy path; `pending -> rejected` is
+    the other decision. `invalid` is set at insert time by the probe stage for a
+    candidate that failed validation — it is never shown for approval, because
+    approving a feed that 404s is a decision nobody should be asked to make.
+
+    Only `pending` and `invalid` are insertable; the rest are reached through a
+    guarded transition, so a caller cannot mint a row that skips the human gate.
+    Both terminal-looking states are escapable via `db.reopen_proposal`: a
+    rejection because the operator changed their mind, and an `invalid` because
+    a probe failure is often transient (a timeout or a 503 is not a dead feed).
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    APPLIED = "applied"
+    INVALID = "invalid"
+
+
+class ProposalTier(StrEnum):
+    """Where a candidate came from, shown in the digest so the reader can weight it.
+
+    `CORPUS` candidates were derived from the operator's own stored items — the
+    strongest signal available and free to compute. `WEB` candidates came from the
+    scout's search and deserve more scrutiny, which is what the probe facts are for.
+    """
+
+    CORPUS = "corpus"
+    WEB = "web"
 
 
 def _normalized_table(names: tuple[str, ...], *, label: str) -> tuple[str, ...]:
