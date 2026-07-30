@@ -29,7 +29,14 @@ from signalforge.ingest.base import (
 )
 from signalforge.models import Item, SourceType
 
-__all__ = ["GITHUB_API_ROOT", "GithubReleasesIngestor", "build_github_ingestors"]
+__all__ = [
+    "GITHUB_ACCEPT",
+    "GITHUB_API_ROOT",
+    "GITHUB_API_VERSION",
+    "GithubReleasesIngestor",
+    "build_github_ingestors",
+    "parse_github_timestamp",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -39,8 +46,10 @@ _PER_PAGE: Final = 10
 self-heals on the next one). Ten releases covers a week for even the busiest
 repo, and dedup makes the overlap free."""
 
-_ACCEPT: Final = "application/vnd.github+json"
-_API_VERSION: Final = "2022-11-28"
+# Public so `probe.py` can speak to the same API with the same headers rather
+# than keeping a second copy of them — bumping the API version must be one edit.
+GITHUB_ACCEPT: Final = "application/vnd.github+json"
+GITHUB_API_VERSION: Final = "2022-11-28"
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +69,7 @@ _RELEASES_UNCHANGED: Final = _ReleasesOutcome(publishes_releases=True, items=[])
 """Sentinel: the `/releases` payload 304'd, so there is nothing new to ingest."""
 
 
-def _parse_timestamp(value: object) -> datetime | None:
+def parse_github_timestamp(value: object) -> datetime | None:
     """Parse GitHub's ISO 8601 `...Z` timestamps."""
     if not isinstance(value, str) or not value:
         return None
@@ -111,7 +120,7 @@ class GithubReleasesIngestor:
         self._api_root = api_root.rstrip("/")
 
     def _headers(self) -> dict[str, str]:
-        headers = {"accept": _ACCEPT, "x-github-api-version": _API_VERSION}
+        headers = {"accept": GITHUB_ACCEPT, "x-github-api-version": GITHUB_API_VERSION}
         if self._token:
             headers["authorization"] = f"Bearer {self._token}"
         return headers
@@ -243,8 +252,8 @@ class GithubReleasesIngestor:
                     url=url,
                     title=f"{self.repo} {title}",
                     author=author.get("login") if isinstance(author, dict) else None,
-                    published_at=_parse_timestamp(release.get("published_at"))
-                    or _parse_timestamp(release.get("created_at")),
+                    published_at=parse_github_timestamp(release.get("published_at"))
+                    or parse_github_timestamp(release.get("created_at")),
                     # Release notes are markdown: keep the line structure that
                     # makes a changelog readable rather than flattening it.
                     summary=truncate_summary(

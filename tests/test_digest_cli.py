@@ -47,12 +47,27 @@ def vault_dir(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def config_dir(tmp_path: Path) -> Path:
-    """A minimal interests.yaml — `digest` reads `thresholds.daily_max_items`."""
+    """A minimal config dir: `digest` reads `thresholds.daily_max_items` from
+    `interests.yaml`, and `curation.settled_display_days` from `sources.yaml`.
+
+    `sources.yaml` carries no `curation:` block here, which is the "feature off"
+    shape — the settled-proposal window is then 0 days, and the digest renders
+    exactly as it did before curation existed.
+    """
     path = tmp_path / "config"
     path.mkdir()
     (path / "interests.yaml").write_text(
         "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,"
         " daily_max_items: 15}\n",
+        encoding="utf-8",
+    )
+    (path / "sources.yaml").write_text(
+        "defaults:\n"
+        "  fetch_timeout: 20\n"
+        "  min_hn_points: 80\n"
+        "  max_summary_chars: 4000\n"
+        "  max_item_age_days: 7\n"
+        "rss: []\n",
         encoding="utf-8",
     )
     return path
@@ -271,6 +286,15 @@ def test_digest_reads_the_cap_from_interests_yaml(
         " daily_max_items: 1}\n",
         encoding="utf-8",
     )
+    (config_dir / "sources.yaml").write_text(
+        "defaults:\n"
+        "  fetch_timeout: 20\n"
+        "  min_hn_points: 80\n"
+        "  max_summary_chars: 4000\n"
+        "  max_item_age_days: 7\n"
+        "rss: []\n",
+        encoding="utf-8",
+    )
     with connection(db_path) as conn:
         first_id, _ = upsert_item(conn, make_item())
         second_id, _ = upsert_item(
@@ -314,3 +338,102 @@ def test_digest_run_is_recorded_as_failed_when_rendering_blows_up(
     errors = json.loads(run["errors"])
     assert errors[0]["error_type"] == "RuntimeError"
     assert errors[0]["message"] == "template exploded"
+
+
+def _curation_config(tmp_path: Path, *, settled_display_days: int | None) -> Path:
+    """A config dir whose `sources.yaml` may or may not carry a `curation:` block."""
+    path = tmp_path / f"config-{settled_display_days}"
+    path.mkdir()
+    (path / "interests.yaml").write_text(
+        "thresholds: {weekly_min_signal: 3, weekly_min_relevance: 3, weekly_min_total: 10,"
+        " daily_max_items: 15}\n",
+        encoding="utf-8",
+    )
+    curation = (
+        ""
+        if settled_display_days is None
+        else (
+            "curation:\n"
+            "  max_proposals_per_run: 5\n"
+            "  max_searches_per_run: 6\n"
+            "  yield_window_days: 30\n"
+            f"  settled_display_days: {settled_display_days}\n"
+        )
+    )
+    (path / "sources.yaml").write_text(
+        "defaults:\n"
+        "  fetch_timeout: 20\n"
+        "  min_hn_points: 80\n"
+        "  max_summary_chars: 4000\n"
+        "  max_item_age_days: 7\n"
+        "rss: []\n" + curation,
+        encoding="utf-8",
+    )
+    return path
+
+
+def _seed_settled_proposal(db_path: Path) -> None:
+    """One rejected proposal that surfaced five days before the digest date."""
+    from datetime import UTC, datetime
+    from datetime import date as Date
+
+    from signalforge.db import decide_proposal, insert_proposal
+    from signalforge.models import ProposalKind, ProposalStatus, ProposalTier
+
+    with connection(db_path) as conn:
+        proposal_id = insert_proposal(
+            conn,
+            run_id=None,
+            kind=ProposalKind.ADD_RSS,
+            dedup_key="https://newvoice.example.com/feed",
+            payload={"id": "newvoice", "url": "https://newvoice.example.com/feed"},
+            rationale="Cited repeatedly by items you kept.",
+            evidence=[{"url": "https://example.com/post", "note": ""}],
+            probe=None,
+            tier=ProposalTier.WEB,
+            status=ProposalStatus.PENDING,
+            surface_date=Date(2026, 7, 11),
+            created_at=datetime(2026, 7, 11, 6, 0, tzinfo=UTC),
+        )
+        assert proposal_id is not None
+        decide_proposal(
+            conn,
+            proposal_id=proposal_id,
+            status=ProposalStatus.REJECTED,
+            decided_at=datetime(2026, 7, 12, 6, 0, tzinfo=UTC),
+        )
+
+
+def test_the_configured_settled_window_reaches_the_rendered_digest(
+    db_path: Path, vault_dir: Path, tmp_path: Path
+) -> None:
+    """The knob is config, so it has to have an effect through the real command.
+
+    Without this, `curation.settled_display_days` validated fine and did nothing:
+    the CLI never passed it, so the code default of 0 always won and a decided
+    proposal vanished from every digest after the day it surfaced.
+    """
+    _seed(db_path)
+    _seed_settled_proposal(db_path)
+
+    result = _invoke(db_path, vault_dir, _curation_config(tmp_path, settled_display_days=14))
+
+    assert result.exit_code == 0, result.output
+    content = (vault_dir / "daily" / "2026-07-16.md").read_text(encoding="utf-8")
+    assert "Recently decided" in content
+    assert "rejected 2026-07-12" in content
+
+
+def test_no_curation_block_means_no_settled_proposals_render(
+    db_path: Path, vault_dir: Path, tmp_path: Path
+) -> None:
+    """An absent `curation:` block is the feature turned off, and 0 days is the
+    honest reading of that — not a Python default standing in for config."""
+    _seed(db_path)
+    _seed_settled_proposal(db_path)
+
+    result = _invoke(db_path, vault_dir, _curation_config(tmp_path, settled_display_days=None))
+
+    assert result.exit_code == 0, result.output
+    content = (vault_dir / "daily" / "2026-07-16.md").read_text(encoding="utf-8")
+    assert "Recently decided" not in content

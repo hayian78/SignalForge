@@ -27,6 +27,7 @@ __all__ = [
     "SOURCES_FILENAME",
     "ArxivConfig",
     "ConfigError",
+    "CurationConfig",
     "GithubConfig",
     "HackerNewsConfig",
     "IgnoreRules",
@@ -163,6 +164,71 @@ class HackerNewsConfig(_StrictModel):
     keywords: list[str] = Field(default_factory=list)
 
 
+class CurationConfig(_StrictModel):
+    """The `curation:` block — adaptive source curation's knobs (DESIGN §7.1).
+
+    Every field is required, as in `SourceDefaults` (CLAUDE.md §10 rule 6): a
+    default buried in code is a spend limit nobody can see. The dividing line is
+    not optional-vs-required blocks — `GithubConfig.token_env` is required inside
+    an optional block too — but what the default would *be*. The defaults on
+    `github`/`arxiv`/`hackernews` are empty collections and `RssSource.weight` is
+    the identity element: invisible but inert. A tuned number or a spend cap is
+    neither, so it has no Python fallback.
+
+    The *block* is optional, though — omitting `curation:` turns the feature off
+    rather than starting it on invented numbers. An operator who wants a weekly
+    scout says so, and says what it may cost.
+    """
+
+    max_proposals_per_run: int = Field(
+        ge=1,
+        le=20,
+        description=(
+            "Change-rate cap: at most N proposals per scout run. Bounded above so a "
+            "typo cannot let one week rewire the whole feed — the same discipline as "
+            "DESIGN §11's ±0.1/month weight-nudge cap."
+        ),
+    )
+
+    max_searches_per_run: int = Field(
+        ge=0,
+        description=(
+            "Web-search cap per scout run. This is a money knob, not a quality one: "
+            "search bills $10 per 1,000 calls on top of the tokens its results consume "
+            "(DESIGN §8), so it is the first dial to turn if the monthly figure in "
+            "`signalforge status` surprises you. 0 is meaningful and supported — the "
+            "scout then reasons from the stored corpus alone and reaches for nothing "
+            "external, which is the cheapest useful mode. No upper bound here because "
+            "`llm.py` owns the hard ceiling and clamps this value to it — logging a "
+            "warning and recording it so the clamp is never silent; config.py cannot "
+            "import `llm.py` to check it at load (llm.py imports config)."
+        ),
+    )
+
+    yield_window_days: int = Field(
+        ge=1,
+        le=365,
+        description=(
+            "Lookback for per-source yield stats. Long enough that a quiet fortnight "
+            "does not read as a dead source, short enough that a source which has "
+            "genuinely stopped delivering shows up while the operator still cares."
+        ),
+    )
+
+    settled_display_days: int = Field(
+        ge=0,
+        le=90,
+        description=(
+            "How long a decided proposal keeps rendering in a digest as a settled "
+            "one-line note, measured from `surface_date` — not from `decided_at`, so a "
+            "proposal that sat pending for a week does not then linger for the full "
+            "window after it is ticked. Bounds the block's growth without dropping the "
+            "record the moment a decision lands: re-rendering an old digest should "
+            "still show what was approved that week. 0 hides settled proposals at once."
+        ),
+    )
+
+
 class SourcesConfig(_StrictModel):
     """Root model for `sources.yaml`."""
 
@@ -171,6 +237,9 @@ class SourcesConfig(_StrictModel):
     github: GithubConfig | None = None
     arxiv: ArxivConfig | None = None
     hackernews: HackerNewsConfig | None = None
+    curation: CurationConfig | None = None
+    """None means adaptive source curation is off; `curate` says so and exits
+    rather than guessing its own spend caps (DESIGN §7.1)."""
 
     @field_validator("rss")
     @classmethod

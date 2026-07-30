@@ -13,6 +13,7 @@ this task does not own.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import UTC, date, datetime
 from pathlib import Path
@@ -20,8 +21,16 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from signalforge.db import upsert_item
-from signalforge.models import Item, SourceType
+from signalforge.curate.approvals import parse_proposal_marks
+from signalforge.db import decide_proposal, insert_proposal, upsert_item
+from signalforge.feedback import parse_marks
+from signalforge.models import (
+    Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
+    SourceType,
+)
 from signalforge.report.daily import (
     DigestContext,
     _to_line,
@@ -70,8 +79,6 @@ def _insert_score(
 
 
 def _insert_ingest_run_with_errors(conn: sqlite3.Connection, errors: list[dict[str, str]]) -> None:
-    import json
-
     conn.execute(
         """
         INSERT INTO runs (kind, started_at, finished_at, status, items_new, errors)
@@ -881,3 +888,584 @@ def test_killed_count_shares_the_digest_window(conn: sqlite3.Connection) -> None
     assert ctx.killed_count == 1
     assert ctx.kept_count == 1
     assert ctx.scored_count == 2
+
+
+# --------------------------------------------------------------------------- #
+# The source-curation approval block (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+PROPOSALS_GOLDEN_FIXTURE = REPO_ROOT / "fixtures" / "daily_digest_proposals_golden.md"
+SURFACE_DATE = date(2026, 7, 16)
+SETTLED_DAYS = 14
+"""Mirrors the shipped `curation.settled_display_days`; the window is config."""
+
+
+def _add_proposal(
+    conn: sqlite3.Connection,
+    *,
+    kind: ProposalKind = ProposalKind.ADD_RSS,
+    dedup_key: str = "https://newvoice.example.com/feed",
+    payload: dict[str, object] | None = None,
+    rationale: str = "Cited three times this month by items you marked useful.",
+    evidence: list[dict[str, str]] | None = None,
+    probe: dict[str, object] | None = None,
+    tier: ProposalTier = ProposalTier.WEB,
+    status: ProposalStatus = ProposalStatus.PENDING,
+    surface_date: date = SURFACE_DATE,
+) -> int:
+    proposal_id = insert_proposal(
+        conn,
+        run_id=None,
+        kind=kind,
+        dedup_key=dedup_key,
+        payload=payload if payload is not None else {"id": "newvoice", "url": dedup_key},
+        rationale=rationale,
+        evidence=evidence
+        if evidence is not None
+        else [{"url": "https://simonwillison.net/2026/Jul/12/link/", "note": "linked twice"}],
+        probe=probe,
+        tier=tier,
+        status=status,
+        surface_date=surface_date,
+        created_at=datetime(2026, 7, 16, 6, 0, tzinfo=UTC),
+    )
+    assert proposal_id is not None
+    return proposal_id
+
+
+def _proposal_context(conn: sqlite3.Connection, **kwargs: object) -> DigestContext:
+    return build_digest_context(
+        conn,
+        target_date=kwargs.pop("target_date", TARGET_DATE),  # type: ignore[arg-type]
+        max_items=MAX_ITEMS,
+        settled_display_days=kwargs.pop("settled_display_days", SETTLED_DAYS),  # type: ignore[arg-type]
+    )
+
+
+def test_a_pending_proposal_renders_both_checkboxes_that_the_harvester_parses(
+    conn: sqlite3.Connection,
+) -> None:
+    """The wire format has one definition, and this proves the round trip.
+
+    The template renders through `proposal_marker` and the harvester reads through
+    `PROPOSAL_MARK_RE`; a digest whose checkboxes the harvester cannot parse would
+    silently swallow every decision the operator makes.
+    """
+    proposal_id = _add_proposal(conn)
+
+    rendered = render_digest(_proposal_context(conn))
+
+    ticked = rendered.replace("- [ ] approve", "- [x] approve")
+    marks = parse_proposal_marks(ticked)
+    assert [(mark.proposal_id, mark.decision) for mark in marks] == [(proposal_id, "approve")]
+
+
+def test_a_settled_proposal_renders_no_checkbox(conn: sqlite3.Connection) -> None:
+    """A decided proposal is a record, not a question. Offering a box would invite a
+    second decision that `db.decide_proposal`'s pending guard would then ignore."""
+    proposal_id = _add_proposal(conn)
+    decide_proposal(
+        conn,
+        proposal_id=proposal_id,
+        status=ProposalStatus.APPROVED,
+        decided_at=datetime(2026, 7, 16, 7, 0, tzinfo=UTC),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" not in rendered
+    assert "approved 2026-07-16" in rendered
+
+
+def test_a_pending_proposal_follows_forward_into_later_digests(
+    conn: sqlite3.Connection,
+) -> None:
+    """An unanswered question must not scroll out of sight (DESIGN §7.1)."""
+    _add_proposal(conn, surface_date=date(2026, 7, 1))
+
+    rendered = render_digest(_proposal_context(conn, target_date=TARGET_DATE))
+
+    assert "sf:proposal=" in rendered
+
+
+def test_a_proposal_surfacing_tomorrow_is_not_shown_today(conn: sqlite3.Connection) -> None:
+    _add_proposal(conn, surface_date=date(2026, 7, 20))
+
+    rendered = render_digest(_proposal_context(conn, target_date=TARGET_DATE))
+
+    assert "Proposed source changes" not in rendered
+
+
+def test_a_settled_proposal_drops_out_after_its_display_window(
+    conn: sqlite3.Connection,
+) -> None:
+    """Counted from the day it surfaced, so an old digest still shows its own week."""
+    proposal_id = _add_proposal(conn, surface_date=date(2026, 7, 1))
+    decide_proposal(
+        conn,
+        proposal_id=proposal_id,
+        status=ProposalStatus.REJECTED,
+        decided_at=datetime(2026, 7, 2, 7, 0, tzinfo=UTC),
+    )
+
+    within = render_digest(_proposal_context(conn, target_date=date(2026, 7, 14)))
+    beyond = render_digest(_proposal_context(conn, target_date=date(2026, 7, 16)))
+
+    assert "rejected" in within
+    assert "Proposed source changes" not in beyond
+
+
+def test_an_arxiv_proposal_is_tagged_staged(conn: sqlite3.Connection) -> None:
+    """Applying it changes a file and nothing else until the phase gate opens."""
+    _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_ARXIV_KEYWORD,
+        dedup_key="interpretability",
+        payload={"target": "interpretability"},
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "staged" in rendered
+
+
+def test_a_suggested_weight_is_shown_with_how_to_override_it(
+    conn: sqlite3.Connection,
+) -> None:
+    """It is part of what a tick approves, so it cannot be invisible."""
+    _add_proposal(
+        conn, payload={"id": "newvoice", "url": "https://newvoice.example.com/feed", "weight": 1.3}
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "suggested weight:** 1.3" in rendered
+    assert "edit it in the diff" in rendered
+
+
+def test_probe_facts_render_beside_the_proposal(conn: sqlite3.Connection) -> None:
+    _add_proposal(
+        conn,
+        probe={
+            "ok": True,
+            "items_total": 24,
+            "items_in_window": 3,
+            "median_summary_chars": 1240,
+            "newest_published_at": "2026-07-15T09:00:00+00:00",
+            "label": "Nathan Lambert",
+        },
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "24 entries, 3 recent, median 1240 chars, newest 2026-07-15" in rendered
+    assert "latest by Nathan Lambert" in rendered
+
+
+def test_an_invalid_proposal_is_recorded_as_considered_not_offered(
+    conn: sqlite3.Connection,
+) -> None:
+    """It was never shown for approval, but "we looked and it 404s" is worth a line.
+
+    Without it a candidate the operator might have wanted vanishes with no trace
+    that it was ever considered.
+    """
+    _add_proposal(
+        conn,
+        status=ProposalStatus.INVALID,
+        probe={"ok": False, "error": "HTTP 404", "status_code": 404},
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" not in rendered
+    assert "not shown — HTTP 404" in rendered
+
+
+def test_a_malformed_probe_blob_shortens_the_line_rather_than_breaking_the_digest(
+    conn: sqlite3.Connection,
+) -> None:
+    """`db._decode_probe` is tolerant on purpose; this is why (CLAUDE.md §7)."""
+    _add_proposal(conn)
+    conn.execute("UPDATE proposals SET probe = ?", ("not json at all",))
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "sf:proposal=" in rendered
+    assert "checked:" not in rendered
+
+
+def test_no_proposals_means_no_block_at_all(conn: sqlite3.Connection) -> None:
+    """A digest from before curation existed must render exactly as it did."""
+    rendered = render_digest(_proposal_context(conn))
+
+    assert "Proposed source changes" not in rendered
+
+
+def test_the_proposal_block_matches_the_golden_fixture(conn: sqlite3.Connection) -> None:
+    """The block as a human actually reads it — pending, staged, and settled together."""
+    _add_proposal(
+        conn,
+        payload={"id": "interconnects", "url": "https://newvoice.example.com/feed", "weight": 1.2},
+        probe={
+            "ok": True,
+            "items_total": 24,
+            "items_in_window": 3,
+            "median_summary_chars": 1240,
+            "newest_published_at": "2026-07-15T09:00:00+00:00",
+            "label": "Nathan Lambert",
+        },
+    )
+    _add_proposal(
+        conn,
+        kind=ProposalKind.RETIRE_GITHUB_REPO,
+        dedup_key="block/goose",
+        payload={"target": "block/goose"},
+        rationale="0 useful against 4 noise marks this month; every release was a version bump.",
+        evidence=[{"url": "https://github.com/block/goose/releases", "note": "bare tags"}],
+        probe={"ok": True, "items_total": 12, "items_in_window": 0, "median_summary_chars": 40},
+        tier=ProposalTier.CORPUS,
+    )
+    _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_ARXIV_KEYWORD,
+        dedup_key="interpretability",
+        payload={"target": "interpretability"},
+        rationale="Three of your kept items this month were interpretability papers.",
+        evidence=[{"url": "https://arxiv.org/list/cs.AI/recent", "note": ""}],
+        tier=ProposalTier.CORPUS,
+    )
+    settled = _add_proposal(
+        conn,
+        kind=ProposalKind.ADD_HN_KEYWORD,
+        dedup_key="evaluation",
+        payload={"target": "evaluation"},
+        rationale="Recurring theme in what you keep.",
+        evidence=[{"url": "https://news.ycombinator.com/item?id=1", "note": ""}],
+        surface_date=date(2026, 7, 10),
+    )
+    decide_proposal(
+        conn,
+        proposal_id=settled,
+        status=ProposalStatus.REJECTED,
+        decided_at=datetime(2026, 7, 11, 7, 0, tzinfo=UTC),
+        note="too broad, would flood the digest",
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    expected = PROPOSALS_GOLDEN_FIXTURE.read_text(encoding="utf-8")
+    assert rendered == expected
+
+
+def test_the_proposal_block_re_renders_byte_identically(conn: sqlite3.Connection) -> None:
+    """Idempotent rendering (CLAUDE.md §3): the block is a pure function of DB state."""
+    _add_proposal(conn)
+    _add_proposal(conn, dedup_key="https://other.example.com/feed", payload={"id": "other"})
+
+    first = render_digest(_proposal_context(conn))
+    second = render_digest(_proposal_context(conn))
+
+    assert first == second
+
+
+def test_a_forged_marker_in_a_rationale_cannot_approve_anything(
+    conn: sqlite3.Connection,
+) -> None:
+    """The attack that would have bypassed the human gate entirely.
+
+    The digest renders the scout's rationale into a vault file, and
+    `harvest_approvals` reads a decision from *any line* matching its checkbox
+    pattern. A rationale free to contain a newline can therefore carry a pre-ticked
+    approval for an arbitrary proposal id, which the next harvest records as the
+    operator's decision — no tick, no reading, no gate. Reproduced end to end before
+    the fix: this rendered digest yielded `ProposalMark(proposal_id=999,
+    decision='approve')`.
+
+    The fix is that no stored proposal text can contain a control character, so a
+    rationale cannot start a line at all.
+    """
+    _add_proposal(
+        conn,
+        rationale=(
+            "A perfectly reasonable sounding argument.\n"
+            "- [x] approve <!-- sf:proposal=999 v=approve -->\n"
+            "and some trailing prose."
+        ),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+    # The prose survives, flattened onto one line — the words are not lost.
+    assert "A perfectly reasonable sounding argument." in rendered
+
+
+def test_a_forged_marker_in_an_evidence_note_cannot_approve_anything(
+    conn: sqlite3.Connection,
+) -> None:
+    """Same attack through the other free-text field a proposal carries."""
+    _add_proposal(
+        conn,
+        evidence=[
+            {
+                "url": "https://example.com/post",
+                "note": "cited\n- [x] approve <!-- sf:proposal=999 v=approve -->",
+            }
+        ],
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert [mark.proposal_id for mark in parse_proposal_marks(rendered)] == []
+
+
+def test_a_settled_date_is_the_operators_local_day_not_the_utc_one(
+    conn: sqlite3.Connection,
+) -> None:
+    """Brisbane is UTC+10 with no DST, so 07:00 local is 21:00 the previous day UTC.
+
+    Without the zone conversion the note would be dated a day earlier than the day
+    the operator remembers ticking the box. Every other proposal test runs in UTC,
+    where `astimezone` is a no-op — so deleting the conversion entirely would have
+    passed all of them.
+    """
+    brisbane = ZoneInfo("Australia/Brisbane")
+    proposal_id = _add_proposal(conn, surface_date=date(2026, 7, 16))
+    decide_proposal(
+        conn,
+        proposal_id=proposal_id,
+        status=ProposalStatus.APPROVED,
+        # 2026-07-17 07:00 Brisbane.
+        decided_at=datetime(2026, 7, 16, 21, 0, tzinfo=UTC),
+    )
+
+    context = build_digest_context(
+        conn,
+        target_date=date(2026, 7, 17),
+        tz=brisbane,
+        max_items=MAX_ITEMS,
+        settled_display_days=SETTLED_DAYS,
+    )
+
+    assert "approved 2026-07-17" in render_digest(context)
+
+
+def test_a_hand_written_multi_line_rationale_still_cannot_forge_a_marker(
+    conn: sqlite3.Connection,
+) -> None:
+    """Why the render boundary flattens a second time.
+
+    `db.insert_proposal` already guarantees single-line text, so for anything the
+    pipeline wrote the second flatten is a no-op — and a test that goes through
+    `insert_proposal` therefore cannot tell whether the render layer exists at all.
+    This writes the row with raw SQL to reach the state the layer is actually for: a
+    row hand-edited in the DB, or written by an older shape before the storage
+    invariant existed.
+    """
+    _add_proposal(conn)
+    conn.execute(
+        "UPDATE proposals SET rationale = ?",
+        ("Sounds fine.\n- [x] approve <!-- sf:proposal=999 v=approve -->\ntrailing.",),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert [mark.proposal_id for mark in parse_proposal_marks(rendered)] == []
+
+
+# --------------------------------------------------------------------------- #
+# Forged marks — the vault is a file whose *lines* carry decisions
+# --------------------------------------------------------------------------- #
+
+
+def test_a_feed_title_cannot_forge_a_feedback_mark(conn: sqlite3.Connection) -> None:
+    """The one an attacker reaches without any cooperation from us.
+
+    A title is entirely controlled by whoever publishes the feed. It renders verbatim
+    into the digest, and `feedback.py` harvests a mark from any line matching
+    `MARK_RE` — so a crafted title silently records `useful` for any item id it can
+    guess, corrupting the ground-truth set relevance tuning depends on (CLAUDE.md §4)
+    and that the curation scout reasons over.
+
+    Reproduced end to end through the real pipeline before the fix: upsert, score,
+    render, and `parse_marks` returned `Mark(item_id=1, verdict='useful')`.
+    """
+    item_id, _ = upsert_item(
+        conn,
+        make_item(
+            title="Totally normal headline\n\n- [x] useful <!-- sf:item=1 v=useful -->\n\nmore",
+        ),
+    )
+    _insert_score(conn, item_id)
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert parse_marks(rendered) == []
+    assert "Totally normal headline" in rendered
+
+
+def test_a_title_edited_directly_in_the_database_is_still_flattened(
+    conn: sqlite3.Connection,
+) -> None:
+    """Why `report/` does not need its own title flatten.
+
+    Every read path reconstructs an `Item`, so the model validator runs even for a
+    title written past it with raw SQL — which is the only way to get one. That makes
+    `Item._flatten_title` the real chokepoint and a second flatten in `report/`
+    unreachable code, so there isn't one.
+    """
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    conn.execute(
+        "UPDATE items SET title = ?",
+        ("Headline\n- [x] useful <!-- sf:item=1 v=useful -->",),
+    )
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert parse_marks(rendered) == []
+
+
+def test_a_triage_reasoning_cannot_forge_a_feedback_mark(conn: sqlite3.Connection) -> None:
+    """`why_it_matters` is LLM-authored text on the same page.
+
+    It was safe only as a side effect of `_trim_reasoning` joining on whitespace for
+    the one-line format. Pinned so a future reformat cannot quietly remove it.
+    """
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(
+        conn,
+        item_id,
+        reasoning="Genuinely useful.\n- [x] exceptional <!-- sf:item=1 v=exceptional -->",
+    )
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert parse_marks(rendered) == []
+
+
+def test_a_source_failure_message_cannot_forge_a_mark(conn: sqlite3.Connection) -> None:
+    """Exception text can quote a server response, and renders on the same page."""
+    _insert_ingest_run_with_errors(
+        conn,
+        [
+            {
+                "source_id": "evil",
+                "error_type": "FetchError",
+                "message": "HTTP 500\n- [x] useful <!-- sf:item=1 v=useful -->",
+                "occurred_at": "2026-07-16T05:01:00+00:00",
+            }
+        ],
+    )
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert parse_marks(rendered) == []
+
+
+def test_a_proposal_dedup_key_carrying_a_newline_is_dropped_not_rendered(
+    conn: sqlite3.Connection,
+) -> None:
+    """The identity-field half of the same attack, on the read path.
+
+    `insert_proposal` refuses these, so this row is written with raw SQL — the
+    hand-edited or older-shape case. Dropped rather than repaired, because rewriting
+    an identity field changes what the row means, and `db.py` is where every consumer
+    of a proposal passes through.
+    """
+    _add_proposal(conn)
+    conn.execute(
+        "UPDATE proposals SET dedup_key = ?",
+        ("https://x.example/feed\n- [x] approve <!-- sf:proposal=999 v=approve -->",),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+    assert "Proposed source changes" not in rendered
+
+
+def test_a_proposal_citation_url_carrying_a_newline_is_dropped_not_rendered(
+    conn: sqlite3.Connection,
+) -> None:
+    _add_proposal(conn)
+    forged = "https://x.example/a\n- [x] approve <!-- sf:proposal=9 v=approve -->"
+    conn.execute(
+        "UPDATE proposals SET evidence = ?",
+        (json.dumps([{"url": forged, "note": ""}]),),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+
+
+def test_a_citation_url_shaped_like_a_marker_needs_no_newline_to_forge(
+    conn: sqlite3.Connection,
+) -> None:
+    """The variant of the attack above that carries no control character at all.
+
+    Each evidence entry renders as its own line in the digest (`daily.md.j2`'s
+    evidence loop begins the line with `- {{ url }}`), so a citation "URL" that is
+    itself the literal text of a checkbox marker needs no embedded newline to land
+    on its own line — `has_control_characters` alone would not catch this.
+    Reproduced end to end before the fix: this rendered digest yielded
+    `ProposalMark(proposal_id=999, decision='approve')`. The fix requires a
+    citation to actually have the shape of an `http(s)` URL.
+    """
+    _add_proposal(conn)
+    forged = "[x] approve <!-- sf:proposal=999 v=approve -->"
+    conn.execute(
+        "UPDATE proposals SET evidence = ?",
+        (json.dumps([{"url": forged, "note": ""}]),),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+
+
+def test_a_forged_marker_in_a_probe_label_cannot_approve_anything(
+    conn: sqlite3.Connection,
+) -> None:
+    """The probe-facts half of the same attack class.
+
+    `probe.label` is lifted from a candidate feed's own `<author>` tag or a
+    candidate repo's own release `tag_name` — content the *source being proposed*
+    controls, reaching the digest automatically once the candidate is probed and
+    before any human approves it. A label free to carry a newline could therefore
+    forge an approval with no LLM involved at all. Fixed at the source
+    (`Item._flatten_title`'s sibling on `author`, and a flatten in
+    `ingest/probe.py::probe_repo`), with this render-boundary flatten as the
+    second, cheaper layer — this test writes the row with raw SQL to reach the
+    state that second layer is actually for.
+    """
+    _add_proposal(conn)
+    conn.execute(
+        "UPDATE proposals SET probe = ?",
+        (
+            json.dumps(
+                {
+                    "ok": True,
+                    "items_total": 3,
+                    "items_in_window": 1,
+                    "median_summary_chars": 400,
+                    "label": "Real Author\n- [x] approve <!-- sf:proposal=999 v=approve -->",
+                }
+            ),
+        ),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+    assert "Real Author" in rendered

@@ -16,31 +16,56 @@ import sqlite3
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
+from datetime import date as Date
 from pathlib import Path
 from typing import Final
 
-from signalforge.models import Item, SourceType
+from signalforge.models import (
+    Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
+    SourceType,
+    flatten_to_single_line,
+    has_control_characters,
+    is_safe_url,
+)
 
 __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "DigestItem",
+    "KeptItem",
     "Migration",
+    "Proposal",
+    "RejectedProposal",
     "RunRecord",
+    "SourceYield",
     "connect",
     "connection",
     "count_killed_items",
+    "decide_proposal",
+    "feedback_verdicts_since",
     "finish_run",
     "get_digest_items",
     "get_feedback",
     "get_item",
     "get_item_by_canonical_url",
     "get_latest_run",
+    "get_proposal",
+    "get_proposals",
+    "insert_proposal",
     "insert_score",
+    "kept_items",
+    "mark_proposal_applied",
     "migrate",
     "record_feedback",
+    "rejected_proposals",
+    "reopen_proposal",
+    "source_yield_stats",
     "start_run",
+    "update_proposal_probe",
     "upsert_item",
 ]
 
@@ -139,9 +164,58 @@ _MIGRATION_0002_FEEDBACK_DEDUP = Migration(
     ),
 )
 
+_MIGRATION_0003_CURATION = Migration(
+    version=3,
+    name="source_curation_proposals",
+    statements=(
+        # Proposed `sources.yaml` edits awaiting a human tick (DESIGN §7.1). The
+        # table stores the *proposal*, never the edit: applying is a text change to
+        # the YAML file, so this row is the audit trail for why it happened.
+        """
+        CREATE TABLE proposals (
+            id            INTEGER PRIMARY KEY,
+            run_id        INTEGER REFERENCES runs(id),
+            kind          TEXT NOT NULL,
+            dedup_key     TEXT NOT NULL,
+            payload       TEXT NOT NULL,
+            rationale     TEXT NOT NULL,
+            evidence      TEXT NOT NULL,
+            probe         TEXT,
+            tier          TEXT NOT NULL,
+            status        TEXT NOT NULL,
+            surface_date  TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            decided_at    TEXT,
+            -- Why the operator said no, when they bothered to say. A digest
+            -- checkbox carries no reason, so this is only ever populated from
+            -- `curate decide --note`; it is what the scout's suppression list
+            -- feeds back, because replaying the scout's own pitch at it teaches
+            -- it nothing about the operator's taste (DESIGN §7.1).
+            decision_note TEXT,
+            applied_at    TEXT
+        )
+        """,
+        # The idempotency lever, mirroring `ux_feedback_item_verdict`: one row per
+        # distinct (kind, target) *ever*. Re-running the scout weekly re-suggests
+        # the same obvious candidates, and `ON CONFLICT DO NOTHING` collapses those
+        # to the original row — so a re-scout adds zero duplicates and a proposal
+        # the operator already rejected never reappears in a digest.
+        "CREATE UNIQUE INDEX ux_proposals_kind_key ON proposals (kind, dedup_key)",
+        # Rendering the digest block asks for "pending, surfaced on or before D",
+        # which is this index's exact shape.
+        "CREATE INDEX idx_proposals_status_surface ON proposals (status, surface_date)",
+        # Web search is billed per search ($10/1000), not per token, so the two
+        # `llm_*_tokens` columns cannot express its cost. Without this column the
+        # spend would be real and invisible — the failure NEVER rule 11 exists to
+        # prevent. `signalforge status` turns it into a dollar figure (DESIGN §8).
+        "ALTER TABLE runs ADD COLUMN server_tool_requests INTEGER DEFAULT 0",
+    ),
+)
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     _MIGRATION_0001_PHASE0,
     _MIGRATION_0002_FEEDBACK_DEDUP,
+    _MIGRATION_0003_CURATION,
 )
 """Ordered, append-only. Never edit an applied migration — add a new one."""
 
@@ -648,6 +722,7 @@ def finish_run(
     items_new: int = 0,
     llm_input_tokens: int = 0,
     llm_output_tokens: int = 0,
+    server_tool_requests: int = 0,
     errors: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """Close a `runs` row.
@@ -655,17 +730,23 @@ def finish_run(
     `status` is one of `ok | partial | failed` (DESIGN §5). `errors` is the
     per-source failure list, stored as JSON — one broken source never aborts a
     run, but it must never vanish either (CLAUDE.md §7).
+
+    `server_tool_requests` counts Anthropic server-tool calls (web search) made
+    by the run. It defaults to 0 because every existing caller makes none; the
+    curation scout is the only path that passes it. Token counts alone cannot
+    express that spend — web search bills per call (DESIGN §8).
     """
     encoded = json.dumps(list(errors)) if errors else None
     conn.execute(
         """
         UPDATE runs SET
-            finished_at       = ?,
-            status            = ?,
-            items_new         = ?,
-            llm_input_tokens  = ?,
-            llm_output_tokens = ?,
-            errors            = ?
+            finished_at          = ?,
+            status               = ?,
+            items_new            = ?,
+            llm_input_tokens     = ?,
+            llm_output_tokens    = ?,
+            server_tool_requests = ?,
+            errors               = ?
         WHERE id = ?
         """,
         (
@@ -674,6 +755,7 @@ def finish_run(
             items_new,
             llm_input_tokens,
             llm_output_tokens,
+            server_tool_requests,
             encoded,
             run_id,
         ),
@@ -783,3 +865,739 @@ def get_feedback(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
             (item_id,),
         ).fetchall()
     )
+
+
+# --------------------------------------------------------------------------- #
+# proposals — adaptive source curation (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True, slots=True)
+class Proposal:
+    """One proposed `sources.yaml` edit, read back with its JSON fields decoded."""
+
+    id: int
+    run_id: int | None
+    kind: ProposalKind
+    dedup_key: str
+    payload: dict[str, object]
+    """The edit itself — url, source id, repo slug, keyword. Load-bearing: the
+    applier writes these values into `sources.yaml`, so it is decoded strictly.
+    A corrupt payload raises rather than degrading to `{}`, because a traceback
+    is a better outcome than appending a malformed entry to the config."""
+
+    rationale: str
+    evidence: tuple[dict[str, str], ...]
+    """`[{url, note}]` — guaranteed non-empty. `insert_proposal` refuses to store
+    an uncited proposal and the read path drops any row that somehow holds one,
+    so no caller can render a claim with no backing URL (CLAUDE.md §5, NEVER 7)."""
+
+    probe: dict[str, object] | None
+    """Deterministic health facts, or a recorded failure reason. Advisory detail
+    for the digest block, so this is the one column decoded tolerantly."""
+
+    tier: ProposalTier
+    status: ProposalStatus
+    surface_date: Date
+    created_at: datetime
+    decided_at: datetime | None
+    decision_note: str | None
+    applied_at: datetime | None
+
+
+def _decode_probe(raw: str | None) -> dict[str, object] | None:
+    """Decode the advisory `probe` column, tolerating anything unreadable.
+
+    Tolerant on purpose, and only for this column: probe facts are decoration on
+    a digest block, so one unreadable row must not make the whole digest
+    unrenderable (CLAUDE.md §7). Every other column is either strict or typed.
+    """
+    if not raw:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("proposal probe column could not be decoded; treating as absent")
+        return None
+    return decoded if isinstance(decoded, dict) else None
+
+
+def _decode_evidence(raw: str) -> tuple[dict[str, str], ...]:
+    """Decode the evidence list, keeping only entries that carry a usable URL.
+
+    Returns `()` for an unreadable or fully-uncited list; the read path treats
+    that as a row to drop rather than a proposal to render. Re-checking here
+    rather than trusting the insert is deliberate — citations are the structural
+    defence against confabulation (CLAUDE.md §5), and a defence that lives in
+    exactly one write path is one refactor away from being gone.
+    """
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("proposal evidence could not be decoded; treating as empty")
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(
+        {"url": str(entry["url"]), "note": str(entry.get("note", ""))}
+        for entry in decoded
+        if isinstance(entry, dict) and str(entry.get("url", "")).strip()
+    )
+
+
+def _decode_payload(raw: str, *, proposal_id: int) -> dict[str, object]:
+    """Decode the `payload` column strictly — a corrupt edit must not proceed quietly.
+
+    Unlike `probe`, this is what `curate/apply.py` writes into `sources.yaml`.
+    Degrading it to `{}` would turn a corrupt row into a malformed config append,
+    which is a worse failure than raising: the same reasoning that makes
+    `surface_date` a hard `Date.fromisoformat`.
+    """
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"proposal {proposal_id} has an undecodable payload: {exc}") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError(f"proposal {proposal_id} payload is not a JSON object")
+    return decoded
+
+
+def _row_to_proposal(row: sqlite3.Row) -> Proposal:
+    return Proposal(
+        id=row["id"],
+        run_id=row["run_id"],
+        kind=ProposalKind(row["kind"]),
+        dedup_key=row["dedup_key"],
+        payload=_decode_payload(row["payload"], proposal_id=row["id"]),
+        rationale=row["rationale"],
+        evidence=_decode_evidence(row["evidence"]),
+        probe=_decode_probe(row["probe"]),
+        tier=ProposalTier(row["tier"]),
+        status=ProposalStatus(row["status"]),
+        surface_date=Date.fromisoformat(row["surface_date"]),
+        created_at=_from_iso(row["created_at"]) or datetime.fromtimestamp(0),
+        decided_at=_from_iso(row["decided_at"]),
+        decision_note=row["decision_note"],
+        applied_at=_from_iso(row["applied_at"]),
+    )
+
+
+def _cited_proposals(rows: Sequence[sqlite3.Row]) -> list[Proposal]:
+    """Decode rows to `Proposal`s, dropping any that carry no usable citation.
+
+    This is where `Proposal.evidence`'s non-empty guarantee is actually made good
+    on the read side. `insert_proposal` already refuses uncited proposals, so a
+    drop here means a row was hand-edited or written by an older shape — logged
+    loudly and skipped, never rendered, because an uncited proposal in a digest
+    is precisely the confabulation NEVER rule 7 forbids.
+    """
+    proposals: list[Proposal] = []
+    for row in rows:
+        proposal = _row_to_proposal(row)
+        if not proposal.evidence:
+            logger.warning(
+                "dropping a proposal with no usable evidence URL",
+                extra={"proposal_id": proposal.id, "kind": proposal.kind.value},
+            )
+            continue
+        if _unsafe_identity(proposal):
+            continue
+        proposals.append(proposal)
+    return proposals
+
+
+def _unsafe_identity(proposal: Proposal) -> bool:
+    """Whether a row's identity fields carry a control character. Drops it if so.
+
+    The read-side counterpart to `insert_proposal`'s refusal, and for the same
+    reason: `dedup_key` and every citation URL render into a vault markdown file
+    whose *lines* a later harvest reads decisions from, so a newline in either can
+    forge an approval for an arbitrary proposal.
+
+    Here rather than in `report/` because the digest is not the only consumer — the
+    `curate` CLI lists these and the applier writes them into `sources.yaml` — and a
+    defence that lives in one of three consumers is not a defence. Dropped rather
+    than repaired, matching the write side: rewriting an identity field changes what
+    the row means, and a row in this state was hand-edited or written by an older
+    shape, never produced by the pipeline.
+    """
+    urls = [entry["url"] for entry in proposal.evidence]
+    control_char = any(has_control_characters(value) for value in [proposal.dedup_key, *urls])
+    # A citation must also actually be a URL, not merely free of control
+    # characters: a plain, printable string like `"[x] approve <!-- sf:proposal=5
+    # v=approve -->"` renders as its own line in the digest's evidence block and
+    # would be harvested as a real decision without ever containing a control
+    # character (`models.is_safe_url`'s docstring has the full exploit chain).
+    forged_citation = any(not is_safe_url(url) for url in urls)
+    if not (control_char or forged_citation):
+        return False
+    logger.warning(
+        "dropping a proposal whose identity fields are unsafe",
+        extra={
+            "proposal_id": proposal.id,
+            "kind": proposal.kind.value,
+            "control_character": control_char,
+            "forged_citation": forged_citation,
+        },
+    )
+    return True
+
+
+_INSERT_PROPOSAL = """
+    INSERT INTO proposals (
+        run_id, kind, dedup_key, payload, rationale, evidence, probe, tier,
+        status, surface_date, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (kind, dedup_key) DO NOTHING
+"""
+
+
+def insert_proposal(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int,
+    kind: ProposalKind,
+    dedup_key: str,
+    payload: Mapping[str, object],
+    rationale: str,
+    evidence: Sequence[Mapping[str, str]],
+    probe: Mapping[str, object] | None,
+    tier: ProposalTier,
+    status: ProposalStatus,
+    surface_date: Date,
+    created_at: datetime,
+) -> int | None:
+    """Store one proposal, returning its id, or None when it already existed.
+
+    Idempotent by construction (CLAUDE.md §3, NEVER rule 4): the
+    `ux_proposals_kind_key` index plus `ON CONFLICT DO NOTHING` mean a weekly
+    scout re-suggesting last week's candidate is a no-op, and a candidate the
+    operator already rejected can never be re-surfaced for a second decision.
+    None is therefore the *expected* return on a steady-state run, not an error.
+
+    `evidence` must contain at least one entry with a non-blank `url`. That is
+    checked here rather than trusted, because this is the chokepoint every
+    proposal passes through, and an uncited proposal must not be storable at all
+    (CLAUDE.md §5, NEVER rule 7).
+
+    `dedup_key` must already be normalized by the caller — `canonicalize_url` for
+    a feed, the bare `owner/repo` slug, or the lowercased keyword. Normalizing
+    here would hide which shape each kind expects; getting it wrong shows up as a
+    duplicate proposal, which the tests cover.
+
+    Only `pending` and `invalid` are insertable. Every other state is reached
+    through a guarded transition, so no caller — including a future one — can
+    mint an `approved` or `applied` row and bypass the human gate that DESIGN
+    §7.1 says has no bypass.
+
+    **No stored text may contain a control character**, and that is a security
+    invariant, not tidiness. These fields are rendered into a vault markdown file
+    where a *line* is structure, and `curate/approvals.py` harvests a decision from
+    any line matching its checkbox pattern. A rationale free to contain a newline can
+    therefore carry a pre-ticked approval marker for an arbitrary proposal id, which
+    the next harvest records as the operator's decision — the same bypass the
+    paragraph above forbids, arriving through prose instead of through a status.
+    Prose (`rationale`, evidence notes) is flattened; identity fields (`dedup_key`,
+    citation URLs) are refused, because rewriting them would change what the row
+    means. A citation URL is refused on a second ground too: it must have the
+    shape of an `http(s)` URL (`models.is_safe_url`), not merely be free of
+    control characters — a printable string with none can still be a complete
+    checkbox marker line, and every evidence entry renders as its own line in the
+    digest.
+    """
+    if status not in (ProposalStatus.PENDING, ProposalStatus.INVALID):
+        raise ValueError(
+            f"proposals are insertable only as pending or invalid, not {status.value!r}; "
+            "approval and application are guarded transitions (DESIGN §7.1)"
+        )
+    cited = [
+        {
+            "url": str(entry["url"]).strip(),
+            "note": flatten_to_single_line(str(entry.get("note", ""))),
+        }
+        for entry in evidence
+        if str(entry.get("url", "")).strip()
+    ]
+    if not cited:
+        raise ValueError(
+            f"proposal {kind.value} {dedup_key!r} has no evidence URL; "
+            "every proposal must cite at least one source (CLAUDE.md §5)"
+        )
+    if not dedup_key.strip():
+        raise ValueError(f"proposal {kind.value} has an empty dedup_key")
+    # Identity fields are refused rather than repaired: silently rewriting a dedup
+    # key or a citation changes what the row *means*. Prose fields are flattened
+    # just above and just below.
+    if has_control_characters(dedup_key):
+        raise ValueError(
+            f"proposal {kind.value} has a dedup_key containing a control character: {dedup_key!r}"
+        )
+    for entry in cited:
+        if has_control_characters(entry["url"]):
+            raise ValueError(
+                f"proposal {kind.value} {dedup_key!r} cites a URL containing a control "
+                f"character: {entry['url']!r}"
+            )
+        if not is_safe_url(entry["url"]):
+            # Not just a control-character check: a printable string with no
+            # control character at all can still be a complete, valid checkbox
+            # marker line, and every evidence entry renders as its own line in the
+            # digest. Requiring the shape of a real URL is what a forged marker
+            # cannot satisfy (`models.is_safe_url`).
+            raise ValueError(
+                f"proposal {kind.value} {dedup_key!r} cites something that is not an "
+                f"http(s) URL: {entry['url']!r}"
+            )
+
+    cursor = conn.execute(
+        _INSERT_PROPOSAL,
+        (
+            run_id,
+            kind.value,
+            dedup_key,
+            json.dumps(dict(payload), sort_keys=True),
+            flatten_to_single_line(rationale),
+            json.dumps(cited),
+            json.dumps(dict(probe), sort_keys=True) if probe is not None else None,
+            tier.value,
+            status.value,
+            surface_date.isoformat(),
+            _to_iso(created_at),
+        ),
+    )
+    if cursor.rowcount != 1:
+        logger.debug(
+            "proposal already exists; not re-surfacing",
+            extra={"kind": kind.value, "dedup_key": dedup_key},
+        )
+        return None
+    proposal_id = int(cursor.lastrowid or 0)
+    logger.info(
+        "stored proposal",
+        extra={"proposal_id": proposal_id, "kind": kind.value, "status": status.value},
+    )
+    return proposal_id
+
+
+def get_proposal(conn: sqlite3.Connection, proposal_id: int) -> Proposal | None:
+    """One proposal by primary key, or None (also None for an uncited row)."""
+    row = conn.execute("SELECT * FROM proposals WHERE id = ?", (proposal_id,)).fetchone()
+    if row is None:
+        return None
+    found = _cited_proposals([row])
+    return found[0] if found else None
+
+
+def get_proposals(
+    conn: sqlite3.Connection,
+    *,
+    statuses: Sequence[ProposalStatus] | None = None,
+    surfaced_on_or_before: Date | None = None,
+) -> list[Proposal]:
+    """Proposals matching the given filters, oldest surface date first.
+
+    Ordering is `(surface_date, id)` so a digest re-render is byte-identical
+    (CLAUDE.md §3) — the block is a pure function of the filters and DB state.
+
+    `statuses=None` means no status filter; an *empty* sequence means "no status
+    is acceptable" and returns nothing. The distinction matters because a caller
+    building the list dynamically would otherwise get every row — including
+    rejected candidates — into a digest the moment its list computed empty.
+    """
+    clauses: list[str] = []
+    params: list[object] = []
+    if statuses is not None:
+        if not statuses:
+            return []
+        placeholders = ", ".join("?" for _ in statuses)
+        clauses.append(f"status IN ({placeholders})")
+        params.extend(status.value for status in statuses)
+    if surfaced_on_or_before is not None:
+        clauses.append("surface_date <= ?")
+        params.append(surfaced_on_or_before.isoformat())
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        # The interpolated text is fixed clause fragments and one `?` per status;
+        # no caller data reaches the SQL string itself.
+        f"SELECT * FROM proposals{where} ORDER BY surface_date ASC, id ASC",  # noqa: S608
+        params,
+    ).fetchall()
+    return _cited_proposals(rows)
+
+
+def decide_proposal(
+    conn: sqlite3.Connection,
+    *,
+    proposal_id: int,
+    status: ProposalStatus,
+    decided_at: datetime,
+    note: str | None = None,
+) -> bool:
+    """Record an approve/reject decision, returning True only when it landed.
+
+    The `status = 'pending'` guard is what makes re-harvesting the same vault
+    checkbox a no-op (DESIGN §11's harvest-then-overwrite, applied to proposals):
+    a proposal already approved, applied, or rejected is left exactly as it was
+    and False comes back. It also means a tick added to an *old* digest after the
+    fact cannot silently re-open a settled decision.
+
+    `note` is the operator's reason, and is only ever supplied from the CLI — a
+    digest checkbox carries no free text. It is what the scout's suppression list
+    replays, so a rejection made with a note teaches the next run something.
+    """
+    if status not in (ProposalStatus.APPROVED, ProposalStatus.REJECTED):
+        raise ValueError(f"decide_proposal expects approved or rejected, got {status.value!r}")
+    cursor = conn.execute(
+        """
+        UPDATE proposals SET status = ?, decided_at = ?, decision_note = ?
+        WHERE id = ? AND status = ?
+        """,
+        (
+            status.value,
+            _to_iso(decided_at),
+            note,
+            proposal_id,
+            ProposalStatus.PENDING.value,
+        ),
+    )
+    decided = cursor.rowcount == 1
+    logger.info(
+        "proposal decided" if decided else "proposal was not pending; decision ignored",
+        extra={"proposal_id": proposal_id, "status": status.value},
+    )
+    return decided
+
+
+def mark_proposal_applied(
+    conn: sqlite3.Connection, *, proposal_id: int, applied_at: datetime
+) -> bool:
+    """Flip an approved proposal to applied, returning True only when it landed.
+
+    Guarded on `status = 'approved'` so a second `curate apply` sees False rather
+    than re-applying. **That guard protects this row, not the file.** The YAML
+    edit and this status flip are two writes: a crash between them leaves the row
+    `approved` with the edit already on disk, and the next run would append it
+    again. The applier must therefore be idempotent against the `sources.yaml`
+    *text* as well — append only when the entry is genuinely absent — because
+    duplicating a config block is NEVER rule 4 at the file level, and `db.py`
+    cannot prevent it from here.
+    """
+    cursor = conn.execute(
+        "UPDATE proposals SET status = ?, applied_at = ? WHERE id = ? AND status = ?",
+        (
+            ProposalStatus.APPLIED.value,
+            _to_iso(applied_at),
+            proposal_id,
+            ProposalStatus.APPROVED.value,
+        ),
+    )
+    return cursor.rowcount == 1
+
+
+_REOPENABLE_STATUSES: Final = (ProposalStatus.REJECTED, ProposalStatus.INVALID)
+"""The two states `reopen_proposal` can escape.
+
+`rejected` because an operator may change their mind, and the unique index means
+the scout can never re-suggest the candidate on its own. `invalid` because probe
+failures are frequently transient — a timeout, a 503, a rate limit — and one bad
+Sunday must not permanently remove a good feed from the scout's reachable set.
+`applied` is deliberately absent: that state lives in `sources.yaml`, and undoing
+it means editing the file."""
+
+
+def reopen_proposal(conn: sqlite3.Connection, *, proposal_id: int) -> bool:
+    """Return a rejected or invalid proposal to pending, returning True when it moved.
+
+    Called two ways: by the operator via `curate reopen` after a rejection they
+    regret, and by the probe stage when a previously-`invalid` candidate passes
+    its health check on a later run. Both matter because `ux_proposals_kind_key`
+    makes every terminal state permanent from the scout's point of view.
+
+    The reopened row keeps its original `surface_date` and its stale `probe`
+    facts; the next probe pass overwrites the latter. That is why a reopen alone
+    does not re-surface health numbers that could be months old.
+    """
+    rejected, invalid = _REOPENABLE_STATUSES
+    cursor = conn.execute(
+        """
+        UPDATE proposals SET status = ?, decided_at = NULL, decision_note = NULL
+        WHERE id = ? AND status IN (?, ?)
+        """,
+        (ProposalStatus.PENDING.value, proposal_id, rejected.value, invalid.value),
+    )
+    reopened = cursor.rowcount == 1
+    logger.info(
+        "proposal reopened" if reopened else "proposal is not reopenable; left as is",
+        extra={"proposal_id": proposal_id},
+    )
+    return reopened
+
+
+def update_proposal_probe(
+    conn: sqlite3.Connection, *, proposal_id: int, probe: Mapping[str, object]
+) -> bool:
+    """Replace a proposal's health facts, returning True when a row was updated.
+
+    The re-probe path needs this: `insert_proposal` is `ON CONFLICT DO NOTHING`,
+    so a candidate that already has a row cannot have its facts refreshed through
+    the insert. Without this function `probe` would be write-once, and the
+    lifecycle DESIGN §7.1 describes — re-probe `invalid` rows each run, record why
+    the probe failed, reopen the ones that now pass — would be undeliverable.
+
+    Facts are replaced wholesale rather than merged: a probe result describes one
+    fetch attempt, and merging last week's item count into this week's failure
+    would produce a row describing a state that never existed.
+    """
+    cursor = conn.execute(
+        "UPDATE proposals SET probe = ? WHERE id = ?",
+        (json.dumps(dict(probe), sort_keys=True), proposal_id),
+    )
+    return cursor.rowcount == 1
+
+
+@dataclass(frozen=True, slots=True)
+class RejectedProposal:
+    """One entry in the scout's suppression list (DESIGN §7.1)."""
+
+    kind: ProposalKind
+    dedup_key: str
+    rationale: str
+    """The scout's original pitch — kept so the prompt can show what was
+    proposed, not just that something was."""
+
+    decision_note: str | None
+    """The operator's reason, when they gave one. This is the part that actually
+    teaches taste; `rationale` alone would just replay the model's own argument
+    back at it."""
+
+
+def rejected_proposals(conn: sqlite3.Connection, *, limit: int) -> list[RejectedProposal]:
+    """The most recently rejected proposals, oldest of those first.
+
+    Fed into the scout prompt so it stops re-suggesting what the operator already
+    turned down. The unique index would collapse a repeat suggestion anyway, but
+    that wastes the searches and the proposal slot that produced it, and tells the
+    scout nothing about why the answer was no.
+
+    **Bounded, like `kept_items`, because it is prompt input on an Opus-priced
+    call.** Rejections only accumulate — nothing ever removes one — so an unbounded
+    list grows the weekly bill forever and eventually drowns the evidence around it.
+    The bound is safe precisely because `ux_proposals_kind_key` is the real
+    suppression mechanism: a candidate that falls off the end of this list can still
+    never be stored a second time. Losing it from the prompt costs at most one
+    wasted proposal slot, not a re-decision.
+
+    Returned oldest-first within the window so the rendered text is stable, while
+    the *selection* takes the newest — a rejection from last month says more about
+    the operator's current judgment than one from a year ago.
+    """
+    rows = conn.execute(
+        """
+        SELECT kind, dedup_key, rationale, decision_note FROM (
+            SELECT id, kind, dedup_key, rationale, decision_note FROM proposals
+            WHERE status = ? ORDER BY id DESC LIMIT ?
+        ) ORDER BY id ASC
+        """,
+        (ProposalStatus.REJECTED.value, limit),
+    ).fetchall()
+    return [
+        RejectedProposal(
+            kind=ProposalKind(row["kind"]),
+            dedup_key=row["dedup_key"],
+            rationale=row["rationale"],
+            decision_note=row["decision_note"],
+        )
+        for row in rows
+    ]
+
+
+# --------------------------------------------------------------------------- #
+# curation evidence — read-only aggregates for curate/gather.py (DESIGN §7.1)
+#
+# These deliberately return raw rows rather than verdicts about them. The
+# judgment ("this source is dead") belongs to the scout, and the ordinal
+# reduction of feedback belongs next to `feedback.LADDER` — encoding the ladder
+# order in SQL here would be a second copy of a vocabulary that must not drift.
+# --------------------------------------------------------------------------- #
+
+
+def _window_start(since: datetime) -> str:
+    """Normalize a window start to a UTC ISO string before comparing it in SQL.
+
+    Every stored timestamp is UTC with a `+00:00` offset (`Item._require_utc`),
+    which is what makes SQLite's lexical string comparison chronological. A
+    `since` expressed in any other zone is the *same instant* written with a
+    different offset, and compares wrong: `2026-07-20T10:00:00+10:00` sorts above
+    `2026-07-20T00:00:00+00:00` even though they are identical moments.
+
+    That matters concretely — the operator's zone is UTC+10 and `cli.py` already
+    derives dates through `settings.tzinfo`, so a caller passing a local-midnight
+    `since` would silently get a truncated or empty window. The scout would then
+    read 0 items for healthy sources and propose retiring them.
+
+    A *naive* `since` is treated as UTC, matching `Item._require_utc`'s stated
+    convention for the same reason it exists there. `astimezone` alone would not
+    do this: on a naive input it assumes **system local time**, and this pipeline
+    runs under `TZ=Australia/Brisbane`, so a naive midnight would silently widen
+    the window by ten hours. Both coercions are needed for the claim that callers
+    cannot get this wrong to actually hold.
+    """
+    aware = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+    return aware.astimezone(UTC).isoformat()
+
+
+@dataclass(frozen=True, slots=True)
+class SourceYield:
+    """Per-source triage outcomes over a window — the retirement evidence.
+
+    Deliberately carries no feedback counts: an item can hold several verdicts,
+    so summing them per source double-counts and deflates exactly the way DESIGN
+    §11 warns about. Feedback arrives separately, per item, via
+    `feedback_verdicts_since`, and the caller reduces each item to its highest
+    rung before aggregating.
+    """
+
+    source_id: str
+    source_type: SourceType
+    items_total: int
+    kept: int
+    killed: int
+    unscored: int
+
+
+def source_yield_stats(
+    conn: sqlite3.Connection, *, since: datetime, limit: int
+) -> list[SourceYield]:
+    """Triage outcomes per source for items fetched at or after `since`.
+
+    Uses `fetched_at`, not `published_at`: the question is what this source has
+    *delivered to us* lately, and a feed republishing old posts is still noise
+    the operator had to skim past. Note the deliberate asymmetry with feedback —
+    the window is on when we fetched the item, so a mark made this week on an
+    item fetched last month falls outside it.
+
+    **Bounded, like every other list that reaches the scout's prompt.** One row per
+    source is small and grows only when the operator approves a new source, so this
+    is nowhere near the money the rejection list was — but a bound that is merely
+    *emergent from how the config grows* is not a bound, and this is the same class of
+    unbounded prompt input. Ordered by items delivered so the busiest sources survive
+    the cut, since a source with nothing in the window is the least informative row
+    in the table.
+    """
+    rows = conn.execute(
+        """
+        SELECT items.source_id                                            AS source_id,
+               items.source_type                                          AS source_type,
+               COUNT(*)                                                   AS items_total,
+               SUM(CASE WHEN scores.triage = 'keep' THEN 1 ELSE 0 END)    AS kept,
+               SUM(CASE WHEN scores.triage = 'kill' THEN 1 ELSE 0 END)    AS killed,
+               SUM(CASE WHEN scores.item_id IS NULL THEN 1 ELSE 0 END)    AS unscored
+        FROM items
+        LEFT JOIN scores ON scores.item_id = items.id
+        WHERE items.fetched_at >= ?
+        GROUP BY items.source_id, items.source_type
+        ORDER BY items_total DESC, items.source_id ASC
+        LIMIT ?
+        """,
+        (_window_start(since), limit),
+    ).fetchall()
+    return [
+        SourceYield(
+            source_id=row["source_id"],
+            source_type=SourceType(row["source_type"]),
+            items_total=int(row["items_total"]),
+            kept=int(row["kept"] or 0),
+            killed=int(row["killed"] or 0),
+            unscored=int(row["unscored"] or 0),
+        )
+        for row in rows
+    ]
+
+
+def feedback_verdicts_since(
+    conn: sqlite3.Connection, *, since: datetime
+) -> list[tuple[str, int, str]]:
+    """`(source_id, item_id, verdict)` for every mark on an item fetched since `since`.
+
+    One row per stored verdict, unreduced. The caller collapses each item to its
+    highest rung using `feedback.LADDER`, which is the single definition of that
+    order — see this section's header comment for why the reduction is not done
+    in SQL. Row volume is a handful of marks per window, so returning them
+    unaggregated costs nothing.
+
+    **Off-ladder verdicts are included.** `missed` is in the `feedback` vocabulary
+    but deliberately absent from `LADDER`, so the obvious reduction
+    (`max(verdicts, key=LADDER.index)`) raises `ValueError` the first time the
+    operator marks something missed. Callers must filter or handle it explicitly.
+    It is not noise to discard either: a source whose items keep getting marked
+    `missed` is under-weighted, not dead.
+    """
+    rows = conn.execute(
+        """
+        SELECT items.source_id AS source_id, feedback.item_id AS item_id,
+               feedback.verdict AS verdict
+        FROM feedback
+        JOIN items ON items.id = feedback.item_id
+        WHERE items.fetched_at >= ?
+        ORDER BY items.source_id, feedback.item_id
+        """,
+        (_window_start(since),),
+    ).fetchall()
+    return [(row["source_id"], int(row["item_id"]), row["verdict"]) for row in rows]
+
+
+@dataclass(frozen=True, slots=True)
+class KeptItem:
+    """A kept item, reduced to what curation evidence needs.
+
+    `content` is deliberately absent: it exists only for top-N deep reads, and
+    pulling full article text here to count domains would be exactly the kind of
+    quiet cost creep DESIGN §8 guards against.
+    """
+
+    source_id: str
+    url: str
+    title: str
+    summary: str
+    """As stored, which for an RSS item means **HTML already stripped** by
+    `rss._clean_summary`. Anchor text survives; hrefs do not. HN items keep their
+    markup because the Algolia payload carries it, so link extraction over this
+    field covers HN and misses feeds — see `curate.gather` for why that gap is
+    accepted rather than worked around."""
+
+    ranking_score: int
+    """signal + relevance + novelty, so the caller can show the scout the items
+    the operator valued *most* rather than an arbitrary slice."""
+
+
+def kept_items(conn: sqlite3.Connection, *, since: datetime, limit: int) -> list[KeptItem]:
+    """The highest-ranked kept items fetched since `since`, best first.
+
+    Bounded by `limit` because these go into a prompt: this is the one gather
+    query whose output size directly moves the scout's input-token bill, so the
+    caller states how many it can afford rather than discovering it later.
+    """
+    rows = conn.execute(
+        """
+        SELECT items.source_id AS source_id, items.url AS url, items.title AS title,
+               COALESCE(items.summary, '') AS summary,
+               (COALESCE(scores.signal, 0) + COALESCE(scores.relevance, 0)
+                + COALESCE(scores.novelty, 0)) AS ranking_score
+        FROM items
+        JOIN scores ON scores.item_id = items.id
+        WHERE scores.triage = 'keep' AND items.fetched_at >= ?
+        ORDER BY ranking_score DESC, items.id ASC
+        LIMIT ?
+        """,
+        (_window_start(since), limit),
+    ).fetchall()
+    return [
+        KeptItem(
+            source_id=row["source_id"],
+            url=row["url"],
+            title=row["title"],
+            summary=row["summary"],
+            ranking_score=int(row["ranking_score"]),
+        )
+        for row in rows
+    ]

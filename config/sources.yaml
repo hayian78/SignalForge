@@ -56,9 +56,6 @@ rss:
   - id: one-useful-thing
     url: https://www.oneusefulthing.org/feed
     weight: 1.3
-  - id: mit-tech-review-ai
-    url: https://www.technologyreview.com/topic/artificial-intelligence/feed
-    weight: 1.0
   - id: ben-evans
     url: https://www.ben-evans.com/benedictevans?format=rss
     weight: 1.2
@@ -144,3 +141,49 @@ arxiv:
 # policy terms.
 hackernews:
   keywords: [llm, claude, gemini, openai, anthropic, reasoning, agent, agi, policy]
+
+# --------------------------------------------------------------------------- #
+# Adaptive source curation (DESIGN §7.1) — meta-config, not a source.
+#
+# `signalforge curate run` (weekly) reads per-source yield from the stored corpus,
+# searches the live web for where attention has moved, and proposes edits to THIS
+# file. Proposals surface as tick-boxes at the foot of the next daily digest;
+# approved ones are applied by `signalforge curate apply` at the start of the
+# following morning's run, before ingest, so a feed approved yesterday is fetched
+# today. `signalforge curate list` and `curate decide <id> approve|reject --note`
+# are the terminal equivalents of the tick-boxes.
+#
+# Nothing here changes a source without a tick, and every applied change lands as
+# an uncommitted git diff on this file for review. `interests.yaml` is never
+# proposed against — what the operator cares about is a deliberate choice; where
+# it comes from is a fact about the world.
+#
+# Delete this block to turn the feature off; `curate run` will say so and exit
+# rather than invent its own spend caps, and `curate apply` drops out of the daily
+# chain entirely.
+curation:
+  # At most N proposals per run — one week cannot rewire the feed.
+  max_proposals_per_run: 5
+
+  # The money knob: web search is billed per call, not per token (DESIGN §8), so
+  # this caps the one line of curation spend that token counts don't show. Turn
+  # this first if the *search* figure in `signalforge status` surprises you. Set
+  # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
+  # beyond the one Opus call.
+  #
+  # Starts at 6, one below the 7 the budget affords. How many input tokens a search
+  # actually drags into context cannot be measured from tests — the suite never calls
+  # the real API (NEVER rule 13) — so the first real run IS the instrument. Read
+  # `signalforge status` after two runs; if the per-search figure is where DESIGN §8
+  # expects, 7 is available. It is not much headroom: at 7 searches the *pessimistic*
+  # worst case sits at ~96% of this feature's $2.50 budget, and llm.py clamps
+  # anything above 7 rather than spending past it.
+  max_searches_per_run: 6
+
+  # Lookback for the yield stats that justify a retirement.
+  yield_window_days: 30
+
+  # How long a decided proposal keeps rendering as a settled one-liner, counted
+  # from the day it first surfaced, so re-reading an old digest still shows what
+  # was approved that week.
+  settled_display_days: 14

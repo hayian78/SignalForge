@@ -152,7 +152,14 @@ signalforge/
 │   │   ├── github.py           # releases, trending, awesome-list diffs
 │   │   ├── arxiv.py            # category + keyword queries
 │   │   ├── hackernews.py       # Algolia API, front page + keyword search
+│   │   ├── probe.py            # feed/repo health facts for curation (§7.1); writes no items
 │   │   └── youtube.py          # Phase 3: yt-dlp auto-transcripts
+│   ├── curate/                 # Phase 1: adaptive source curation (§7.1)
+│   │   ├── gather.py           # per-source yield + outbound attention (DB reads only)
+│   │   ├── scout.py            # the weekly LLM judgment call
+│   │   ├── probe.py            # drives ingest/probe.py over candidates
+│   │   ├── approvals.py        # digest tick-box wire format + vault harvest (read-only)
+│   │   └── apply.py            # append-and-comment-out applier for sources.yaml
 │   ├── enrich/
 │   │   ├── dedup.py            # exact (P0) + semantic (P2)
 │   │   ├── taxonomy.py         # rule-based tagging, LLM fallback
@@ -185,7 +192,7 @@ signalforge/
 └── tests/
 ```
 
-**Module responsibilities are strict:** `ingest/` never calls an LLM; `score/` and `synth/` never make HTTP calls to sources; `report/` only reads the DB and writes markdown; `llm.py` is the *only* module that touches the Anthropic SDK, so budget accounting, prompt caching, and model selection live in exactly one place.
+**Module responsibilities are strict:** `ingest/` never calls an LLM; `score/` and `synth/` never make HTTP calls to sources; `report/` only reads the DB and writes markdown; `llm.py` is the *only* module that touches the Anthropic SDK, so budget accounting, prompt caching, and model selection live in exactly one place. The single sanctioned exception is `curate/`, which calls both `llm.py` and `ingest/probe.py` in that fixed order and writes no `items` row — see §7.1.
 
 ---
 
@@ -282,13 +289,14 @@ CREATE TABLE impact_assessments (
 -- Operations
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL,               -- ingest | score | daily | weekly | monthly
+    kind        TEXT NOT NULL,               -- ingest | score | curate | curate-apply | daily | weekly | monthly
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     status      TEXT,                        -- ok | partial | failed
     items_new   INTEGER DEFAULT 0,
     llm_input_tokens  INTEGER DEFAULT 0,
     llm_output_tokens INTEGER DEFAULT 0,
+    server_tool_requests INTEGER DEFAULT 0,  -- billed per call, not per token (web search) — §7.1
     errors      TEXT                         -- JSON list of per-source failures
 );
 CREATE TABLE feedback (                      -- human-in-the-loop signal for tuning
@@ -298,9 +306,33 @@ CREATE TABLE feedback (                      -- human-in-the-loop signal for tun
     created_at  TEXT NOT NULL,
     PRIMARY KEY (item_id, created_at)
 );
+
+CREATE TABLE proposals (                     -- proposed sources.yaml changes, awaiting a human tick (§7.1)
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER REFERENCES runs(id),
+    kind          TEXT NOT NULL,             -- add_rss | retire_rss | add_github_repo | retire_github_repo
+                                             -- | add_hn_keyword | remove_hn_keyword
+                                             -- | add_arxiv_keyword | remove_arxiv_keyword
+    dedup_key     TEXT NOT NULL,             -- normalized target: canonical_url | owner/repo | keyword
+    payload       TEXT NOT NULL,             -- JSON: url, suggested weight, source id, …
+    rationale     TEXT NOT NULL,             -- the scout's why
+    evidence      TEXT NOT NULL,             -- JSON [{url, note}] — non-empty by construction (§5 citations)
+    probe         TEXT,                      -- JSON deterministic health facts; NULL for non-fetchable kinds
+    tier          TEXT NOT NULL,             -- corpus | web — where the candidate came from
+    status        TEXT NOT NULL,             -- pending | approved | rejected | applied | invalid
+                                             -- only pending/invalid are insertable; the rest are
+                                             -- guarded transitions, so nothing can skip the human gate
+    surface_date  TEXT NOT NULL,             -- the digest date this first renders on
+    created_at    TEXT NOT NULL,
+    decided_at    TEXT,
+    decision_note TEXT,                      -- the operator's reason, when given (CLI only — a
+                                             -- checkbox carries no text); replayed to the scout
+    applied_at    TEXT
+);
+CREATE UNIQUE INDEX ux_proposals_kind_key ON proposals (kind, dedup_key);
 ```
 
-Two details that pay for themselves later: **`rubric_version` on every score** (when you change a prompt, you know which scores are comparable), and **the `feedback` table** (a `signalforge mark <id> useful|noise` command builds the ground-truth set that V2 scoring tuning — and the V3 analyst — will need).
+Three details that pay for themselves later: **`rubric_version` on every score** (when you change a prompt, you know which scores are comparable), **the `feedback` table** (a `signalforge mark <id> useful|noise` command builds the ground-truth set that V2 scoring tuning — and the V3 analyst — will need), and **`ux_proposals_kind_key`** (one row per distinct proposal ever, so re-running the scout is a no-op and a rejected proposal never comes back — the same trick `ux_feedback_item_verdict` plays for marks).
 
 ---
 
@@ -403,6 +435,227 @@ hackernews:
 
 ---
 
+## 7.1 Adaptive Source Curation (Phase 1)
+
+`sources.yaml` is static; the world it points at is not. Thought leaders emerge and go
+quiet, newsletters rebrand or paywall themselves, watched repos stop shipping anything the
+digest can act on. This is risk 6 ("source list goes stale"), and its original mitigation —
+a quarterly manual review — was both unbuilt and structurally limited: it can only reason
+about sources *already in the file*.
+
+`interests.yaml` is explicitly **not** in scope here. What the operator cares about is a
+deliberate choice they make; where it comes from is a fact about the world.
+
+### The loop
+
+Weekly, `signalforge curate run` runs four ordered stages:
+
+1. **Gather (deterministic).** Per-source yield from `items` ⋈ `scores` ⋈ `feedback` over
+   `curation.yield_window_days` — ingested, kept, killed, and highest feedback rung per
+   source. Plus outbound attention: domains and authors that the operator's *kept and
+   useful-or-better* items keep pointing at but which no source covers; and repeatedly-seen
+   HN front-page domains with no matching entry. With sparse `feedback`, yield falls back to
+   keep/kill ratios so the loop works from week one. Zero LLM cost — this is counting.
+2. **Scout (LLM judgment).** One `claude-opus-5` call with the web search server tool,
+   given the gathered evidence, the current `sources.yaml` inventory, `interests.yaml`, and
+   previously **rejected** proposals with their reasons so it stops re-suggesting them. Its
+   job is judgment — who matters now, what went quiet, what the corpus points at that we
+   lack — and reaching past our own sources. It never parses, counts, or normalizes.
+3. **Probe (deterministic).** Every candidate feed or repo is fetched and parsed *before it
+   is ever shown*: item count inside `max_item_age_days`, median body length, HTTP status.
+
+   **`invalid` covers mechanical failure only** — the fetch failed, or nothing parseable
+   came back. Of the two failures already recorded in `sources.yaml` by hand, that catches
+   `the-batch` (no feed exists at any plausible path) and deliberately does *not* catch
+   `stratechery` (the feed parses; its entries are teasers because it is members-only).
+   Whether thin entries are worth a slot is a judgment, and encoding it would mean inventing
+   a threshold for "enough text" — which under NEVER rule 6 would have to be a `curation:`
+   knob. So the probe reports `median_summary_chars` and the human at the gate decides. The
+   cost is precise and accepted: a stub candidate consumes one of
+   `max_proposals_per_run` and a few lines of digest space. The alternative failure is worse
+   — a machine-invented threshold silently dropping a publication the operator wanted, with
+   no record it was considered.
+
+   **`invalid` is not a permanent blacklist.** Probes also fail transiently — timeouts,
+   503s, rate limits — and `ux_proposals_kind_key` means the scout can never re-suggest a
+   candidate on its own, so one bad Sunday would otherwise remove a good feed forever. The
+   probe stage therefore re-probes **every** existing `invalid` row each run and reopens any
+   that now pass, and the failure reason is recorded in `probe` so the operator can see which
+   it was. No reason is treated as durable enough to skip: `no parseable entries` is exactly
+   what a consent interstitial or a bad deploy serving HTML at the feed path produces, and a
+   repo that has not cut its first release yet is a candidate worth reopening in a month. The
+   cost of re-probing is one HTTP request per invalid row per week; the cost of skipping is
+   permanent, because the unique index means the scout can never re-suggest the candidate
+   itself.
+
+   **The re-probe of existing `invalid` rows runs before the scout call, not after.** It
+   costs no tokens — HTTP and DB only — and running it first means a candidate the scout
+   re-proposes this week has already been refreshed and, if it now fetches, reopened. The
+   re-proposal then hits `ux_proposals_kind_key` and does nothing, instead of arriving with
+   fresh facts the conflict would discard. Running it afterwards would fetch the same URL
+   twice in one run and keep the same result.
+4. **Propose.** At most `curation.max_proposals_per_run` rows written to `proposals`,
+   each carrying a rationale and at least one evidence URL. The run records its tokens
+   *and* its `server_tool_requests`, and `curate apply` gets a `runs.kind` of its own —
+   folding the free applier into the paid scout's kind would hide a scout that had
+   stopped running behind an apply that runs every morning.
+
+   This is where model output becomes something that will edit the operator's config, so it
+   is where meaning is checked rather than only shape. `llm.ScoutProposal` validates the
+   shape; `curate/scout.py` validates the proposal against the config it would land in: a
+   feed URL is an http(s) URL, a retirement names a source that actually exists (resolved to
+   the config's *own* spelling, because the applier matches lines literally), an addition is
+   not something already configured, a keyword cannot contain a character that would corrupt
+   the flow-style list it is spliced into. Each check exists because failing it produces
+   either a checkbox that does nothing when ticked or an edit the safety net reverts — both
+   of which spend the operator's attention and discard their decision. A proposal that fails
+   any of them is dropped with its reason recorded to `runs.errors`, never stored.
+
+### The human gate
+
+Pending proposals render as an approval block at the foot of the next Daily Digest, with the
+same GFM checkbox affordance the `feedback` marks use (§11): the operator ticks approve or
+reject while reading in Obsidian. The next morning's `daily` run harvests those ticks from
+the vault markdown (read-only, before the render overwrites it) and applies the approved ones
+**before ingest**, so a feed approved yesterday is fetched this morning.
+
+A pending proposal follows forward into every digest until it is decided, so it cannot scroll
+out of sight. Once decided it keeps rendering as a settled one-line note for
+`curation.settled_display_days`, counted from the day it first surfaced — re-reading an old
+digest should still show what was approved that week, rather than silently losing the record
+the moment the render overwrites the file.
+
+Three constraints make this safe:
+
+- **Nothing changes without a tick.** There is no auto-apply path, and no confidence
+  threshold that bypasses the operator.
+
+  That guarantee rests on a rule with wider scope than curation — see **§13.1, a line in
+  the vault is structure**. In short: nothing rendered into a vault file may contain a
+  control character, because the harvesters read a decision from any line that matches
+  their checkbox pattern.
+- **Applying only appends or comments out.** `sources.yaml` is a document whose comments
+  carry the reasoning behind every past pruning decision; a YAML round-trip would erase
+  them. An add appends a dated entry, a retirement comments the existing lines out in place —
+  exactly the convention the file already follows. The result is re-validated through
+  `load_sources` and reverted on any `ConfigError`.
+  The applier must be idempotent **against the file text**, not just against the proposal
+  row: writing the YAML and flipping `proposals.status` to `applied` are two separate
+  writes, so a crash or a validation revert between them leaves an approved row whose edit
+  is already on disk. Appending only when the entry is genuinely absent is what stops the
+  next run duplicating it — a duplicated config block is NEVER rule 4 at the file level, and
+  the status guard in `db.py` cannot prevent it.
+- **Every applied change is a reviewable git diff** on `sources.yaml`, uncommitted, same
+  promise as §11's proposed tuning nudges.
+- **The scout may suggest a starting weight, within a bounded band.** A scout arguing that
+  an author is worth trusting should be able to say so with a number, and the number is
+  cheap to overrule: it renders in the digest block and lands in an uncommitted
+  `sources.yaml` diff, so changing it is one edit in a file the operator is already
+  reading. Most additions should carry none, which means the identity element and no
+  `weight:` line at all.
+
+  The band (`curate/scout._WEIGHT_BAND`) is drawn a little wider than the 1.0–1.3 the
+  operator's own config uses, and a suggestion outside it is clamped and recorded rather
+  than dropped — the proposal is "add this source", so an over-enthusiastic multiplier
+  should not cost a well-argued addition its slot. The bound exists because of *how* the
+  suggestion is reviewed: a human skimming a digest over coffee will judge a visible 1.3
+  on its merits, but nothing else in the loop would catch a quietly-proposed 9.0 before it
+  reweighted one source against everything else in the feed. It bounds only what a model
+  may propose; `RssSource.weight` still accepts any positive number the operator sets by
+  hand (NEVER rule 6).
+
+  Ongoing weight *tuning* remains Phase 2's `tune` job under §11's ±0.1/month cap. This is
+  only the value a newly added source starts at.
+
+### Boundary exception
+
+`curate/` is the one module permitted to call both `llm.py` and an `ingest/` fetch helper
+(§4's module table otherwise keeps those apart). It is allowed because the two are strictly
+ordered — judgment first, then validation of what judgment produced — and because `curate/`
+never writes an `items` row. `ingest/` still imports no LLM.
+
+### Cost
+
+**Budget: ≤ $2.50/month for this feature.** That number is the decision, and it lives in
+code as `llm.SCOUT_MONTHLY_CEILING_USD`, beside the constants that enforce it. Expected
+spend is ≈ **$1.00/month**.
+
+The worst case is **not restated here**, because a figure written in prose is a figure that
+goes stale — every arithmetic error found in this feature's reviews was a number that had
+drifted from the thing it described. It is computed instead, by
+`test_the_worst_case_cost_stays_within_the_recorded_ceiling`, from four inputs it reads
+rather than assumes:
+
+1. exactly one API request per run, no resumes;
+2. searches capped server-side by `max_uses`, at `SCOUT_MAX_SEARCHES_CEILING` or the lower
+   configured value;
+3. output capped by `SCOUT_MAX_TOKENS` for that single request;
+4. **the rendered prompt itself**, built by `curate/prompts.py` against the live config with
+   every bounded evidence list filled to its bound — so growing the prompt moves the ceiling
+   automatically instead of quietly eating its headroom. (An earlier version assumed 2,500
+   tokens here; the real figure is ~4,000, and the assumption had already been overtaken by
+   a prompt change once.)
+
+It is computed at the *ceiling*, not the shipped default, and with a pessimistic 6k input
+tokens per search — 3× what dynamic filtering is expected to deliver, because per-search
+input volume is the one figure here that no code enforces. Raising any knob, editing the
+config, or growing the prompt past what the budget affords fails CI rather than the invoice.
+
+Every list of evidence in that prompt is bounded for the same reason: kept titles, outbound
+domains, per-source yield rows, and past rejections all reach an Opus-priced call, and
+rejections in particular only ever accumulate — nothing deletes one — so an unbounded suppression list would raise
+the weekly bill for the life of the pipeline. Bounding it is safe because
+`ux_proposals_kind_key`, not the prompt, is what stops a candidate being re-proposed.
+
+Two notes for §8's accounting:
+
+- Web search is billed **per search**, not per token, so token counts alone would hide it.
+  `runs.server_tool_requests` records the count; the `status` readout that turns it
+  into a dollar figure lands with the `curate` CLI commands.
+- This call carries **no `cache_control`**, deliberately breaking the project's
+  cache-everything discipline. At a weekly cadence every cache entry has long expired before
+  the next run, so a breakpoint would pay the 1.25× write premium for exactly zero reads.
+
+---
+
+### 13.1 A line in the vault is structure
+
+The digest is not only output — it is also **input**. `feedback.py` harvests an item mark
+and `curate/approvals.py` harvests a proposal decision by scanning every line of every
+`vault/daily/*.md` for a checkbox pattern, and neither can tell which lines the template
+wrote from which came from data. So any text that renders into a vault file and can contain
+a newline can *fabricate a decision the operator never made*.
+
+Three fields make that reachable, in descending order of how easy they are to reach:
+
+- **`items.title`** — controlled outright by whoever publishes the feed. No LLM and no
+  prompt injection required: a feed publishing a title containing a newline followed by
+  `- [x] useful <!-- sf:item=1 v=useful -->` records that mark on the next digest run, for
+  any item id it can guess, corrupting the ground-truth set relevance tuning depends on
+  (§11) and that the curation scout reasons over (§7.1).
+- **`proposals.rationale` and evidence notes** — the scout's own prose, so reachable by
+  prompt injection from any page its web search reads.
+- **`scores.reasoning` and `runs.errors` messages** — LLM- and exception-authored text on
+  the same page.
+
+The rule: **flatten model- and world-authored text to a single line at the boundary where
+it is stored**, and refuse rather than repair for identity fields, where a rewrite would
+change what the record means. `models.flatten_to_single_line` and
+`models.has_control_characters` are the two primitives; `Item._flatten_title`,
+`db.insert_proposal`, and `db._cited_proposals` are the three places that apply them.
+
+Two notes for anyone extending this:
+
+- A defence at the *render* boundary is only worth adding where the read path can hand back
+  unsanitized text. It can for proposals (`_row_to_proposal` reads columns into a
+  dataclass) and it cannot for items (`_row_to_item` reconstructs an `Item`, so the
+  validator runs again). `report/daily.py` therefore re-flattens proposal prose and does
+  not re-flatten titles — an unreachable defence is one nobody can test.
+- Both harvesters treat a matching line as authoritative. Making the marker itself
+  unforgeable (a signature) was considered and rejected: it adds a key to manage for a
+  single-user local tool, and denying newlines at the source closes the hole completely
+  because a marker must begin a line.
+
 ## 8. Deterministic vs LLM Boundary
 
 | Deterministic (plain Python) | LLM |
@@ -415,6 +668,7 @@ hackernews:
 | Embedding computation (local model) | Knowledge extraction (atomic notes) |
 | Report template assembly, git commits | Architecture impact reasoning |
 | Token/cost accounting | Report narrative sections only |
+| Per-source yield stats, feed/repo health probes, YAML edits (§7.1) | Which sources matter now, and which have gone quiet |
 
 ### LLM usage plan (via `llm.py`, the single chokepoint)
 
@@ -424,10 +678,26 @@ hackernews:
 | Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
+| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4k at full evidence) plus search results; output capped by `SCOUT_MAX_TOKENS`; ships at 6 searches |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate:** triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **~$1.60/mo**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **~$2.40/mo**; deep reads and monthly report ≈ ~$3/mo. **Total ≈ $5–10/month**, with $30 as the alarm threshold (the `runs` table tracks actual token spend; the weekly brief prints the month-to-date number).
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (16k in ≈ $0.08 + 4k out ≈ $0.10 + 6 searches ≈ $0.06) ≈ **$1.00**. **Itemized total ≈ $8.00/month**, against a **$5–10 target** and a **$30 alarm**.
+
+Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
+
+Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$8.00 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
+
+**Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
+
+**Two cost facts about the search tool that are easy to get wrong**, both learned the expensive way on this branch:
+
+- `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`.
+- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling was ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which is what makes its absolute worst case derivable from constants at all — see §7.1, which states the budget and leaves the figure to the test that computes it.
+- **A ceiling that permits values the budget forbids is not a ceiling.** `SCOUT_MAX_SEARCHES_CEILING` was 15 while the budget only afforded 7, so any config value in between would have breached it with every test green. Two rules fell out of that: the hard ceiling is derived from the budget, and the test that guards the budget asserts **at the ceiling**, never at the shipped default — otherwise a pure data edit to `curation.max_searches_per_run` moves real spend without failing anything.
+- Search-result content is billed as **input** tokens on every request that carries it, so a resume re-sending the accumulated conversation pays for the same results twice.
+- **A number written in two places is a number that will disagree with itself.** Every arithmetic error found while reviewing this feature was a figure that had drifted from what it described — a docstring quoting a superseded `max_tokens`, a test constant whose "measured: ~1.6-1.9k" note predated a prompt change that made it ~4k. The fix each time was to delete the copy, not correct it: the budget lives in one constant, and the worst case is computed by a test from the values it actually reads, including the rendered prompt.
+- **State a budget as a ceiling derived from enforced limits, not from expected behaviour.** The scout's first worst-case figure assumed ~4k of output per turn and looked comfortable; recomputed against the `max_tokens` the code actually permits, the same scenario was 3× over. An estimate that assumes good behaviour is a forecast, not a bound.
 
 ---
 
@@ -610,7 +880,9 @@ is what stops a newly-added source backfilling its history into one digest.
 
 ## 14. Scheduling & Operations
 
-- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (ingest→score→digest, 06:00), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00).
+- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
+
+The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$7/month expected against this feature's $2.50 budget. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.
@@ -659,8 +931,9 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 
 ### Phase 1 — MVP: the weekly question (4–6 more weekends)
 **Status — not started** (gated on Phase 0's acceptance).
-`sources.yaml` / `interests.yaml` / `taxonomy.yaml`; arXiv + awesome-list diffing; 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands.
+`sources.yaml` / `interests.yaml` / `taxonomy.yaml`; arXiv + awesome-list diffing; 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).
 **Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated **`useful` or better** — an item's rating is its highest rung on the §11 ladder, so an item marked only `exceptional` counts toward this gate.
+**Curation gate (§7.1):** four consecutive weekly scout runs in which at least one proposal was approved and applied, and no applied change had to be reverted by hand. Curation is scheduled here rather than in Phase 2 — where the rest of the feedback servo lives (§11) — because the source list going stale is a felt gap in a digest already being read daily, which is the test risk 1 sets. It degrades gracefully on thin `feedback` data by falling back to keep/kill ratios, so it does not depend on Phase 2's mark volume.
 
 ### Phase 2 — Intelligence layer (months 3–5) → *V2*
 **Status — not started.**
@@ -689,7 +962,7 @@ The stretch goal, decomposed into stepwise-verifiable capabilities rather than "
 | 3 | Scoring distrust (scores feel arbitrary) | Med | High | Written reasoning stored with every score; `rubric_version`; `mark useful/noise` feedback loop; 3 dimensions not 11 |
 | 4 | LLM cost creep | Med | Med | Triage on summaries only; Batches API; prompt caching; per-run token accounting with monthly alarm in the brief |
 | 5 | Synthesis confabulation | Med | High | Citation-required rendering (no claim without an item URL); synthesis operates only over stored items, never open-ended |
-| 6 | Source list goes stale | Med | Med | Watchlist hit-rate stats; quarterly `sources.yaml` review prompted by the monthly report |
+| 6 | Source list goes stale | Med | Med | **Adaptive source curation (§7.1)** — weekly scout proposes adds and retirements from per-source yield plus live web search; approved by tick-box in the daily digest, applied append-only to `sources.yaml`. Watchlist hit-rate stats (Phase 2) feed the same yield input |
 | 7 | X/Twitter blind spot | High | Low | Accepted: thought leaders' blogs + HN mirror the signal within hours-to-days; daily cadence makes the lag irrelevant |
 | 8 | Life intervenes; project pauses | Med | Low | Idempotent, self-healing runs; a paused system resumes with `cron` re-enabled; no daemon state to rot |
 

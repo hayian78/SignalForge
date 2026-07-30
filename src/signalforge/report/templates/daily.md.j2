@@ -40,3 +40,39 @@ checking with `signalforge status`.
 {% else %}
 No source failures in the last ingest run.
 {% endif %}
+{% if context.proposals %}
+
+---
+
+## Proposed source changes
+
+{% if context.pending_proposals %}
+Tick one box per proposal. Approved changes are applied to `config/sources.yaml` at
+the start of tomorrow's run, before ingest, and land as an uncommitted git diff you
+can edit or revert.
+
+{% for proposal in context.pending_proposals %}
+### {{ proposal.heading }}
+
+{{ proposal.rationale }}
+
+**Found via:** {{ proposal.facts }}
+
+{% for url, note in proposal.evidence %}
+- {{ url }}{{ " — " ~ note if note else "" }}
+{% endfor %}
+
+{% for decision in proposal_decisions %}
+{{ proposal_marker(proposal.id, decision) }}
+{% endfor %}
+
+{% endfor %}
+{% endif %}
+{% if context.settled_proposals %}
+**Recently decided:**
+
+{% for proposal in context.settled_proposals %}
+- {{ proposal.action }} `{{ proposal.target }}` — {{ proposal.settled_note }}
+{% endfor %}
+{% endif %}
+{% endif %}

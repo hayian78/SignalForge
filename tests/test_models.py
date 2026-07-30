@@ -8,14 +8,19 @@ dropped item, so the golden table below is the contract.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import signalforge.ingest
 from signalforge.models import (
     TRACKING_PARAM_PREFIXES,
     TRACKING_PARAMS,
     Item,
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
     SourceType,
     canonicalize_url,
     compute_content_hash,
@@ -303,6 +308,72 @@ def test_source_type_vocabulary_matches_design_section_5() -> None:
     }
 
 
+def test_proposal_kind_vocabulary_matches_design_section_5() -> None:
+    # `db._row_to_proposal` does `ProposalKind(row["kind"])`, so drift between
+    # this vocabulary and a stored row is a read-time crash.
+    assert {member.value for member in ProposalKind} == {
+        "add_rss",
+        "retire_rss",
+        "add_github_repo",
+        "retire_github_repo",
+        "add_hn_keyword",
+        "remove_hn_keyword",
+        "add_arxiv_keyword",
+        "remove_arxiv_keyword",
+    }
+
+
+def test_proposal_kinds_come_in_add_and_retire_pairs() -> None:
+    # Every block the scout may add to, it may also prune from. A one-way kind
+    # would let the source list only ever grow, which is the failure DESIGN §7.1
+    # exists to fix.
+    adds = {member.value for member in ProposalKind if member.value.startswith("add_")}
+    removes = {
+        member.value.split("_", 1)[1]
+        for member in ProposalKind
+        if member.value.startswith(("retire_", "remove_"))
+    }
+    assert {value.split("_", 1)[1] for value in adds} == removes
+
+
+def test_proposal_status_vocabulary_matches_design_section_5() -> None:
+    assert {member.value for member in ProposalStatus} == {
+        "pending",
+        "approved",
+        "rejected",
+        "applied",
+        "invalid",
+    }
+
+
+def test_proposal_tier_vocabulary() -> None:
+    assert {member.value for member in ProposalTier} == {"corpus", "web"}
+
+
+def test_only_arxiv_proposal_kinds_are_staged() -> None:
+    """`is_staged` must name exactly the kinds whose block has no ingestor.
+
+    This is a phase fact, not a preference: `arxiv` is modeled in `sources.yaml`
+    but wired to nothing (NEVER rule 15), so applying an arXiv keyword changes a
+    file and no behaviour. Asserting it against the *actual* ingestor registry
+    means the day an arXiv ingestor lands, this test fails and points at the
+    `(staged)` label that would otherwise quietly lie in every digest.
+    """
+    staged_blocks = {
+        member.value.split("_", 1)[1].removesuffix("_keyword").removesuffix("_repo")
+        for member in ProposalKind
+        if member.is_staged
+    }
+    assert staged_blocks == {"arxiv"}
+
+    ingest_package = Path(signalforge.ingest.__file__).parent
+    wired = {path.stem for path in ingest_package.glob("*.py")}
+    assert "arxiv" not in wired, (
+        "an arXiv ingestor now exists — arXiv proposals are no longer staged, "
+        "so ProposalKind.is_staged and the digest's (staged) label must be updated"
+    )
+
+
 def test_item_content_defaults_to_none() -> None:
     # Full text is fetched lazily for top-N survivors only (CLAUDE.md §6); an
     # ingest-time Item must not carry it.
@@ -327,3 +398,48 @@ def test_item_title_whitespace_is_stripped() -> None:
         title="  T  ",
         summary="  S  ",
     ).content_hash == compute_content_hash("T", "S")
+
+
+def test_a_multi_line_title_is_flattened_to_one_line() -> None:
+    """A security control, not formatting — see `Item._flatten_title`.
+
+    A title is fully controlled by whoever publishes the feed and renders verbatim
+    into the daily digest, where `feedback.py` harvests a mark from any line matching
+    its checkbox pattern. A multi-line title can therefore forge feedback for any
+    item id. `str_strip_whitespace` only trims the ends and does not help.
+    """
+    item = make_item(title="Headline\n- [x] useful <!-- sf:item=1 v=useful -->\n\ntrailing")
+
+    assert "\n" not in item.title
+    assert item.title == "Headline - [x] useful <!-- sf:item=1 v=useful --> trailing"
+
+
+def test_flattening_a_title_changes_its_content_hash() -> None:
+    """Stated because it is a real consequence, not an accident.
+
+    `content_hash` is derived after validation, so the fingerprint tracks the text
+    actually held rather than what the feed sent. That is the same rule
+    `compute_content_hash`'s docstring already states for a backfilled summary.
+    """
+    flattened = make_item(title="a\nb", summary=None)
+    plain = make_item(title="a b", summary=None)
+
+    assert flattened.content_hash == plain.content_hash
+
+
+def test_a_multi_line_author_is_flattened_to_one_line() -> None:
+    """The same forgery class as `_flatten_title`, missed when that was added.
+
+    `ingest/probe.py::probe_feed` lifts a feed's own `<author>` field verbatim
+    into a candidate's probe `label`, which renders into the digest *before* any
+    human approves the candidate — so an author name free to carry a newline can
+    forge an approval marker with no LLM involved at all.
+    """
+    item = make_item(author="Real Author\n- [x] approve <!-- sf:proposal=5 v=approve -->")
+
+    assert item.author is not None
+    assert "\n" not in item.author
+
+
+def test_a_none_author_stays_none() -> None:
+    assert make_item(author=None).author is None

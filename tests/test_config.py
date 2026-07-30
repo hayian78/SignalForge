@@ -392,6 +392,114 @@ def test_interests_optional_blocks_default_to_empty(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# curation block (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+VALID_CURATION_YAML = textwrap.dedent("""
+    curation:
+      max_proposals_per_run: 5
+      max_searches_per_run: 12
+      yield_window_days: 30
+      settled_display_days: 14
+""")
+
+
+def test_curation_block_is_optional(tmp_path: Path) -> None:
+    # Absent means the feature is off. That is different from the required blocks
+    # (`defaults`, `thresholds`): those hold knobs a run always needs, whereas an
+    # operator can legitimately not want a weekly scout at all.
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML)
+
+    assert load_sources(tmp_path).curation is None
+
+
+def test_curation_block_parses(tmp_path: Path) -> None:
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + VALID_CURATION_YAML)
+
+    curation = load_sources(tmp_path).curation
+
+    assert curation is not None
+    assert curation.max_proposals_per_run == 5
+    assert curation.max_searches_per_run == 12
+    assert curation.yield_window_days == 30
+    assert curation.settled_display_days == 14
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_proposals_per_run",
+        "max_searches_per_run",
+        "yield_window_days",
+        "settled_display_days",
+    ],
+)
+def test_every_curation_field_is_required(tmp_path: Path, field: str) -> None:
+    # No Python fallback for any of them (CLAUDE.md §10 rule 6). A default buried
+    # in code is a spend limit nobody can see — and one of these is real money.
+    partial = "\n".join(
+        line for line in VALID_CURATION_YAML.splitlines() if not line.strip().startswith(field)
+    )
+    write_sources(tmp_path, MINIMAL_SOURCES_YAML + partial + "\n")
+
+    with pytest.raises(ConfigError, match=field):
+        load_sources(tmp_path)
+
+
+def test_curation_rejects_an_unknown_key(tmp_path: Path) -> None:
+    # extra="forbid" everywhere: a typo'd knob that silently does nothing is the
+    # worst failure mode for config-as-data.
+    write_sources(
+        tmp_path, MINIMAL_SOURCES_YAML + VALID_CURATION_YAML + "  max_serches_per_run: 3\n"
+    )
+
+    with pytest.raises(ConfigError, match="max_serches_per_run"):
+        load_sources(tmp_path)
+
+
+def test_curation_allows_zero_searches(tmp_path: Path) -> None:
+    # A supported, meaningful mode: the scout reasons from the stored corpus alone
+    # and spends nothing on search. This is the cheapest useful configuration, so
+    # it must not be validated away as if it were a mistake.
+    write_sources(
+        tmp_path,
+        MINIMAL_SOURCES_YAML
+        + VALID_CURATION_YAML.replace("max_searches_per_run: 12", "max_searches_per_run: 0"),
+    )
+
+    curation = load_sources(tmp_path).curation
+    assert curation is not None
+    assert curation.max_searches_per_run == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_proposals_per_run", 0),  # a run that can propose nothing is a no-op
+        ("max_proposals_per_run", 21),  # one week must not be able to rewire the feed
+        ("max_searches_per_run", -1),  # negative spend is meaningless
+        ("yield_window_days", 0),  # an empty window makes every source look dead
+        ("yield_window_days", 400),  # beyond a year the "lately" question stops meaning anything
+        ("settled_display_days", -1),
+        ("settled_display_days", 91),  # the block would grow without bound
+    ],
+)
+def test_curation_rejects_out_of_range_values(tmp_path: Path, field: str, value: int) -> None:
+    write_sources(
+        tmp_path,
+        MINIMAL_SOURCES_YAML
+        + "\n".join(
+            f"  {field}: {value}" if line.strip().startswith(field) else line
+            for line in VALID_CURATION_YAML.splitlines()
+        )
+        + "\n",
+    )
+
+    with pytest.raises(ConfigError, match=field):
+        load_sources(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
 # The shipped config — the files that actually run at 06:00
 #
 # Every other test in this file validates a string constant, which proves the
@@ -455,6 +563,26 @@ def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
         "the per-repo limit is the tighter of the two; above the per-source cap it is a no-op"
     )
     assert config.priority_topics, "interests.yaml defines 'relevant to me' — it cannot be empty"
+
+
+def test_shipped_sources_yaml_configures_curation(repo_config_dir: Path) -> None:
+    # The block is optional in the model (absent = feature off), so assert the
+    # shipped file actually sets it — deleting the key silently disables the
+    # weekly scout rather than failing anything.
+    config = load_sources(repo_config_dir)
+
+    assert config.curation is not None
+    # No bound assertions here: the model's own `ge=`/`le=` already hold by
+    # construction if `load_sources` returned, so restating them would be a test
+    # that cannot fail. What is worth asserting is what the model does *not*
+    # enforce — that the block is present at all, and that the money knob is sane.
+    # The one cap that is real money: web search bills per call, not per token
+    # (DESIGN §8). A shipped value above the ceiling in `llm.py` is clamped there,
+    # not here, but a wildly large number in the file is worth catching in CI.
+    assert config.curation.max_searches_per_run <= 20, (
+        "max_searches_per_run is a spend cap; a value this high wants a deliberate "
+        "decision and a matching ceiling in llm.py"
+    )
 
 
 def test_shipped_configs_load_together(repo_config_dir: Path) -> None:

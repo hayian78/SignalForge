@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  A feed that carries real article text in its summaries — the counterpart to
+  teaser_stub_feed.xml.
+
+  These two fixtures exist as a pair, and only as a pair. `probe_feed` reports
+  `median_summary_chars` on the argument that it separates a publication worth a
+  digest slot from a members-only feed of one-line teasers. That argument is only
+  worth making if the number actually separates them, so the pair is probed
+  together in `test_median_summary_chars_separates_rich_feeds_from_teaser_stubs`.
+
+  The existing `simonwillison_atom.xml` capture cannot play this role: it is a
+  two-entry fixture with short summaries (median ~99 chars), which is realistic
+  for a link blog and useless as a contrast. Measuring it against the teaser feed
+  showed the two only ~50 chars apart — which is exactly how an unverified claim
+  about a statistic gets shipped.
+-->
+<rss version="2.0">
+  <channel>
+    <title>Applied Inference Weekly</title>
+    <link>https://applied-inference.example.com</link>
+    <description>Long-form engineering writing on serving models in production.</description>
+    <item>
+      <title>What Actually Broke When We Doubled Context</title>
+      <link>https://applied-inference.example.com/2026/07/doubled-context/</link>
+      <guid>https://applied-inference.example.com/2026/07/doubled-context/</guid>
+      <pubDate>Mon, 27 Jul 2026 09:00:00 GMT</pubDate>
+      <author>R. Engineer</author>
+      <description><![CDATA[
+        <p>We moved from a 200k window to a 1M window expecting a capacity problem and
+        got a scheduling problem instead. This post walks through the three things that
+        actually degraded, with the traces that showed them.</p>
+        <p>The first was prefill. At 200k our prefill was comfortably inside the budget
+        we had allocated per request, so batching decisions were dominated by decode.
+        At 1M the prefill cost for a single long request could exceed the decode cost of
+        an entire batch of short ones, which meant our scheduler — which had been
+        assuming roughly uniform request cost — started making choices that were locally
+        reasonable and globally terrible. A single long-context request would arrive,
+        claim a slot, and stall a dozen short requests behind it.</p>
+        <p>The second was the KV cache. Doubling the window more than doubled our
+        working set, because the requests that use long context are also the requests
+        that get retried and continued. We were evicting cache entries that we were
+        about to need again, and the eviction policy had no notion of that.</p>
+        <p>The third was our own instrumentation. Our p99 latency metric was computed
+        per request without normalising for input length, so the number went up and told
+        us almost nothing about why. Splitting the metric by input-length bucket was the
+        change that made the other two problems visible, and in hindsight it should have
+        been the first thing we did rather than the last.</p>
+        <p>The fix for the scheduler was to price a request by estimated total tokens
+        rather than by request count, which is obvious in retrospect and was not obvious
+        at the time. We have included the before-and-after queue depth graphs below.</p>
+      ]]></description>
+    </item>
+    <item>
+      <title>A Cheaper Eval Harness That Still Catches Regressions</title>
+      <link>https://applied-inference.example.com/2026/07/cheaper-evals/</link>
+      <guid>https://applied-inference.example.com/2026/07/cheaper-evals/</guid>
+      <pubDate>Thu, 23 Jul 2026 09:00:00 GMT</pubDate>
+      <author>R. Engineer</author>
+      <description><![CDATA[
+        <p>Our eval suite cost more per month than the service it was testing. Here is
+        how we cut it by roughly 80% without losing the regressions we care about.</p>
+        <p>The starting observation was that most of our eval cases were testing the
+        same handful of behaviours through slightly different wording. That redundancy
+        felt like rigour and was actually just cost: when a regression appeared, forty
+        cases failed together, and the forty-first told us nothing the first one hadn't.
+        We clustered the suite by which behaviour each case exercised and kept the
+        cheapest representative of each cluster, plus every case that had ever been the
+        sole detector of a real regression.</p>
+        <p>The second change was to stop running the full suite on every commit. We
+        split it into a fast tier that runs on every change and a full tier that runs
+        nightly and before a release. The fast tier is chosen to maximise the chance of
+        catching a regression at all, not to characterise it precisely — that is the
+        nightly tier's job.</p>
+        <p>The third change was the least popular internally and had the largest effect:
+        we deleted every eval whose pass criterion was a model judging free text without
+        a rubric. Those cases were noisy enough that people had learned to ignore their
+        failures, which is worse than not having them.</p>
+      ]]></description>
+    </item>
+    <item>
+      <title>Notes On Running Two Model Versions Side By Side</title>
+      <link>https://applied-inference.example.com/2026/07/two-versions/</link>
+      <guid>https://applied-inference.example.com/2026/07/two-versions/</guid>
+      <pubDate>Mon, 20 Jul 2026 09:00:00 GMT</pubDate>
+      <author>R. Engineer</author>
+      <description><![CDATA[
+        <p>Version pinning sounds like a configuration detail until you are serving two
+        versions at once and discover your caches, metrics, and prompt templates all
+        quietly assumed there was only one.</p>
+        <p>Prompt caches are per-model, so a naive rollout halves your cache hit rate at
+        exactly the moment you are watching latency most closely. We staged the rollout
+        by cohort rather than by percentage so that each cohort's cache stayed warm, and
+        accepted a slower rollout in exchange for a readable latency graph.</p>
+        <p>Metrics needed a model-version dimension added everywhere, including in the
+        dashboards we had not touched in a year. The ones we forgot showed up as
+        inexplicable step changes that took an afternoon each to trace back.</p>
+        <p>The thing we got right by accident: our prompt templates were already in
+        version control with the model id in the path, so nothing silently reused a
+        prompt tuned for the old version. That was a decision someone made two years
+        ago for unrelated reasons and it saved us a week.</p>
+      ]]></description>
+    </item>
+  </channel>
+</rss>

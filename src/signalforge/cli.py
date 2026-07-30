@@ -5,9 +5,12 @@ Phase 0 surface, and deliberately no more (NEVER rule 15):
 * `ingest` — fetch every configured source, persist the items, close a `runs` row.
 * `score` — triage/score unscored items via `score/` (DESIGN §8).
 * `digest` — assemble the day's markdown digest from scored items (DESIGN §13).
-* `daily` — `ingest` → `score` → `digest` in sequence, the cron entry (DESIGN §14).
-* `status` — last-run health, per-source freshness, month-to-date token spend
-  (DESIGN §14).
+* `curate run|apply|list|decide|reopen` — adaptive source curation (DESIGN §7.1):
+  propose `sources.yaml` changes, review them in the digest, apply the approved.
+  `run` is the only command in this CLI that spends money on being typed.
+* `daily` — `curate apply` → `ingest` → `score` → `digest`, the cron entry (DESIGN §14).
+* `status` — last-run health, per-source freshness, month-to-date token and
+  web-search spend (DESIGN §14).
 
 LLM work stays behind the `score/` boundary: this module drives the pipeline but
 must never import `llm.py` directly (NEVER rule 1 — `anthropic` lives in `llm.py`).
@@ -51,7 +54,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Final
 
@@ -62,6 +65,7 @@ from rich.table import Table
 from signalforge import feedback
 from signalforge.config import (
     ConfigError,
+    CurationConfig,
     InterestsConfig,
     SettingsConfig,
     SourcesConfig,
@@ -69,16 +73,37 @@ from signalforge.config import (
     load_settings,
     load_sources,
 )
-from signalforge.db import connection, finish_run, get_item, record_feedback, start_run, upsert_item
+from signalforge.curate.apply import apply_approved_proposals
+from signalforge.curate.approvals import DECISIONS, harvest_approvals
+from signalforge.curate.scout import (
+    Candidate,
+    ScoutOutcome,
+    persist_candidates,
+    reprobe_invalid_proposals,
+    scout_for_proposals,
+    search_spend_usd,
+)
+from signalforge.db import (
+    connection,
+    decide_proposal,
+    finish_run,
+    get_item,
+    get_proposal,
+    get_proposals,
+    record_feedback,
+    reopen_proposal,
+    start_run,
+    upsert_item,
+)
 from signalforge.feedback import harvest_marks
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY
 from signalforge.ingest.hackernews import HN_SOURCE_ID
-from signalforge.models import Item
+from signalforge.models import Item, ProposalStatus
 from signalforge.report.daily import build_digest_context, digest_path, render_digest
 from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "daily", "digest", "ingest", "mark", "score", "status"]
+__all__ = ["app", "curate_app", "daily", "digest", "ingest", "mark", "score", "status"]
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +117,26 @@ DEFAULT_CACHE_DIR: Final = Path("data/http_cache")
 RUN_KIND_INGEST: Final = "ingest"
 RUN_KIND_SCORE: Final = "score"
 RUN_KIND_DIGEST: Final = "daily"
-"""Matches the `runs.kind` vocabulary in DESIGN §5 (`ingest | score | daily | weekly | monthly`)."""
+RUN_KIND_CURATE: Final = "curate"
+RUN_KIND_CURATE_APPLY: Final = "curate-apply"
+"""Matches the `runs.kind` vocabulary in DESIGN §5.
+
+`curate` and `curate-apply` are separate kinds on purpose: one makes a paid Opus
+call and the other edits a file for free, and `status` shows the last run of each
+kind. Folding them together would hide a scout that has stopped running behind an
+apply that runs every morning."""
+
+_MIN_CURATE_INTERVAL_DAYS: Final = 6
+"""How recently a `curate` run may have happened before another is refused.
+
+A spend backstop, not a schedule: `curate run` is the one command here that costs
+money on being typed, and nothing else stops it running daily. The unique index
+prevents a re-run *storing* duplicates and does nothing about the call being billed
+again — wired into `daily` by mistake, that is ~$7/month expected against a $2.50
+budget for this feature. 6 rather than 7 so a weekly cron that drifts an hour is
+never refused. `--force` overrides it, which is what an operator tuning the prompt
+wants. In code rather than YAML for the same reason `SCOUT_MAX_SEARCHES_CEILING` is
+(CLAUDE.md §6): cost limits are this project's to set, not a knob to tune."""
 
 _RUN_LEVEL_SOURCE_ID: Final = "*"
 """`runs.errors[].source_id` for a failure that belongs to the run, not a source."""
@@ -660,6 +704,12 @@ def digest(
     # them from validated config like every other tuning knob (CLAUDE.md §4).
     interests = _load_interests_or_exit(config_dir)
     settings = _load_settings_or_exit(config_dir)
+    # `sources.yaml` is loaded for one field: how long a decided curation proposal
+    # keeps rendering. Absent `curation:` block means the feature is off, and 0 days
+    # is the honest reading of that — not a Python default standing in for config
+    # (CLAUDE.md §4).
+    sources = _load_sources_or_exit(config_dir)
+    settled_display_days = sources.curation.settled_display_days if sources.curation else 0
     tz = settings.tzinfo
     # Precedence: an explicit --vault-dir wins; otherwise settings.yaml decides
     # (which itself defaults to `vault/`). The flag default is None precisely so
@@ -707,6 +757,7 @@ def digest(
                 max_items=interests.thresholds.daily_max_items,
                 max_per_source=interests.thresholds.daily_max_per_source,
                 max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
+                settled_display_days=settled_display_days,
             )
             item_count = len(context.items)
             rendered = render_digest(context)
@@ -796,6 +847,422 @@ def mark(
 
 
 # --------------------------------------------------------------------------- #
+# curate (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+curate_app = typer.Typer(
+    help="Adaptive source curation: propose, review, and apply sources.yaml changes.",
+    no_args_is_help=True,
+)
+app.add_typer(curate_app, name="curate")
+
+
+def _curation_or_exit(config_dir: Path) -> tuple[SourcesConfig, CurationConfig]:
+    """Load `sources.yaml` and its `curation:` block, or exit saying it is off.
+
+    An absent block is not an error and not a default — it means the operator has
+    not agreed to this feature's spend, and inventing caps on their behalf is the
+    one thing a command that costs money must not do (CLAUDE.md §4).
+    """
+    sources = _load_sources_or_exit(config_dir)
+    if sources.curation is None:
+        err_console.print(
+            "[yellow]source curation is off[/yellow]: `config/sources.yaml` has no "
+            "`curation:` block, so there are no spend caps to run under. Add one to "
+            "enable the weekly scout (see DESIGN §7.1)."
+        )
+        raise typer.Exit(code=1)
+    return sources, sources.curation
+
+
+def _render_proposal_preview(candidates: list[Candidate]) -> None:
+    """Print what a dry run would have stored, in the shape the digest will show."""
+    if not candidates:
+        console.print("[yellow]no proposals[/yellow]: the scout suggested no changes this run.")
+        return
+    for candidate in candidates:
+        staged = " (staged)" if candidate.kind.is_staged else ""
+        invalid = (
+            ""
+            if candidate.status is ProposalStatus.PENDING
+            else f"  [red]{candidate.status.value}[/red]"
+        )
+        console.print(
+            f"\n[bold]{candidate.kind.action_label}: {candidate.dedup_key}[/bold]{staged}{invalid}"
+        )
+        console.print(f"  {candidate.rationale}")
+        facts = [candidate.tier.value]
+        if (weight := candidate.payload.get("weight")) is not None:
+            facts.append(f"weight {weight}")
+        if candidate.probe is not None:
+            facts.append(
+                f"probe ok, {candidate.probe.items_total} entries"
+                if candidate.probe.ok
+                else f"probe failed: {candidate.probe.error}"
+            )
+        console.print(f"  [dim]{' · '.join(facts)}[/dim]")
+        for entry in candidate.evidence:
+            console.print(f"  [dim]- {entry['url']}[/dim]")
+
+
+def _too_soon(conn: sqlite3.Connection, *, now: datetime) -> int | None:
+    """Days since the last `curate` run, if that is inside the minimum interval.
+
+    Reads only the `curate` kind. `curate-apply` runs every morning and costs
+    nothing, so counting it would refuse every scout run forever — which is one of
+    the reasons the two have separate kinds.
+    """
+    row = conn.execute(
+        "SELECT MAX(started_at) AS latest FROM runs WHERE kind = ?", (RUN_KIND_CURATE,)
+    ).fetchone()
+    latest = _parse_iso(row["latest"] if row else None)
+    if latest is None:
+        return None
+    days = (now - latest).days
+    return days if days < _MIN_CURATE_INTERVAL_DAYS else None
+
+
+@curate_app.command("run")
+def curate_run(
+    config_dir: Annotated[Path, typer.Option("--config-dir")] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    cache_dir: Annotated[Path, typer.Option("--cache-dir")] = DEFAULT_CACHE_DIR,
+    surface_date: Annotated[
+        datetime | None,
+        typer.Option(
+            "--surface-date",
+            formats=["%Y-%m-%d"],
+            help="Digest date the proposals first render on. Defaults to tomorrow.",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the proposals; write none of them.")
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Run even if the last scout run was days ago, not a week."),
+    ] = False,
+) -> None:
+    """Run the weekly source scout (DESIGN §7.1, cron Sunday).
+
+    Three passes in a fixed order: re-probe the `invalid` proposals from previous
+    weeks (free), make **one** Opus call with web search (the only paid step), then
+    probe and store what it proposed. The re-probe goes first so a candidate the
+    scout re-suggests this week already carries fresh facts.
+
+    **`--dry-run` still spends money.** It skips every write to `proposals` — so
+    nothing reaches a digest and nothing can be approved — but the API call and its
+    searches happen either way, which is the whole point: the preview has to be what
+    a real run would produce. The `runs` row is therefore written on a dry run too,
+    because that row *is* the spend accounting (NEVER rule 11). This is the opposite
+    of `digest --dry-run`, which costs nothing.
+
+    Proposals surface on tomorrow's digest by default: this command runs after the
+    morning's digest has already been written, so today's is gone.
+
+    Refuses to run twice inside `_MIN_CURATE_INTERVAL_DAYS` unless `--force`, because
+    nothing else stops a weekly command being run daily and each run is billed
+    whether or not its proposals are new. `--dry-run` is guarded too: it spends the
+    same money.
+    """
+    sources, curation = _curation_or_exit(config_dir)
+    interests = _load_interests_or_exit(config_dir)
+    settings = _load_settings_or_exit(config_dir)
+    now = datetime.now(UTC)
+    resolved_surface = (
+        surface_date.date()
+        if surface_date is not None
+        else now.astimezone(settings.tzinfo).date() + timedelta(days=1)
+    )
+
+    with connection(db) as conn:
+        if not force and (days := _too_soon(conn, now=now)) is not None:
+            err_console.print(
+                f"[yellow]too soon[/yellow]: the scout last ran {days} day(s) ago and this "
+                f"is a weekly job. Every run is billed whether or not its proposals are "
+                f"new, so pass --force if you mean it."
+            )
+            raise typer.Exit(code=1)
+        run_id = start_run(conn, RUN_KIND_CURATE, started_at=now)
+        errors: list[dict[str, str]] = []
+        spent = ScoutOutcome()
+        status_value = "failed"
+        try:
+            if not dry_run:
+                # Free, and first: refreshes last week's `invalid` rows so a
+                # re-proposal below finds facts already up to date.
+                reprobe = asyncio.run(
+                    reprobe_invalid_proposals(conn, sources=sources, cache_dir=cache_dir, now=now)
+                )
+                errors.extend(reprobe.errors)
+                if reprobe.reopened:
+                    console.print(
+                        f"[green]reopened[/green]: {len(reprobe.reopened)} previously "
+                        "invalid candidate(s) now fetch."
+                    )
+
+            spent = asyncio.run(
+                scout_for_proposals(
+                    conn,
+                    sources=sources,
+                    interests=interests,
+                    curation=curation,
+                    cache_dir=cache_dir,
+                    now=now,
+                )
+            )
+            errors.extend(spent.errors)
+
+            if dry_run:
+                _render_proposal_preview(spent.candidates)
+                console.print(
+                    f"[yellow]dry run[/yellow]: {len(spent.candidates)} proposal(s) would be "
+                    "stored; nothing written."
+                )
+            else:
+                stored = persist_candidates(
+                    conn,
+                    spent.candidates,
+                    run_id=run_id,
+                    surface_date=resolved_surface,
+                    created_at=now,
+                )
+                errors.extend(stored.errors)
+                console.print(
+                    f"[green]stored[/green]: {len(stored.stored)} new proposal(s), "
+                    f"{stored.duplicates} already known. "
+                    f"They surface in the {resolved_surface.isoformat()} digest."
+                )
+            status_value = "partial" if errors else "ok"
+        except BaseException as exc:
+            # `BaseException`, matching `ingest`/`score`: a Ctrl-C'd run should still
+            # close its row *with a reason*, not just close it. Re-raised, so the
+            # interrupt still stops the process.
+            #
+            # A Ctrl-C mid-probe does lose the *spend figure* — `_shape_candidates`
+            # catches `Exception`, so `KeyboardInterrupt` propagates past it and
+            # `spent` stays zero. That is a deliberate trade, not an oversight: the
+            # row is still written with `KeyboardInterrupt` as its reason, the amount
+            # at risk is cents on a human-initiated action, and the person who hit
+            # Ctrl-C knows what they just spent. **Do not "fix" it by moving the
+            # accounting guarantee back into this function** — reading spend off a
+            # raised exception is the contract that produced the bug two reviews
+            # found, and `scout_for_proposals` now owns the promise instead.
+            logger.exception("curate run failed")
+            errors.append(_run_level_error(exc))
+            raise
+        finally:
+            # In `finally` because the searches and tokens are spent before anything
+            # below can fail, and a run that loses its own cost record is worse than
+            # a run that failed (NEVER rule 11).
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                llm_input_tokens=spent.input_tokens,
+                llm_output_tokens=spent.output_tokens,
+                server_tool_requests=spent.web_search_requests,
+                errors=errors or None,
+            )
+            searches = spent.web_search_requests
+            console.print(
+                f"[dim]spend: {spent.input_tokens:,} in / {spent.output_tokens:,} out tokens, "
+                f"{searches} search(es) (${search_spend_usd(searches):.2f}).[/dim]"
+            )
+        if errors:
+            _render_curate_errors(errors)
+
+
+def _render_curate_errors(errors: list[dict[str, str]]) -> None:
+    console.print(f"[yellow]{len(errors)} note(s) recorded to this run:[/yellow]")
+    for record in errors:
+        console.print(f"  [dim]{record.get('source_id', '?')}[/dim]: {record.get('message', '')}")
+
+
+@curate_app.command("apply")
+def curate_apply(
+    config_dir: Annotated[Path, typer.Option("--config-dir")] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    vault_dir: Annotated[Path | None, typer.Option("--vault-dir")] = None,
+) -> None:
+    """Harvest ticked proposals from the vault and apply the approved ones.
+
+    Two steps, both free — **this command makes no LLM call** (see the test that
+    pins it). It reads `<vault>/daily/*.md` for approve/reject ticks, records those
+    decisions, then edits `config/sources.yaml` for everything now approved.
+
+    Runs first in the `daily` chain, before ingest, so a feed approved yesterday is
+    fetched this morning. The YAML change is **not committed** — it lands as a
+    working-tree diff to read, which is the promise DESIGN §11 makes for every
+    proposed change.
+    """
+    settings = _load_settings_or_exit(config_dir)
+    effective_vault_dir = vault_dir if vault_dir is not None else settings.vault_dir
+    today = datetime.now(settings.tzinfo).date()
+
+    with connection(db) as conn:
+        run_id = start_run(conn, RUN_KIND_CURATE_APPLY, started_at=datetime.now(UTC))
+        errors: list[dict[str, str]] = []
+        status_value = "failed"
+        try:
+            harvest = harvest_approvals(conn, effective_vault_dir)
+            if harvest.decisions_recorded:
+                console.print(
+                    f"[green]harvested[/green]: {harvest.decisions_recorded} decision(s) from "
+                    f"{harvest.files_scanned} vault file(s)."
+                )
+            if harvest.contradictions:
+                console.print(
+                    f"[yellow]{harvest.contradictions} proposal(s) had both boxes ticked[/yellow]"
+                    " and were left pending — tick one."
+                )
+
+            outcome = apply_approved_proposals(conn, config_dir, today=today)
+            errors.extend(outcome.errors)
+            for change in outcome.changes:
+                verb = "already applied" if change.already_applied else "applied"
+                console.print(f"[green]{verb}[/green]: {change.kind.action_label} {change.target}")
+            if outcome.text_changed:
+                console.print(
+                    "[bold]config/sources.yaml changed[/bold] — review it with "
+                    "`git diff config/sources.yaml` (nothing was committed)."
+                )
+            elif not outcome.changes:
+                console.print("[dim]nothing approved to apply.[/dim]")
+            status_value = "partial" if errors else "ok"
+        except BaseException as exc:
+            # See `curate_run` — a row closed with no reason is a row that lies.
+            logger.exception("curate apply failed")
+            errors.append(_run_level_error(exc))
+            raise
+        finally:
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                errors=errors or None,
+            )
+        if errors:
+            _render_curate_errors(errors)
+
+
+@curate_app.command("list")
+def curate_list(
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    status_filter: Annotated[
+        str | None,
+        typer.Option("--status", help=f"One of: {', '.join(s.value for s in ProposalStatus)}."),
+    ] = None,
+) -> None:
+    """List proposals — the terminal view of the digest's approval block."""
+    statuses: list[ProposalStatus] | None = None
+    if status_filter is not None:
+        try:
+            statuses = [ProposalStatus(status_filter)]
+        except ValueError as exc:
+            raise typer.BadParameter(
+                f"status must be one of {', '.join(s.value for s in ProposalStatus)}",
+                param_hint="--status",
+            ) from exc
+
+    with connection(db) as conn:
+        proposals = get_proposals(conn, statuses=statuses)
+
+    if not proposals:
+        console.print("[dim]no proposals match.[/dim]")
+        return
+    table = Table(header_style="bold")
+    for column in ("id", "action", "target", "status", "surfaced", "found via"):
+        table.add_column(column)
+    for proposal in proposals:
+        table.add_row(
+            str(proposal.id),
+            proposal.kind.action_label,
+            proposal.dedup_key,
+            proposal.status.value,
+            proposal.surface_date.isoformat(),
+            proposal.tier.value,
+        )
+    console.print(table)
+
+
+@curate_app.command("decide")
+def curate_decide(
+    proposal_id: Annotated[int, typer.Argument(help="The proposal id shown in the digest.")],
+    decision: Annotated[str, typer.Argument(help=f"One of: {', '.join(DECISIONS)}.")],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    note: Annotated[
+        str | None,
+        typer.Option("--note", help="Why. Replayed to the scout so it learns from a rejection."),
+    ] = None,
+) -> None:
+    """Approve or reject a proposal from the terminal.
+
+    The same decision the digest checkbox records, plus a `--note` the checkbox
+    cannot carry — and the note is the half that teaches the next scout run
+    something, so a rejection is worth making here rather than by tick.
+    """
+    if decision not in DECISIONS:
+        raise typer.BadParameter(
+            f"decision must be one of {', '.join(DECISIONS)}, not {decision!r}",
+            param_hint="decision",
+        )
+    status = ProposalStatus.APPROVED if decision == "approve" else ProposalStatus.REJECTED
+
+    with connection(db) as conn:
+        if get_proposal(conn, proposal_id) is None:
+            err_console.print(f"[red]unknown proposal[/red] {proposal_id}; nothing recorded.")
+            raise typer.Exit(code=2)
+        recorded = decide_proposal(
+            conn,
+            proposal_id=proposal_id,
+            status=status,
+            decided_at=datetime.now(UTC),
+            note=note,
+        )
+
+    if recorded:
+        console.print(f"[green]recorded[/green]: proposal {proposal_id} {status.value}.")
+    else:
+        console.print(
+            f"[yellow]already decided[/yellow]: proposal {proposal_id} is not pending, so "
+            "nothing changed. Use `curate reopen` first if you have changed your mind."
+        )
+
+
+@curate_app.command("reopen")
+def curate_reopen(
+    proposal_id: Annotated[int, typer.Argument(help="The proposal id to return to pending.")],
+    db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+) -> None:
+    """Return a rejected or invalid proposal to pending.
+
+    The escape hatch from a decision you regret. Without it a rejection is permanent
+    from the scout's side: `ux_proposals_kind_key` means it can never re-suggest the
+    candidate itself. `applied` is deliberately not reopenable — that state lives in
+    `sources.yaml`, and undoing it means editing the file.
+    """
+    with connection(db) as conn:
+        if get_proposal(conn, proposal_id) is None:
+            err_console.print(f"[red]unknown proposal[/red] {proposal_id}.")
+            raise typer.Exit(code=2)
+        reopened = reopen_proposal(conn, proposal_id=proposal_id)
+
+    if reopened:
+        console.print(
+            f"[green]reopened[/green]: proposal {proposal_id} is pending again and will "
+            "appear in the next digest."
+        )
+    else:
+        console.print(
+            f"[yellow]not reopenable[/yellow]: proposal {proposal_id} is neither rejected "
+            "nor invalid."
+        )
+
+
+# --------------------------------------------------------------------------- #
 # daily
 # --------------------------------------------------------------------------- #
 
@@ -810,7 +1277,7 @@ def daily(
         DEFAULT_MAX_CONCURRENCY
     ),
 ) -> None:
-    """Run `ingest`, `score`, then `digest` in sequence (DESIGN §14, cron 06:00).
+    """Run `curate apply`, `ingest`, `score`, then `digest` (DESIGN §14, cron 06:00).
 
     Each step keeps its own `runs` row and failure isolation — a step that
     comes back `partial`/`failed` does not stop the next one from running,
@@ -822,12 +1289,37 @@ def daily(
     still lands in the digest computed *after* it finished, not one decided
     before it started.
 
-    Exit code is the worst of the three steps' (2 > 1 > 0), so a config error
-    in any step is still visible to cron even though later steps still ran.
+    Exit code is the worst of the steps' (2 > 1 > 0), so a config error in any step
+    is still visible to cron even though later steps still ran.
+
+    `curate apply` runs first and only when `sources.yaml` has a `curation:` block:
+    applying yesterday's approvals before ingest is what lets a feed approved in
+    last night's digest be fetched this morning. Its failure is isolated like every
+    other step's — a broken applier costs the day's approvals, not the day's digest,
+    and a `sources.yaml` that does not parse costs only the steps that read it.
     """
     worst_exit = 0
 
+    def apply_approvals() -> None:
+        """`curate apply`, but only when the feature is configured.
+
+        The config load lives **inside** this closure, not above the loop. Reading it
+        outside would make a `ConfigError` in `sources.yaml` abort `daily` before any
+        step ran and before any `runs` row existed — no isolation, and no record that
+        6am happened at all (CLAUDE.md §3, §7). `sources.yaml` is a file the design
+        expects to be hand-edited, so a typo in it must cost the steps that need it,
+        not the whole morning: `score` needs only `interests.yaml` and should still
+        clear its backlog.
+        """
+        if _load_sources_or_exit(config_dir).curation is None:
+            # An operator who has not enabled curation should see no trace of it.
+            return
+        curate_apply(config_dir=config_dir, db=db, vault_dir=vault_dir)
+
+    # `curate apply` leads so a source approved in yesterday's digest is fetched by
+    # this morning's ingest (DESIGN §7.1).
     steps: tuple[Callable[[], None], ...] = (
+        apply_approvals,
         lambda: ingest(
             config_dir=config_dir,
             db=db,
@@ -1100,7 +1592,7 @@ def _render_freshness(conn: sqlite3.Connection, config: SourcesConfig, *, now: d
 
 
 def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
-    """Month-to-date token spend — 0 until triage lands, and shown anyway.
+    """Month-to-date spend: tokens, plus the web-search line tokens cannot express.
 
     DESIGN §8 makes spend the number this project lives or dies on ($30 is the
     alarm). A cost readout that only appears once there is cost to report is a
@@ -1109,9 +1601,10 @@ def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
     row = conn.execute(
         """
-        SELECT COALESCE(SUM(llm_input_tokens), 0)  AS input_tokens,
-               COALESCE(SUM(llm_output_tokens), 0) AS output_tokens,
-               COUNT(*)                            AS run_count
+        SELECT COALESCE(SUM(llm_input_tokens), 0)     AS input_tokens,
+               COALESCE(SUM(llm_output_tokens), 0)    AS output_tokens,
+               COALESCE(SUM(server_tool_requests), 0) AS searches,
+               COUNT(*)                               AS run_count
         FROM runs
         WHERE started_at >= ?
         """,
@@ -1124,6 +1617,13 @@ def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
     table.add_row("runs", str(row["run_count"]))
     table.add_row("LLM input tokens", f"{row['input_tokens']:,}")
     table.add_row("LLM output tokens", f"{row['output_tokens']:,}")
+    # Web search bills per call, not per token, so this line is not derivable from
+    # the two above it — without it the $30 alarm cannot see the whole invoice
+    # (DESIGN §8). Shown always, including as a $0.00, for the same reason the token
+    # rows are: a cost readout that appears only once there is cost to report is one
+    # nobody has looked at when it mattered.
+    searches = int(row["searches"])
+    table.add_row("web searches", f"{searches:,} (${search_spend_usd(searches):.2f})")
     console.print(table)
 
 
