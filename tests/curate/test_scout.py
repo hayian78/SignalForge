@@ -205,22 +205,64 @@ async def test_a_source_id_is_derived_when_the_scout_omits_one(
 
 @pytest.mark.parametrize(
     "target",
-    ["not-a-url", "ftp://example.com/feed", "example.com/feed", "https:///feed"],
+    [
+        "not-a-url",
+        "ftp://example.com/feed",
+        "example.com/feed",
+        "https:///feed",
+        # The YAML injection. `urlsplit` strips embedded newlines *before* parsing,
+        # so this validates as a well-formed https URL while the string keeps them —
+        # and written into `sources.yaml` verbatim it stops being one entry and
+        # becomes a new `defaults:` block. The result is *valid* YAML with a
+        # duplicate top-level key, which PyYAML resolves last-wins, so the
+        # re-validation safety net succeeds and reverts nothing.
+        "https://evil.example.com/feed\ndefaults:\n  min_hn_points: 0\n",
+        "https://evil.example.com/feed\r\nrss: []",
+        "https://evil.example.com/\tfeed",
+    ],
 )
 @respx.mock
-async def test_an_addition_that_is_not_an_http_url_is_dropped(
+async def test_an_addition_that_is_not_a_safe_http_url_is_dropped(
     target: str,
     conn: sqlite3.Connection,
     interests: InterestsConfig,
     cache_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A scout URL comes from a web-search result — the least trusted input here.
+
+    Refused at the proposal boundary so the rejection is recorded against the run;
+    `apply.py` refuses it again at the write site, where it can only raise.
+    """
     fake_scout(monkeypatch, [make_scout_proposal(target=target)])
 
     outcome = await run_scout(conn, interests, cache_dir)
 
     assert outcome.candidates == []
     assert any("http(s)" in error["message"] for error in outcome.errors)
+
+
+@respx.mock
+async def test_surrounding_whitespace_is_trimmed_rather_than_refused(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trailing newline is sloppiness, not an injection, and is stripped.
+
+    Worth pinning both halves: the proposal is accepted, and what gets stored carries
+    no control character. `re.match` with a trailing `$` would accept a trailing
+    newline *inside* the value too, which is why the check uses `fullmatch` — this
+    test is what keeps the difference between the two visible.
+    """
+    mock_healthy_feed()
+    fake_scout(monkeypatch, [make_scout_proposal(target=f"  {FEED_URL}\n")])
+
+    outcome = await run_scout(conn, interests, cache_dir)
+
+    assert outcome.candidates[0].dedup_key == FEED_URL
+    assert outcome.candidates[0].payload["url"] == FEED_URL
 
 
 @respx.mock
@@ -566,6 +608,74 @@ async def test_the_scout_is_sent_the_configured_caps(
 
     assert seen["max_searches"] == 3
     assert seen["max_proposals"] == 4
+
+
+@respx.mock
+async def test_one_pass_makes_exactly_one_paid_call(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Asserted at the orchestrator, not only inside `llm.run_source_scout`.
+
+    `test_the_scout_makes_exactly_one_api_request` pins that a *paused turn is not
+    resumed* within one call. It says nothing about this function calling that
+    function twice, which would double the feature's bill with every existing test
+    still green — the coverage gap a cost review found by mutating exactly that.
+    """
+    calls = 0
+
+    def _counting_run(**_kwargs: object) -> llm.ScoutResult:
+        nonlocal calls
+        calls += 1
+        return llm.ScoutResult()
+
+    monkeypatch.setattr("signalforge.curate.scout.llm.run_source_scout", _counting_run)
+
+    await run_scout(conn, interests, cache_dir)
+
+    assert calls == 1
+
+
+@respx.mock
+async def test_the_suppression_list_sent_to_the_scout_is_bounded(
+    conn: sqlite3.Connection,
+    interests: InterestsConfig,
+    cache_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rejections accumulate forever; the prompt they feed must not.
+
+    Every one of these is input tokens on an Opus-priced call, and nothing ever
+    deletes a rejection, so an unbounded list raises the weekly bill for the life of
+    the pipeline. Bounding it is safe because the unique index, not the prompt, is
+    what prevents a re-proposal.
+    """
+    from signalforge.curate.gather import _REJECTED_PROMPT_LIMIT  # noqa: PLC0415
+
+    for index in range(_REJECTED_PROMPT_LIMIT + 5):
+        stored = scout.persist_candidates(
+            conn,
+            [make_candidate(dedup_key=f"https://rejected{index}.example.com/feed")],
+            run_id=start_run(conn),
+            surface_date=SURFACE_DATE,
+            created_at=FROZEN_NOW,
+        )
+        db.decide_proposal(
+            conn,
+            proposal_id=stored.stored[0],
+            status=ProposalStatus.REJECTED,
+            decided_at=FROZEN_NOW,
+        )
+    seen = fake_scout(monkeypatch, [])
+
+    await run_scout(conn, interests, cache_dir)
+
+    prompt = str(seen["user_prompt"])
+    assert prompt.count("rejected: ") == _REJECTED_PROMPT_LIMIT
+    # The newest are the ones kept: the oldest five fall off.
+    assert "rejected0.example.com" not in prompt
 
 
 @respx.mock

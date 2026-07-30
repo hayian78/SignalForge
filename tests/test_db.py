@@ -1103,7 +1103,7 @@ def test_rejected_proposals_returns_the_suppression_list(
         note="too much product marketing",
     )
 
-    suppressed = rejected_proposals(conn)
+    suppressed = rejected_proposals(conn, limit=40)
 
     assert len(suppressed) == 1
     assert suppressed[0].kind is ProposalKind.ADD_RSS
@@ -1112,6 +1112,34 @@ def test_rejected_proposals_returns_the_suppression_list(
     # The operator's reason is the part that teaches the scout something; the
     # scout's own pitch replayed back at it teaches nothing (DESIGN §7.1).
     assert suppressed[0].decision_note == "too much product marketing"
+
+
+def test_rejected_proposals_is_bounded_and_keeps_the_most_recent(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """This list is prompt input on an Opus-priced call, and it only ever grows.
+
+    Nothing removes a rejection, so an unbounded query raises the weekly bill for
+    the rest of the pipeline's life and eventually crowds out the evidence beside
+    it. The bound is safe because `ux_proposals_kind_key` — not the prompt — is what
+    stops a candidate being re-proposed.
+
+    Selection takes the newest; the returned order is oldest-first so the rendered
+    prompt text is stable.
+    """
+    for index in range(5):
+        proposal_id = _add_proposal(conn, run_id=curate_run, dedup_key=f"feed-{index}")
+        assert proposal_id is not None
+        decide_proposal(
+            conn,
+            proposal_id=proposal_id,
+            status=ProposalStatus.REJECTED,
+            decided_at=DECIDED_AT,
+        )
+
+    suppressed = rejected_proposals(conn, limit=3)
+
+    assert [entry.dedup_key for entry in suppressed] == ["feed-2", "feed-3", "feed-4"]
 
 
 def test_rejected_proposals_tolerates_a_decision_with_no_note(
@@ -1124,7 +1152,7 @@ def test_rejected_proposals_tolerates_a_decision_with_no_note(
         conn, proposal_id=proposal_id, status=ProposalStatus.REJECTED, decided_at=DECIDED_AT
     )
 
-    assert rejected_proposals(conn)[0].decision_note is None
+    assert rejected_proposals(conn, limit=40)[0].decision_note is None
 
 
 def test_insert_proposal_refuses_to_mint_an_already_approved_row(
@@ -1193,7 +1221,7 @@ def test_reopen_proposal_clears_the_decision_note(
     stored = get_proposal(conn, proposal_id)
     assert stored is not None
     assert stored.decision_note is None
-    assert rejected_proposals(conn) == []
+    assert rejected_proposals(conn, limit=40) == []
 
 
 # --------------------------------------------------------------------------- #

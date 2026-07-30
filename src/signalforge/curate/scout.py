@@ -86,7 +86,7 @@ retirement claims, and hiding that proposal would suppress the one it most makes
 sense to show. So a failed probe marks an addition `invalid` and never renders it,
 and leaves a retirement pending with the failure recorded in its facts."""
 
-_KEYWORD_SAFE: Final = re.compile(r"^[a-z0-9][a-z0-9 .+#/-]*$")
+_KEYWORD_SAFE: Final = re.compile(r"[a-z0-9][a-z0-9 .+#/-]*")
 r"""What a keyword may contain.
 
 A syntax guard on model output, not a tuning knob: HN keywords are spliced into a
@@ -173,7 +173,26 @@ class ReprobeOutcome:
     errors: list[dict[str, str]] = field(default_factory=list)
 
 
+_URL_SAFE: Final = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+"""Every character RFC 3986 permits in a URI, and nothing else.
+
+An allowlist rather than a blocklist, because the thing being defended against is
+not a known bad character — it is `urlsplit` accepting a string that is not the
+string we keep. CPython strips embedded `\\n`, `\\r` and `\\t` *before* parsing, so
+a URL carrying a newline validates as a well-formed `https://` URL while the value
+still holds the newline. Written into `sources.yaml` verbatim, that newline starts a
+new YAML line, and a crafted one can append or replace whole top-level blocks.
+
+`load_sources` does not catch it: the injected document is *valid* YAML, and a
+duplicate top-level key silently wins (last one loaded), so the safety net that
+reverts a `ConfigError` never fires. The scout's URLs come from web-search results —
+the least trustworthy input in the system — so this is checked here, and again at
+the write site in `apply.py`."""
+
+
 def _is_http_url(value: str) -> bool:
+    if not _URL_SAFE.fullmatch(value):
+        return False
     parts = urlsplit(value)
     return parts.scheme in ("http", "https") and bool(parts.hostname)
 
@@ -225,7 +244,7 @@ def _clean_keyword(value: str) -> str:
         raise ValueError("keyword is empty")
     if len(keyword) > _MAX_KEYWORD_CHARS:
         raise ValueError(f"keyword {keyword[:20]!r}… is too long to be a search term")
-    if not _KEYWORD_SAFE.match(keyword):
+    if not _KEYWORD_SAFE.fullmatch(keyword):
         raise ValueError(f"keyword {keyword!r} contains characters that would break the YAML list")
     return keyword
 
@@ -399,7 +418,6 @@ async def scout_for_proposals(
     """
     stamp = now or datetime.now(UTC)
     evidence = gather_evidence(conn, sources, window_days=curation.yield_window_days, now=stamp)
-    rejected = db.rejected_proposals(conn)
 
     # Blocking, on purpose. Nothing else is scheduled on this loop: the probes
     # cannot start until there is something to probe, which is the ordering the
@@ -412,7 +430,7 @@ async def scout_for_proposals(
             feedback_by_source=evidence.feedback_by_source,
             outbound_domains=evidence.outbound_domains,
             kept_titles=evidence.kept_titles,
-            rejected=rejected,
+            rejected=evidence.rejected,
             window_days=evidence.window_days,
             max_proposals=curation.max_proposals_per_run,
         ),

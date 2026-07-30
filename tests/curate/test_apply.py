@@ -406,6 +406,161 @@ def test_adding_a_feed_whose_id_is_taken_by_a_different_feed_raises(
         )
 
 
+INJECTED_URL = (
+    "https://evil.example.com/feed\n"
+    "defaults:\n"
+    "  fetch_timeout: 1\n"
+    "  min_hn_points: 0\n"
+    "  max_summary_chars: 1\n"
+    "  max_item_age_days: 9999\n"
+)
+
+
+def test_a_url_carrying_a_newline_cannot_inject_yaml(repo_config_dir: Path) -> None:
+    """The one corruption the re-validation safety net cannot catch.
+
+    `urlsplit` strips embedded newlines before parsing, so this string validates as
+    a well-formed `https://` URL while still containing them. Written into a line
+    with an f-string it stops being one entry and becomes several — and the result
+    is **valid** YAML, where a duplicate top-level key silently wins, so
+    `load_sources` succeeds and nothing is reverted. The operator ticks "add this
+    feed" and their `defaults:` block is replaced.
+
+    Reachable from the scout's web search, which makes a page it happens to read an
+    input to the operator's git-tracked config. Refused at the write site so it holds
+    for every path in, not just the scout's.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        apply_to_text(
+            (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+            make_proposal(
+                dedup_key="https://evil.example.com/feed",
+                payload={"id": "evil", "url": INJECTED_URL},
+            ),
+            today=TODAY,
+            current=load_sources(repo_config_dir),
+        )
+
+
+@pytest.mark.parametrize(
+    "control",
+    ["\n", "\r", "\t", "\x00", "\x7f"],
+)
+def test_no_control_character_survives_into_a_written_value(
+    control: str, repo_config_dir: Path
+) -> None:
+    """Not just newline: the guard is an allowlist over the whole control range.
+
+    `\\r` alone reflows a line in some editors, `\\t` breaks YAML indentation
+    outright, and a NUL in a config file is a debugging session nobody wants.
+    """
+    with pytest.raises(ValueError, match="control character"):
+        apply_to_text(
+            (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+            make_proposal(
+                dedup_key=f"https://x.example.com/feed{control}",
+                payload={"id": "x", "url": f"https://x.example.com/feed{control}"},
+            ),
+            today=TODAY,
+            current=load_sources(repo_config_dir),
+        )
+
+
+def test_adding_a_keyword_that_differs_only_in_case_is_a_no_op(
+    tmp_path: Path, repo_config_dir: Path
+) -> None:
+    """The case-race the RSS and GitHub kinds had closed, for the keyword kinds.
+
+    `scout._clean_keyword` lowercases every proposed keyword and `config.py` puts no
+    case rule on the configured list, so a `keywords: [LLM]` config against a
+    proposed `llm` is an ordinary case. Compared case-sensitively it appends a
+    duplicate to the operator's file.
+    """
+    config_dir = _write_config(tmp_path, repo_config_dir, keywords="[LLM, agent]")
+
+    result = apply_to_text(
+        (config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=20, kind=ProposalKind.ADD_HN_KEYWORD, dedup_key="llm", payload={}
+        ),
+        today=TODAY,
+        current=load_sources(config_dir),
+    )
+
+    assert result is None
+
+
+def test_removing_a_keyword_that_differs_only_in_case_still_removes_it(
+    tmp_path: Path, repo_config_dir: Path
+) -> None:
+    """Otherwise the row is marked applied and the keyword is never removed."""
+    config_dir = _write_config(tmp_path, repo_config_dir, keywords="[LLM, agent]")
+
+    result = apply_to_text(
+        (config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=21, kind=ProposalKind.REMOVE_HN_KEYWORD, dedup_key="llm", payload={}
+        ),
+        today=TODAY,
+        current=load_sources(config_dir),
+    )
+
+    assert result is not None
+    assert "keywords: [agent]" in result
+
+
+def test_removing_an_arxiv_keyword_that_differs_only_in_case_still_removes_it(
+    tmp_path: Path, repo_config_dir: Path
+) -> None:
+    config_dir = _write_config(tmp_path, repo_config_dir, arxiv_keyword="Reasoning")
+
+    result = apply_to_text(
+        (config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=22,
+            kind=ProposalKind.REMOVE_ARXIV_KEYWORD,
+            dedup_key="reasoning",
+            payload={},
+        ),
+        today=TODAY,
+        current=load_sources(config_dir),
+    )
+
+    assert result is not None
+    assert "    # - Reasoning" in result
+
+
+def _write_config(
+    tmp_path: Path,
+    repo_config_dir: Path,
+    *,
+    keywords: str = "[llm]",
+    arxiv_keyword: str = "reasoning",
+) -> Path:
+    """A tiny config whose casing is chosen by the test rather than by the repo.
+
+    The shipped `sources.yaml` is all-lowercase, so the case-race cases above cannot
+    be expressed against it. This is the one place in this file that does not use the
+    real config, and only because the property under test is about casing the real
+    file does not contain.
+    """
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "sources.yaml").write_text(
+        "defaults:\n"
+        "  fetch_timeout: 20\n"
+        "  min_hn_points: 80\n"
+        "  max_summary_chars: 4000\n"
+        "  max_item_age_days: 7\n"
+        "rss: []\n"
+        f"hackernews:\n  keywords: {keywords}\n"
+        f"arxiv:\n  categories: [cs.AI]\n  require_keywords:\n    - {arxiv_keyword}\n",
+        encoding="utf-8",
+    )
+    shutil.copy(repo_config_dir / "interests.yaml", config_dir / "interests.yaml")
+    return config_dir
+
+
 def test_retiring_a_repo_whose_case_differs_from_the_config_still_retires_it(
     repo_config_dir: Path,
 ) -> None:

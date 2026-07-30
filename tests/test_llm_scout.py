@@ -27,7 +27,14 @@ import pytest
 from anthropic import APIError
 from anthropic.types import Message, ServerToolUsage, TextBlock, ToolUseBlock, Usage
 
-from signalforge.config import load_sources
+from signalforge.config import load_interests, load_sources
+from signalforge.curate.gather import (
+    _KEPT_ITEM_PROMPT_LIMIT,
+    _OUTBOUND_DOMAIN_LIMIT,
+    _REJECTED_PROMPT_LIMIT,
+)
+from signalforge.curate.prompts import build_scout_system_prompt, build_scout_user_prompt
+from signalforge.db import RejectedProposal, SourceYield
 from signalforge.llm import (
     SCOUT_EFFORT,
     SCOUT_MAX_SEARCHES_CEILING,
@@ -38,7 +45,7 @@ from signalforge.llm import (
     LlmError,
     run_source_scout,
 )
-from signalforge.models import ProposalKind, ProposalTier
+from signalforge.models import ProposalKind, ProposalTier, SourceType
 
 SYSTEM_PROMPT = "You advise on sources."
 USER_PROMPT = "Here is the evidence."
@@ -364,9 +371,69 @@ IN_RATE_USD_PER_TOKEN = 5 / 1e6
 OUT_RATE_USD_PER_TOKEN = 25 / 1e6
 SEARCH_USD = 0.01
 WEEKS_PER_MONTH = 4.33
-PROMPT_TOKENS = 2_500
-"""Measured: the rendered system + user prompt against the live config with a full
-evidence set is ~1.6-1.9k tokens. 2.5k is that with headroom."""
+CHARS_PER_TOKEN = 3.0
+"""Conservative characters-per-token for this prompt's text.
+
+English prose is ~4; URLs, slugs and `owner/repo` strings tokenize worse, and this
+prompt is full of them. 3.0 therefore *over*-estimates the token count, which is the
+right direction for a ceiling. A real tokenizer would mean an API round-trip
+(`count_tokens`), and this suite never calls the API (NEVER rule 13)."""
+
+
+def _rendered_prompt_tokens(config_dir: Path) -> int:
+    """Estimate the prompt's tokens by rendering the real thing, at full size.
+
+    Deliberately **measured, not stated.** A hardcoded figure with a comment saying
+    what it once was is how every arithmetic error in this feature's reviews
+    happened: the prompt grew, the number and its "measured: ~1.6-1.9k" note did
+    not, and the budget silently rested on a stale reading. Rendering it here means
+    any future section added to the prompt moves the worst case automatically, and
+    if it moves far enough to breach the budget, this file fails instead of the
+    invoice.
+
+    Rendered against the live config, with every bounded list of evidence filled to
+    the bound `curate/gather.py` enforces, so this is the largest prompt the shipped
+    code can produce.
+    """
+    sources = load_sources(config_dir)
+    interests = load_interests(config_dir)
+    yield_rows = [
+        SourceYield(
+            source_id=f"source-{index}",
+            source_type=SourceType.RSS,
+            items_total=40,
+            kept=6,
+            killed=34,
+            unscored=0,
+        )
+        for index in range(len(sources.rss) + 10)
+    ]
+    system = build_scout_system_prompt(interests)
+    user = build_scout_user_prompt(
+        sources=sources,
+        yield_rows=yield_rows,
+        feedback_by_source={row.source_id: {"useful": 2, "noise": 3} for row in yield_rows},
+        outbound_domains=[
+            (f"domain-{index}.example.com", 4) for index in range(_OUTBOUND_DOMAIN_LIMIT)
+        ],
+        kept_titles=[
+            f"A realistic item title about agents and evaluation, number {index}"
+            for index in range(_KEPT_ITEM_PROMPT_LIMIT)
+        ],
+        rejected=[
+            RejectedProposal(
+                kind=ProposalKind.ADD_RSS,
+                dedup_key=f"https://rejected-{index}.example.com/feed",
+                rationale="Looked like a fit on paper.",
+                decision_note="mostly product marketing",
+            )
+            for index in range(_REJECTED_PROMPT_LIMIT)
+        ],
+        window_days=30,
+        max_proposals=5,
+    )
+    return int(len(system + user) / CHARS_PER_TOKEN)
+
 
 PESSIMISTIC_TOKENS_PER_SEARCH = 6_000
 """3x the ~2k dynamic filtering is expected to deliver.
@@ -376,8 +443,8 @@ no code enforces — everything else is a module constant or a server-side cap. 
 budget that holds only if the model behaves as hoped is a forecast, not a ceiling."""
 
 
-def _worst_case_monthly_usd(searches: int, tokens_per_search: int) -> float:
-    tokens_in = PROMPT_TOKENS + searches * tokens_per_search
+def _worst_case_monthly_usd(searches: int, tokens_per_search: int, prompt_tokens: int) -> float:
+    tokens_in = prompt_tokens + searches * tokens_per_search
     per_run = (
         tokens_in * IN_RATE_USD_PER_TOKEN
         + SCOUT_MAX_TOKENS * OUT_RATE_USD_PER_TOKEN
@@ -386,7 +453,7 @@ def _worst_case_monthly_usd(searches: int, tokens_per_search: int) -> float:
     return per_run * WEEKS_PER_MONTH
 
 
-def test_the_worst_case_cost_stays_within_the_recorded_ceiling() -> None:
+def test_the_worst_case_cost_stays_within_the_recorded_ceiling(repo_config_dir: Path) -> None:
     """Guards the budget against any change to the constants *or the config*.
 
     Asserted at `SCOUT_MAX_SEARCHES_CEILING`, **not** at the shipped config value.
@@ -398,7 +465,11 @@ def test_the_worst_case_cost_stays_within_the_recorded_ceiling() -> None:
     Asserting at the ceiling covers every value the code will *accept*, so no config
     edit can breach the budget without also failing here.
     """
-    worst = _worst_case_monthly_usd(SCOUT_MAX_SEARCHES_CEILING, PESSIMISTIC_TOKENS_PER_SEARCH)
+    worst = _worst_case_monthly_usd(
+        SCOUT_MAX_SEARCHES_CEILING,
+        PESSIMISTIC_TOKENS_PER_SEARCH,
+        _rendered_prompt_tokens(repo_config_dir),
+    )
 
     assert worst <= SCOUT_MONTHLY_CEILING_USD, (
         f"worst case at the search ceiling is ${worst:.2f}/month against a "
@@ -431,7 +502,9 @@ def test_the_expected_cost_sits_well_below_the_ceiling(repo_config_dir: Path) ->
     curation = load_sources(repo_config_dir).curation
     assert curation is not None
 
-    expected = _worst_case_monthly_usd(curation.max_searches_per_run, 2_000)
+    expected = _worst_case_monthly_usd(
+        curation.max_searches_per_run, 2_000, _rendered_prompt_tokens(repo_config_dir)
+    )
 
     assert expected <= SCOUT_MONTHLY_CEILING_USD * 0.85
 

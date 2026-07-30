@@ -556,22 +556,36 @@ never writes an `items` row. `ingest/` still imports no LLM.
 
 ### Cost
 
-**Budget: ≤ $2.50/month for this feature**, recorded in code as
-`llm.SCOUT_MONTHLY_CEILING_USD` beside the constants that enforce it. Expected spend is
-≈ **$1.00/month**; the *absolute* worst case is ≈ **$2.38/month**, and it is a ceiling
-derived from enforced limits rather than a forecast of good behaviour — three facts, each
-checkable from code:
+**Budget: ≤ $2.50/month for this feature.** That number is the decision, and it lives in
+code as `llm.SCOUT_MONTHLY_CEILING_USD`, beside the constants that enforce it. Expected
+spend is ≈ **$1.00/month**.
+
+The worst case is **not restated here**, because a figure written in prose is a figure that
+goes stale — every arithmetic error found in this feature's reviews was a number that had
+drifted from the thing it described. It is computed instead, by
+`test_the_worst_case_cost_stays_within_the_recorded_ceiling`, from four inputs it reads
+rather than assumes:
 
 1. exactly one API request per run, no resumes;
-2. searches capped server-side by `max_uses`, at `SCOUT_MAX_SEARCHES_CEILING` (7) or the
-   lower configured value (ships at 6);
-3. output capped by `SCOUT_MAX_TOKENS` (10,240) for that single request.
+2. searches capped server-side by `max_uses`, at `SCOUT_MAX_SEARCHES_CEILING` or the lower
+   configured value;
+3. output capped by `SCOUT_MAX_TOKENS` for that single request;
+4. **the rendered prompt itself**, built by `curate/prompts.py` against the live config with
+   every bounded evidence list filled to its bound — so growing the prompt moves the ceiling
+   automatically instead of quietly eating its headroom. (An earlier version assumed 2,500
+   tokens here; the real figure is ~4,000, and the assumption had already been overtaken by
+   a prompt change once.)
 
-That worst case is computed at the *ceiling*, not the shipped default, and with a
-pessimistic 6k input tokens per search — 3× what dynamic filtering is expected to deliver,
-because per-search input volume is the one figure here that no code enforces. A test
-recomputes it from those constants and fails if it exceeds the budget, so raising either
-knob — or the config value — breaks CI rather than the invoice.
+It is computed at the *ceiling*, not the shipped default, and with a pessimistic 6k input
+tokens per search — 3× what dynamic filtering is expected to deliver, because per-search
+input volume is the one figure here that no code enforces. Raising any knob, editing the
+config, or growing the prompt past what the budget affords fails CI rather than the invoice.
+
+Every list of evidence in that prompt is bounded for the same reason: kept titles, outbound
+domains, and past rejections all reach an Opus-priced call, and rejections in particular
+only ever accumulate — nothing deletes one — so an unbounded suppression list would raise
+the weekly bill for the life of the pipeline. Bounding it is safe because
+`ux_proposals_kind_key`, not the prompt, is what stops a candidate being re-proposed.
 
 Two notes for §8's accounting:
 
@@ -606,11 +620,11 @@ Two notes for §8's accounting:
 | Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
-| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week, ~14.5k in / ~4k out, ships at 6 searches |
+| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4k at full evidence) plus search results; output capped by `SCOUT_MAX_TOKENS`; ships at 6 searches |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (14.5k in ≈ $0.07 + 4k out ≈ $0.10 + 6 searches ≈ $0.06) ≈ **$1.00**. **Itemized total ≈ $8.00/month**, against a **$5–10 target** and a **$30 alarm**.
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (16k in ≈ $0.08 + 4k out ≈ $0.10 + 6 searches ≈ $0.06) ≈ **$1.00**. **Itemized total ≈ $8.00/month**, against a **$5–10 target** and a **$30 alarm**.
 
 Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
@@ -621,9 +635,10 @@ Two things that estimate is not. It is not measured: the only measured figure to
 **Two cost facts about the search tool that are easy to get wrong**, both learned the expensive way on this branch:
 
 - `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`.
-- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling was ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which bounds its absolute worst case at ≈ **$2.38/month** from constants alone — see `llm.SCOUT_MONTHLY_CEILING_USD`.
+- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling was ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which is what makes its absolute worst case derivable from constants at all — see §7.1, which states the budget and leaves the figure to the test that computes it.
 - **A ceiling that permits values the budget forbids is not a ceiling.** `SCOUT_MAX_SEARCHES_CEILING` was 15 while the budget only afforded 7, so any config value in between would have breached it with every test green. Two rules fell out of that: the hard ceiling is derived from the budget, and the test that guards the budget asserts **at the ceiling**, never at the shipped default — otherwise a pure data edit to `curation.max_searches_per_run` moves real spend without failing anything.
 - Search-result content is billed as **input** tokens on every request that carries it, so a resume re-sending the accumulated conversation pays for the same results twice.
+- **A number written in two places is a number that will disagree with itself.** Every arithmetic error found while reviewing this feature was a figure that had drifted from what it described — a docstring quoting a superseded `max_tokens`, a test constant whose "measured: ~1.6-1.9k" note predated a prompt change that made it ~4k. The fix each time was to delete the copy, not correct it: the budget lives in one constant, and the worst case is computed by a test from the values it actually reads, including the rendered prompt.
 - **State a budget as a ceiling derived from enforced limits, not from expected behaviour.** The scout's first worst-case figure assumed ~4k of output per turn and looked comfortable; recomputed against the `max_tokens` the code actually permits, the same scenario was 3× over. An estimate that assumes good behaviour is a forecast, not a bound.
 
 ---

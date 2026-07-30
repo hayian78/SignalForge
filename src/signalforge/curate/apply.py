@@ -118,6 +118,35 @@ def _line_indent(line: str) -> int:
     return len(line) - len(line.lstrip())
 
 
+def _writable(value: str, *, field_name: str, proposal_id: int) -> str:
+    """Return `value` if it is safe to splice into a YAML line, else raise.
+
+    The one hard rule: **no control characters**, above all no newline. Every write
+    in this module builds a line with an f-string, so a value carrying a newline
+    does not produce a broken entry — it produces *extra lines*, at whatever
+    indentation the attacker chose. A crafted feed URL can therefore append or
+    replace whole top-level blocks of `sources.yaml`.
+
+    `load_sources` is not a defence against that. The injected document is **valid**
+    YAML, and PyYAML resolves a duplicate top-level key by keeping the last one, so
+    the re-validation below succeeds and nothing is reverted. The operator ticks one
+    checkbox meaning "add this feed" and gets an arbitrarily different config.
+
+    Checked here, at the write site, rather than only where proposals are built:
+    this is the only code that edits the operator's config, so it is the one place
+    that must hold for every path in — the scout, a hand-written row, a future
+    caller. `curate/scout.py` also refuses these URLs earlier, where the rejection
+    can be recorded against the run instead of raising.
+    """
+    if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+        raise ValueError(
+            f"proposal {proposal_id} has a {field_name} containing a control character; "
+            "refusing to write it, because a newline here would inject YAML lines "
+            "rather than produce an invalid file the safety net could catch"
+        )
+    return value
+
+
 def _match_casefold(value: str, configured: list[str]) -> str | None:
     """The configured entry equal to `value` ignoring case, or None.
 
@@ -300,13 +329,20 @@ def apply_to_text(
     lines = text.splitlines()
     comment = _provenance(proposal.id, today, proposal.rationale)
     payload = proposal.payload
-    target = proposal.dedup_key
+    # Guarded before anything is built from it: `target` reaches a written line for
+    # five of the eight kinds, and a newline in it injects YAML rather than breaking
+    # it. `_provenance` already flattens the rationale through `str.split`.
+    target = _writable(proposal.dedup_key, field_name="target", proposal_id=proposal.id)
     result: list[str] | None = None
 
     match proposal.kind:
         case ProposalKind.ADD_RSS:
-            url = str(payload.get("url") or target)
-            source_id = str(payload.get("id") or "")
+            url = _writable(
+                str(payload.get("url") or target), field_name="feed url", proposal_id=proposal.id
+            )
+            source_id = _writable(
+                str(payload.get("id") or ""), field_name="source id", proposal_id=proposal.id
+            )
             if not source_id:
                 raise ValueError(f"proposal {proposal.id} has no source id to add")
             if canonicalize_url(url) in {canonicalize_url(source.url) for source in current.rss}:
@@ -370,21 +406,30 @@ def apply_to_text(
         case ProposalKind.ADD_HN_KEYWORD:
             if current.hackernews is None:
                 raise ValueError("cannot edit hn keywords: sources.yaml has no hackernews block")
-            if target in current.hackernews.keywords:
+            # Case-insensitive for the same reason as the kinds above, and it bites
+            # harder here: `scout._clean_keyword` lowercases every proposed keyword
+            # while `config.py` puts no case rule on the configured list, so a
+            # `keywords: [LLM]` config plus a proposed `llm` is the normal case, not
+            # an odd one. Compared case-sensitively it appends a duplicate.
+            if _match_casefold(target, current.hackernews.keywords) is not None:
                 return None
             result = _edit_inline_list(lines, "keywords", add=target, remove=None, comment=comment)
 
         case ProposalKind.REMOVE_HN_KEYWORD:
             if current.hackernews is None:
                 raise ValueError("cannot edit hn keywords: sources.yaml has no hackernews block")
-            if target not in current.hackernews.keywords:
+            configured = _match_casefold(target, current.hackernews.keywords)
+            if configured is None:
                 return None
-            result = _edit_inline_list(lines, "keywords", add=None, remove=target, comment=comment)
+            # The config's own spelling: `_edit_inline_list` removes by exact match.
+            result = _edit_inline_list(
+                lines, "keywords", add=None, remove=configured, comment=comment
+            )
 
         case ProposalKind.ADD_ARXIV_KEYWORD:
             if current.arxiv is None:
                 raise ValueError("cannot add an arxiv keyword: sources.yaml has no arxiv block")
-            if target in current.arxiv.require_keywords:
+            if _match_casefold(target, current.arxiv.require_keywords) is not None:
                 return None
             result = _append_to_block(
                 lines,
@@ -395,9 +440,14 @@ def apply_to_text(
             )
 
         case ProposalKind.REMOVE_ARXIV_KEYWORD:
-            if current.arxiv is None or target not in current.arxiv.require_keywords:
+            if current.arxiv is None:
                 return None
-            result = _comment_out_list_item(lines, "  require_keywords:", target, comment, indent=4)
+            configured = _match_casefold(target, current.arxiv.require_keywords)
+            if configured is None:
+                return None
+            result = _comment_out_list_item(
+                lines, "  require_keywords:", configured, comment, indent=4
+            )
 
     if result is None:
         # Reached only if a membership check passed and the text edit then failed to

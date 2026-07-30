@@ -77,6 +77,19 @@ _OUTBOUND_DOMAIN_LIMIT: Final = 15
 reasoning as the item limit: a long tail of once-seen domains is noise the scout
 would have to read past."""
 
+_REJECTED_PROMPT_LIMIT: Final = 40
+"""How many past rejections reach the prompt, most recent first.
+
+Same reasoning as the two limits above, with one difference that makes it matter
+more: rejections only ever accumulate. Nothing removes one, so an unbounded list
+grows the weekly Opus bill forever and eventually crowds out the evidence it sits
+beside. 40 covers roughly two months of decisions at the shipped proposal cap.
+
+Bounding it is safe because the prompt is not what suppresses a re-proposal —
+`ux_proposals_kind_key` is. A candidate that ages out of this list still cannot be
+stored twice; the operator is simply not shown their old reason again, and the cost
+is at most one wasted proposal slot."""
+
 _MIN_DOMAIN_REFERENCES: Final = 2
 """A domain must be pointed at more than once to count as attention.
 
@@ -148,6 +161,12 @@ class CurationEvidence:
     kept_titles: list[str] = field(default_factory=list)
     """Titles of the highest-ranked kept items, best first. What the operator is
     actually reading, which is the signal that survives the href gap."""
+
+    rejected: list[db.RejectedProposal] = field(default_factory=list)
+    """The suppression list — recent rejections with the operator's reasons.
+
+    Evidence like everything else here, and gathered here rather than in `scout.py`
+    so that every bound on the prompt's size is declared in one module."""
 
 
 def _highest_rungs(
@@ -253,6 +272,7 @@ def gather_evidence(
         feedback_by_source=_highest_rungs(verdicts),
         outbound_domains=_outbound_domains(sources, kept),
         kept_titles=[item.title for item in kept],
+        rejected=db.rejected_proposals(conn, limit=_REJECTED_PROMPT_LIMIT),
     )
     logger.info(
         "gathered curation evidence",
@@ -262,6 +282,7 @@ def gather_evidence(
             "marked_sources": len(evidence.feedback_by_source),
             "outbound_domains": len(evidence.outbound_domains),
             "kept_titles": len(evidence.kept_titles),
+            "rejected": len(evidence.rejected),
         },
     )
     return evidence

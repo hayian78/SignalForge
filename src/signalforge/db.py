@@ -1282,20 +1282,34 @@ class RejectedProposal:
     back at it."""
 
 
-def rejected_proposals(conn: sqlite3.Connection) -> list[RejectedProposal]:
-    """Every rejected proposal — the scout's suppression list.
+def rejected_proposals(conn: sqlite3.Connection, *, limit: int) -> list[RejectedProposal]:
+    """The most recently rejected proposals, oldest of those first.
 
     Fed into the scout prompt so it stops re-suggesting what the operator already
     turned down. The unique index would collapse a repeat suggestion anyway, but
-    that wastes the searches and prompt space that produced it, and tells the
+    that wastes the searches and the proposal slot that produced it, and tells the
     scout nothing about why the answer was no.
+
+    **Bounded, like `kept_items`, because it is prompt input on an Opus-priced
+    call.** Rejections only accumulate — nothing ever removes one — so an unbounded
+    list grows the weekly bill forever and eventually drowns the evidence around it.
+    The bound is safe precisely because `ux_proposals_kind_key` is the real
+    suppression mechanism: a candidate that falls off the end of this list can still
+    never be stored a second time. Losing it from the prompt costs at most one
+    wasted proposal slot, not a re-decision.
+
+    Returned oldest-first within the window so the rendered text is stable, while
+    the *selection* takes the newest — a rejection from last month says more about
+    the operator's current judgment than one from a year ago.
     """
     rows = conn.execute(
         """
-        SELECT kind, dedup_key, rationale, decision_note FROM proposals
-        WHERE status = ? ORDER BY id
+        SELECT kind, dedup_key, rationale, decision_note FROM (
+            SELECT id, kind, dedup_key, rationale, decision_note FROM proposals
+            WHERE status = ? ORDER BY id DESC LIMIT ?
+        ) ORDER BY id ASC
         """,
-        (ProposalStatus.REJECTED.value,),
+        (ProposalStatus.REJECTED.value, limit),
     ).fetchall()
     return [
         RejectedProposal(
