@@ -27,6 +27,7 @@ __all__ = [
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "DigestItem",
+    "KeptItem",
     "Migration",
     "Proposal",
     "RejectedProposal",
@@ -47,7 +48,7 @@ __all__ = [
     "get_proposals",
     "insert_proposal",
     "insert_score",
-    "kept_item_links",
+    "kept_items",
     "mark_proposal_applied",
     "migrate",
     "record_feedback",
@@ -1431,24 +1432,58 @@ def feedback_verdicts_since(
     return [(row["source_id"], int(row["item_id"]), row["verdict"]) for row in rows]
 
 
-def kept_item_links(conn: sqlite3.Connection, *, since: datetime) -> list[tuple[str, str, str]]:
-    """`(source_id, url, summary)` for kept items fetched since `since`.
+@dataclass(frozen=True, slots=True)
+class KeptItem:
+    """A kept item, reduced to what curation evidence needs.
 
-    The input to outbound-attention analysis: which domains and authors the
-    material the operator actually valued keeps pointing at. `summary` is
-    included because a link blog's value is in the links inside it, not its own
-    URL. `content` is deliberately absent — it exists only for top-N deep reads
-    and pulling it here would load full article text for a domain count.
+    `content` is deliberately absent: it exists only for top-N deep reads, and
+    pulling full article text here to count domains would be exactly the kind of
+    quiet cost creep DESIGN §8 guards against.
+    """
+
+    source_id: str
+    url: str
+    title: str
+    summary: str
+    """As stored, which for an RSS item means **HTML already stripped** by
+    `rss._clean_summary`. Anchor text survives; hrefs do not. HN items keep their
+    markup because the Algolia payload carries it, so link extraction over this
+    field covers HN and misses feeds — see `curate.gather` for why that gap is
+    accepted rather than worked around."""
+
+    ranking_score: int
+    """signal + relevance + novelty, so the caller can show the scout the items
+    the operator valued *most* rather than an arbitrary slice."""
+
+
+def kept_items(conn: sqlite3.Connection, *, since: datetime, limit: int) -> list[KeptItem]:
+    """The highest-ranked kept items fetched since `since`, best first.
+
+    Bounded by `limit` because these go into a prompt: this is the one gather
+    query whose output size directly moves the scout's input-token bill, so the
+    caller states how many it can afford rather than discovering it later.
     """
     rows = conn.execute(
         """
-        SELECT items.source_id AS source_id, items.url AS url,
-               COALESCE(items.summary, '') AS summary
+        SELECT items.source_id AS source_id, items.url AS url, items.title AS title,
+               COALESCE(items.summary, '') AS summary,
+               (COALESCE(scores.signal, 0) + COALESCE(scores.relevance, 0)
+                + COALESCE(scores.novelty, 0)) AS ranking_score
         FROM items
         JOIN scores ON scores.item_id = items.id
         WHERE scores.triage = 'keep' AND items.fetched_at >= ?
-        ORDER BY items.id
+        ORDER BY ranking_score DESC, items.id ASC
+        LIMIT ?
         """,
-        (_window_start(since),),
+        (_window_start(since), limit),
     ).fetchall()
-    return [(row["source_id"], row["url"], row["summary"]) for row in rows]
+    return [
+        KeptItem(
+            source_id=row["source_id"],
+            url=row["url"],
+            title=row["title"],
+            summary=row["summary"],
+            ranking_score=int(row["ranking_score"]),
+        )
+        for row in rows
+    ]

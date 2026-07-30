@@ -32,7 +32,7 @@ from signalforge.db import (
     get_proposal,
     get_proposals,
     insert_proposal,
-    kept_item_links,
+    kept_items,
     mark_proposal_applied,
     migrate,
     record_feedback,
@@ -1408,7 +1408,7 @@ def test_feedback_verdicts_since_returns_unreduced_rows(conn: sqlite3.Connection
     assert {source_id for source_id, _, _ in verdicts} == {"blog"}
 
 
-def test_kept_item_links_returns_only_kept_items_with_their_summaries(
+def test_kept_items_returns_only_kept_items_with_their_summaries(
     conn: sqlite3.Connection,
 ) -> None:
     _seed_scored_item(
@@ -1420,11 +1420,34 @@ def test_kept_item_links_returns_only_kept_items_with_their_summaries(
     )
     _seed_scored_item(conn, source_id="linkblog", external_id="2", triage="kill")
 
-    links = kept_item_links(conn, since=WINDOW_START)
+    kept = kept_items(conn, since=WINDOW_START, limit=50)
 
-    assert len(links) == 1
-    assert links[0][0] == "linkblog"
-    assert "newvoice.example.com" in links[0][2]
+    assert len(kept) == 1
+    assert kept[0].source_id == "linkblog"
+    assert kept[0].title == "MCP sampling lands everywhere"
+    assert "newvoice.example.com" in kept[0].summary
+    assert kept[0].ranking_score == 11  # 4 + 4 + 3 from `_seed_scored_item`
+
+
+def test_kept_items_returns_the_highest_ranked_first_and_respects_the_limit(
+    conn: sqlite3.Connection,
+) -> None:
+    # These rows go into a prompt, so the cap is a token-budget decision, not a
+    # convenience — and "which items" must mean the best, not an arbitrary slice.
+    for index in range(4):
+        item_id = _seed_scored_item(conn, source_id="blog", external_id=str(index), triage=None)
+        conn.execute(
+            """
+            INSERT INTO scores (item_id, triage, signal, relevance, novelty, reasoning,
+                                rubric_version, model, scored_at)
+            VALUES (?, 'keep', ?, 1, 1, 'because', 'triage-v3', 'claude-haiku-4-5', ?)
+            """,
+            (item_id, index + 1, FIXED_FETCHED_AT.isoformat()),
+        )
+
+    kept = kept_items(conn, since=WINDOW_START, limit=2)
+
+    assert [item.ranking_score for item in kept] == [6, 5]
 
 
 def test_feedback_verdicts_since_excludes_items_fetched_before_the_window(
@@ -1456,7 +1479,7 @@ def test_feedback_verdicts_since_includes_off_ladder_missed_marks(
     ]
 
 
-def test_kept_item_links_excludes_items_fetched_before_the_window(
+def test_kept_items_excludes_items_fetched_before_the_window(
     conn: sqlite3.Connection,
 ) -> None:
     _seed_scored_item(
@@ -1467,13 +1490,24 @@ def test_kept_item_links_excludes_items_fetched_before_the_window(
         fetched_at=datetime(2026, 5, 1, 6, 0, tzinfo=UTC),
     )
 
-    assert kept_item_links(conn, since=WINDOW_START) == []
+    assert kept_items(conn, since=WINDOW_START, limit=50) == []
 
 
 WindowQuery = Callable[..., list[object]]
 
-WINDOW_QUERIES: list[WindowQuery] = [source_yield_stats, feedback_verdicts_since, kept_item_links]
-WINDOW_QUERY_IDS = ["source_yield_stats", "feedback_verdicts_since", "kept_item_links"]
+
+def _kept_items_window(conn: sqlite3.Connection, *, since: datetime) -> list[object]:
+    """`kept_items` with the prompt-size cap fixed, so the window tests below can
+    treat all three gather queries as the same shape."""
+    return list(kept_items(conn, since=since, limit=50))
+
+
+WINDOW_QUERIES: list[WindowQuery] = [
+    source_yield_stats,
+    feedback_verdicts_since,
+    _kept_items_window,
+]
+WINDOW_QUERY_IDS = ["source_yield_stats", "feedback_verdicts_since", "kept_items"]
 
 
 @pytest.fixture
