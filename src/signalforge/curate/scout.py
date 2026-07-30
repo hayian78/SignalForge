@@ -41,8 +41,10 @@ surfaces in the next digest.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import re
+import socket
 import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -61,7 +63,13 @@ from signalforge.curate.prompts import (
     proposal_payload,
 )
 from signalforge.ingest.probe import SourceProbe
-from signalforge.models import ProposalKind, ProposalStatus, ProposalTier, canonicalize_url
+from signalforge.models import (
+    ProposalKind,
+    ProposalStatus,
+    ProposalTier,
+    canonicalize_url,
+    is_safe_url,
+)
 
 __all__ = [
     "Candidate",
@@ -201,28 +209,102 @@ class ReprobeOutcome:
     errors: list[dict[str, str]] = field(default_factory=list)
 
 
-_URL_SAFE: Final = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
-"""Every character RFC 3986 permits in a URI, and nothing else.
+_is_http_url = is_safe_url
+"""`models.is_safe_url`, under the name every call site here already uses.
 
-An allowlist rather than a blocklist, because the thing being defended against is
-not a known bad character — it is `urlsplit` accepting a string that is not the
-string we keep. CPython strips embedded `\\n`, `\\r` and `\\t` *before* parsing, so
-a URL carrying a newline validates as a well-formed `https://` URL while the value
-still holds the newline. Written into `sources.yaml` verbatim, that newline starts a
-new YAML line, and a crafted one can append or replace whole top-level blocks.
-
-`load_sources` does not catch it: the injected document is *valid* YAML, and a
-duplicate top-level key silently wins (last one loaded), so the safety net that
-reverts a `ConfigError` never fires. The scout's URLs come from web-search results —
-the least trustworthy input in the system — so this is checked here, and again at
-the write site in `apply.py`."""
+The scout's URLs come from web-search results and model output — the least
+trustworthy input in the system — so this is checked here, and again at the write
+site in `apply.py` and again in `db.insert_proposal`. Kept in `models.py` rather
+than duplicated here because `db.py` needs the identical check on the read and
+write paths for evidence citations, and a second copy of an RFC 3986 allowlist is
+exactly the kind of drift that produced the arithmetic bugs this project's cost
+constants had to stop restating."""
 
 
-def _is_http_url(value: str) -> bool:
-    if not _URL_SAFE.fullmatch(value):
-        return False
-    parts = urlsplit(value)
-    return parts.scheme in ("http", "https") and bool(parts.hostname)
+_DISALLOWED_FETCH_SUFFIXES: Final = (".localhost", ".local", ".internal")
+"""Hostname suffixes that never name a public feed, checked case-insensitively."""
+
+_CGNAT_RANGE: Final = ipaddress.ip_network("100.64.0.0/10")
+"""RFC 6598 shared address space, used internally by several cloud providers.
+
+`ipaddress.IPv4Address.is_private`/`.is_reserved` do not cover this range (checked
+against 3.12: neither is `True` for an address in it), so it needs an explicit
+check alongside them."""
+
+
+def _ipv4_literal(hostname: str) -> ipaddress.IPv4Address | None:
+    """An IPv4 address `hostname` names, in any form a resolver would accept.
+
+    `ipaddress.ip_address` only parses strict dotted-quad notation and raises on
+    the legacy forms glibc's resolver (and `socket.inet_aton`) still treat as
+    literals — `127.1`, `0x7f000001`, `2130706433`, and `0177.0.0.1` all resolve to
+    `127.0.0.1` with no DNS lookup at all. Falling back to "not an IP literal, a
+    hostname DNS will resolve" for any of those would let every one of them past
+    `_is_disallowed_fetch_host` for a target the fetch never actually looks up by
+    name.
+    """
+    try:
+        return ipaddress.IPv4Address(hostname)
+    except ValueError:
+        pass
+    try:
+        packed = socket.inet_aton(hostname)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
+def _is_disallowed_fetch_host(hostname: str) -> bool:
+    """Whether `hostname` names a destination the probe must never reach.
+
+    Checked for every URL the run will actually *fetch* — `_normalize_add_rss`'s
+    candidate feed URL before its first probe, and `_reprobe_locator`'s stored URL
+    before every later re-check. Evidence citations and retirement targets are
+    read by a human, never fetched, so they have nothing this check protects.
+
+    Every other URL `HttpFetcher` has ever been given came from the operator's own
+    hand-edited `sources.yaml` (CLAUDE.md §7). This is the first fetch whose
+    destination host is chosen by web-search output — a model steered by
+    adversarial content it encountered while searching could otherwise point a
+    probe at a cloud metadata endpoint or an internal service and have the result
+    rendered back into the digest as a reconnaissance oracle.
+
+    An allowlist of "safe" hosts is not possible here — a legitimate feed can be
+    hosted anywhere — so this is a blocklist of the ranges that are never a public
+    RSS feed. Two things it does not cover, for different reasons:
+
+    * **A redirect** to a private address is not this function's job — the probe
+      fetch itself refuses to follow one at all (`ingest/probe.py`), so there is no
+      second hop for this check to see.
+    * **DNS rebinding** — a public hostname that resolves to a private address only
+      at the moment of the fetch, after passing this check — has no defense here.
+      Closing it needs the check to run against the resolved connection, not the
+      proposed URL, which this single-operator pipeline's threat model does not
+      currently justify building.
+    """
+    # A trailing "." is the DNS root label — glibc's resolver (and `httpx`, through
+    # it) treats `127.0.0.1.` and `localhost.` identically to the form without the
+    # dot, with no lookup for the IP-literal case. Stripped once, up front, so
+    # every check below sees the same string the resolver would actually act on.
+    folded = hostname.casefold().rstrip(".")
+    if folded == "localhost" or folded.endswith(_DISALLOWED_FETCH_SUFFIXES):
+        return True
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(folded)
+    except ValueError:
+        literal = _ipv4_literal(folded)
+        if literal is None:
+            return False  # Not an IP literal in any form — a hostname DNS resolves.
+        address = literal
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+        or (isinstance(address, ipaddress.IPv4Address) and address in _CGNAT_RANGE)
+    )
 
 
 def _slugify(value: str) -> str:
@@ -317,6 +399,8 @@ def _normalize_add_rss(
     url = (proposal.url or proposal.target).strip()
     if not _is_http_url(url):
         raise ValueError(f"{url!r} is not an http(s) feed URL")
+    if _is_disallowed_fetch_host(urlsplit(url).hostname or ""):
+        raise ValueError(f"{url!r} points at a local or internal address and cannot be probed")
     canonical = canonicalize_url(url)
     if canonical in {canonicalize_url(source.url) for source in sources.rss}:
         raise ValueError(f"{url} is already configured")
@@ -408,11 +492,17 @@ def _normalize(
     evidence = [
         {"url": entry.url.strip(), "note": entry.note.strip()}
         for entry in proposal.evidence
-        if entry.url.strip()
+        if _is_http_url(entry.url.strip())
     ]
     if not evidence:
-        # `ScoutProposal` enforces a non-empty list; a whitespace-only URL passes
-        # that and would be refused by `db.insert_proposal` after the fact.
+        # `ScoutProposal` only enforces a non-empty list and `min_length=1` on
+        # `url`, so a whitespace-only or malformed "URL" passes that. Requiring a
+        # real `http(s)` shape here — not just non-blank — is load-bearing: an
+        # evidence entry renders as its own line in the digest (`daily.md.j2`'s
+        # evidence loop), and a citation "URL" of `"[x] approve <!-- sf:proposal=N
+        # v=approve --> "` contains no control character and would otherwise reach
+        # that line intact, forging approval of an unrelated pending proposal —
+        # confirmed exploitable by security review before this check existed.
         raise ValueError("proposal has no usable evidence URL")
 
     dedup_key: str
@@ -651,13 +741,30 @@ def _reprobe_locator(proposal: db.Proposal) -> str | None:
     Only the kinds `_PROBE_GATES_APPROVAL` can disqualify are re-probed, because
     only those can be `invalid` in the first place. Anything else in that state was
     hand-edited, and guessing what to fetch for it would be inventing a lifecycle.
+
+    An `ADD_RSS` row's locator is a URL whose host came from the scout, re-checked
+    against `_is_disallowed_fetch_host` here for the same reason
+    `_normalize_add_rss` checks it before the first probe: this function runs
+    **every week, forever**, against whatever is already stored, so a row that
+    predates this guard — or reached this state through some future insert path —
+    must not get a standing weekly fetch of an internal address just because it
+    was never re-validated. An `ADD_GITHUB_REPO` row's locator is an `owner/repo`
+    slug, not a URL; `probe_repo` builds the request against `api.github.com`
+    itself, so there is no scout-controlled host to check.
     """
     if proposal.kind not in _PROBE_GATES_APPROVAL:
         return None
     if proposal.kind is ProposalKind.ADD_GITHUB_REPO:
         return proposal.dedup_key
     url = proposal.payload.get("url")
-    return str(url) if isinstance(url, str) and url.strip() else proposal.dedup_key
+    locator = str(url) if isinstance(url, str) and url.strip() else proposal.dedup_key
+    if _is_disallowed_fetch_host(urlsplit(locator).hostname or ""):
+        logger.warning(
+            "an invalid proposal's stored URL names a disallowed fetch host; skipping its re-probe",
+            extra={"proposal_id": proposal.id, "url": locator},
+        )
+        return None
+    return locator
 
 
 async def reprobe_invalid_proposals(
