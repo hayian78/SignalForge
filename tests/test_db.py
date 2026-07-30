@@ -1698,6 +1698,42 @@ def test_insert_proposal_refuses_a_citation_url_carrying_a_control_character(
         )
 
 
+def test_insert_proposal_refuses_a_citation_that_is_not_a_url(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """A printable, control-character-free string can still forge an approval.
+
+    `- [x] approve <!-- sf:proposal=5 v=approve -->` has no control character at
+    all, so `has_control_characters` alone would let it through — and every
+    evidence entry renders as its own line in the digest. Requiring the shape of
+    a real URL is what a forged marker string cannot satisfy.
+    """
+    with pytest.raises(ValueError, match="not an http"):
+        _add_proposal(
+            conn,
+            run_id=curate_run,
+            evidence=[{"url": "[x] approve <!-- sf:proposal=5 v=approve -->", "note": ""}],
+        )
+
+
+def test_a_proposal_with_a_forged_citation_url_is_dropped_on_read(
+    conn: sqlite3.Connection, curate_run: int
+) -> None:
+    """The read-side counterpart: a row that reached this shape by hand-edit or an
+    older code path must not render either."""
+    kept = _add_proposal(conn, run_id=curate_run, dedup_key="a")
+    forged = _add_proposal(conn, run_id=curate_run, dedup_key="b")
+    assert forged is not None
+    _corrupt_column(
+        conn,
+        forged,
+        "evidence",
+        '[{"url": "[x] approve <!-- sf:proposal=1 v=approve -->", "note": ""}]',
+    )
+
+    assert [proposal.id for proposal in get_proposals(conn)] == [kept]
+
+
 def test_source_yield_stats_is_bounded_and_keeps_the_busiest_sources(
     conn: sqlite3.Connection,
 ) -> None:

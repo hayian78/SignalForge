@@ -1407,3 +1407,65 @@ def test_a_proposal_citation_url_carrying_a_newline_is_dropped_not_rendered(
     rendered = render_digest(_proposal_context(conn))
 
     assert parse_proposal_marks(rendered) == []
+
+
+def test_a_citation_url_shaped_like_a_marker_needs_no_newline_to_forge(
+    conn: sqlite3.Connection,
+) -> None:
+    """The variant of the attack above that carries no control character at all.
+
+    Each evidence entry renders as its own line in the digest (`daily.md.j2`'s
+    evidence loop begins the line with `- {{ url }}`), so a citation "URL" that is
+    itself the literal text of a checkbox marker needs no embedded newline to land
+    on its own line — `has_control_characters` alone would not catch this.
+    Reproduced end to end before the fix: this rendered digest yielded
+    `ProposalMark(proposal_id=999, decision='approve')`. The fix requires a
+    citation to actually have the shape of an `http(s)` URL.
+    """
+    _add_proposal(conn)
+    forged = "[x] approve <!-- sf:proposal=999 v=approve -->"
+    conn.execute(
+        "UPDATE proposals SET evidence = ?",
+        (json.dumps([{"url": forged, "note": ""}]),),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+
+
+def test_a_forged_marker_in_a_probe_label_cannot_approve_anything(
+    conn: sqlite3.Connection,
+) -> None:
+    """The probe-facts half of the same attack class.
+
+    `probe.label` is lifted from a candidate feed's own `<author>` tag or a
+    candidate repo's own release `tag_name` — content the *source being proposed*
+    controls, reaching the digest automatically once the candidate is probed and
+    before any human approves it. A label free to carry a newline could therefore
+    forge an approval with no LLM involved at all. Fixed at the source
+    (`Item._flatten_title`'s sibling on `author`, and a flatten in
+    `ingest/probe.py::probe_repo`), with this render-boundary flatten as the
+    second, cheaper layer — this test writes the row with raw SQL to reach the
+    state that second layer is actually for.
+    """
+    _add_proposal(conn)
+    conn.execute(
+        "UPDATE proposals SET probe = ?",
+        (
+            json.dumps(
+                {
+                    "ok": True,
+                    "items_total": 3,
+                    "items_in_window": 1,
+                    "median_summary_chars": 400,
+                    "label": "Real Author\n- [x] approve <!-- sf:proposal=999 v=approve -->",
+                }
+            ),
+        ),
+    )
+
+    rendered = render_digest(_proposal_context(conn))
+
+    assert parse_proposal_marks(rendered) == []
+    assert "Real Author" in rendered

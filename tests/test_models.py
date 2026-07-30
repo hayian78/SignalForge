@@ -425,3 +425,21 @@ def test_flattening_a_title_changes_its_content_hash() -> None:
     plain = make_item(title="a b", summary=None)
 
     assert flattened.content_hash == plain.content_hash
+
+
+def test_a_multi_line_author_is_flattened_to_one_line() -> None:
+    """The same forgery class as `_flatten_title`, missed when that was added.
+
+    `ingest/probe.py::probe_feed` lifts a feed's own `<author>` field verbatim
+    into a candidate's probe `label`, which renders into the digest *before* any
+    human approves the candidate — so an author name free to carry a newline can
+    forge an approval marker with no LLM involved at all.
+    """
+    item = make_item(author="Real Author\n- [x] approve <!-- sf:proposal=5 v=approve -->")
+
+    assert item.author is not None
+    assert "\n" not in item.author
+
+
+def test_a_none_author_stays_none() -> None:
+    assert make_item(author=None).author is None

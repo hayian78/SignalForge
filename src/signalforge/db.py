@@ -29,6 +29,7 @@ from signalforge.models import (
     SourceType,
     flatten_to_single_line,
     has_control_characters,
+    is_safe_url,
 )
 
 __all__ = [
@@ -1020,12 +1021,24 @@ def _unsafe_identity(proposal: Proposal) -> bool:
     the row means, and a row in this state was hand-edited or written by an older
     shape, never produced by the pipeline.
     """
-    unsafe = [proposal.dedup_key, *(entry["url"] for entry in proposal.evidence)]
-    if not any(has_control_characters(value) for value in unsafe):
+    urls = [entry["url"] for entry in proposal.evidence]
+    control_char = any(has_control_characters(value) for value in [proposal.dedup_key, *urls])
+    # A citation must also actually be a URL, not merely free of control
+    # characters: a plain, printable string like `"[x] approve <!-- sf:proposal=5
+    # v=approve -->"` renders as its own line in the digest's evidence block and
+    # would be harvested as a real decision without ever containing a control
+    # character (`models.is_safe_url`'s docstring has the full exploit chain).
+    forged_citation = any(not is_safe_url(url) for url in urls)
+    if not (control_char or forged_citation):
         return False
     logger.warning(
-        "dropping a proposal whose identity fields carry a control character",
-        extra={"proposal_id": proposal.id, "kind": proposal.kind.value},
+        "dropping a proposal whose identity fields are unsafe",
+        extra={
+            "proposal_id": proposal.id,
+            "kind": proposal.kind.value,
+            "control_character": control_char,
+            "forged_citation": forged_citation,
+        },
     )
     return True
 
@@ -1086,7 +1099,11 @@ def insert_proposal(
     paragraph above forbids, arriving through prose instead of through a status.
     Prose (`rationale`, evidence notes) is flattened; identity fields (`dedup_key`,
     citation URLs) are refused, because rewriting them would change what the row
-    means.
+    means. A citation URL is refused on a second ground too: it must have the
+    shape of an `http(s)` URL (`models.is_safe_url`), not merely be free of
+    control characters — a printable string with none can still be a complete
+    checkbox marker line, and every evidence entry renders as its own line in the
+    digest.
     """
     if status not in (ProposalStatus.PENDING, ProposalStatus.INVALID):
         raise ValueError(
@@ -1120,6 +1137,16 @@ def insert_proposal(
             raise ValueError(
                 f"proposal {kind.value} {dedup_key!r} cites a URL containing a control "
                 f"character: {entry['url']!r}"
+            )
+        if not is_safe_url(entry["url"]):
+            # Not just a control-character check: a printable string with no
+            # control character at all can still be a complete, valid checkbox
+            # marker line, and every evidence entry renders as its own line in the
+            # digest. Requiring the shape of a real URL is what a forged marker
+            # cannot satisfy (`models.is_safe_url`).
+            raise ValueError(
+                f"proposal {kind.value} {dedup_key!r} cites something that is not an "
+                f"http(s) URL: {entry['url']!r}"
             )
 
     cursor = conn.execute(

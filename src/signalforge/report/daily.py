@@ -294,7 +294,10 @@ def _probe_summary(probe: dict[str, object] | None) -> str:
     if not probe:
         return ""
     if not probe.get("ok"):
-        reason = str(probe.get("error") or "could not be fetched")
+        # Flattened for the same reason `label` is below: `error` is exception text
+        # this module does not control the shape of, and it renders into the same
+        # digest line.
+        reason = flatten_to_single_line(str(probe.get("error") or "could not be fetched"))
         status = probe.get("status_code")
         return f"probe failed: {reason}" + (f" (HTTP {status})" if status else "")
 
@@ -307,7 +310,10 @@ def _probe_summary(probe: dict[str, object] | None) -> str:
         # Date only: the block is skimmed, and the hour a feed published is noise.
         parts.append(f"newest {str(newest)[:10]}")
     if label := probe.get("label"):
-        parts.append(f"latest by {label}")
+        # Flattened again here, deliberately — same reasoning as `rationale` below:
+        # the writer already flattens (`ingest/probe.py`), but this is the boundary
+        # where text becomes a line of a vault file a later harvest parses.
+        parts.append(f"latest by {flatten_to_single_line(str(label))}")
     return ", ".join(parts)
 
 
@@ -319,7 +325,10 @@ def _settled_note(proposal: Proposal, *, tz: tzinfo) -> str:
     """
     if proposal.status is ProposalStatus.INVALID:
         # No date: an `invalid` row was never decided, so there is nothing to date.
-        reason = str((proposal.probe or {}).get("error") or "failed validation")
+        # Flattened for the same reason `_probe_summary` flattens the same field.
+        reason = flatten_to_single_line(
+            str((proposal.probe or {}).get("error") or "failed validation")
+        )
         return f"not shown — {reason}"
     when = proposal.decided_at or proposal.applied_at
     stamp = f" {when.astimezone(tz).date().isoformat()}" if when is not None else ""

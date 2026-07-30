@@ -11,6 +11,7 @@ functions.
 from __future__ import annotations
 
 import hashlib
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Final
@@ -30,6 +31,7 @@ __all__ = [
     "compute_content_hash",
     "flatten_to_single_line",
     "has_control_characters",
+    "is_safe_url",
 ]
 
 
@@ -162,6 +164,35 @@ def flatten_to_single_line(text: str) -> str:
     """
     collapsed = " ".join(text.split())
     return "".join(char for char in collapsed if not has_control_characters(char))
+
+
+_URL_SAFE: Final = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")
+"""Every character RFC 3986 permits in a URI, and nothing else."""
+
+
+def is_safe_url(value: str) -> bool:
+    """Whether `value` is a syntactically well-formed `http(s)` URL.
+
+    The shape check behind refusing rather than repairing an identity field
+    (`has_control_characters`'s docstring, and `db.insert_proposal`): a citation
+    URL is rendered as its own line in a vault markdown file (`daily.md.j2`'s
+    evidence loop), so it must actually be a URL, not merely free of control
+    characters. A plain, printable string like `"[x] approve <!-- sf:proposal=5
+    v=approve -->"` contains no control character at all and would pass
+    `has_control_characters` while still being a complete, valid checkbox marker
+    line once rendered — `curate/approvals.py` would harvest it as a real
+    decision. Requiring an `http(s)` scheme and a hostname is what a forged
+    marker string cannot satisfy.
+
+    Also rejects a URL carrying an embedded `\\n`/`\\r`/`\\t`: `urlsplit` strips
+    those before parsing, so a URL smuggling a newline would otherwise validate
+    as well-formed while the stored string still holds it. The RFC 3986
+    character allowlist catches that before `urlsplit` ever sees the value.
+    """
+    if not _URL_SAFE.fullmatch(value):
+        return False
+    parts = urlsplit(value)
+    return parts.scheme in ("http", "https") and bool(parts.hostname)
 
 
 def _normalized_table(names: tuple[str, ...], *, label: str) -> tuple[str, ...]:
@@ -370,6 +401,18 @@ class Item(BaseModel):
         fingerprint the text actually held.
         """
         return flatten_to_single_line(value)
+
+    @field_validator("author", mode="after")
+    @classmethod
+    def _flatten_author(cls, value: str | None) -> str | None:
+        """Collapse an author name to a single line — the same control as `title`.
+
+        `ingest/probe.py::probe_feed` lifts this field verbatim into a candidate's
+        probe `label`, which renders into the digest before any human approves the
+        candidate. Missed when `_flatten_title` was added; same forgery class,
+        same fix, same reason (see `_flatten_title`).
+        """
+        return None if value is None else flatten_to_single_line(value)
 
     @field_validator("published_at", "fetched_at")
     @classmethod
