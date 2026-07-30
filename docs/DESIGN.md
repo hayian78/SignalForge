@@ -289,7 +289,7 @@ CREATE TABLE impact_assessments (
 -- Operations
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL,               -- ingest | score | digest | curate | daily | weekly | monthly
+    kind        TEXT NOT NULL,               -- ingest | score | curate | curate-apply | daily | weekly | monthly
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     status      TEXT,                        -- ok | partial | failed
@@ -448,7 +448,7 @@ deliberate choice they make; where it comes from is a fact about the world.
 
 ### The loop
 
-Weekly, `signalforge curate` runs four ordered stages:
+Weekly, `signalforge curate run` runs four ordered stages:
 
 1. **Gather (deterministic).** Per-source yield from `items` ⋈ `scores` ⋈ `feedback` over
    `curation.yield_window_days` — ingested, kept, killed, and highest feedback rung per
@@ -495,7 +495,10 @@ Weekly, `signalforge curate` runs four ordered stages:
    fresh facts the conflict would discard. Running it afterwards would fetch the same URL
    twice in one run and keep the same result.
 4. **Propose.** At most `curation.max_proposals_per_run` rows written to `proposals`,
-   each carrying a rationale and at least one evidence URL.
+   each carrying a rationale and at least one evidence URL. The run records its tokens
+   *and* its `server_tool_requests`, and `curate apply` gets a `runs.kind` of its own —
+   folding the free applier into the paid scout's kind would hide a scout that had
+   stopped running behind an apply that runs every morning.
 
    This is where model output becomes something that will edit the operator's config, so it
    is where meaning is checked rather than only shape. `llm.ScoutProposal` validates the
@@ -877,7 +880,9 @@ is what stops a newly-added source backfilling its history into one digest.
 
 ## 14. Scheduling & Operations
 
-- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate-apply→ingest→score→digest, 06:00), `signalforge curate` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning; the weekly scout runs before the brief so its proposals ride the next digest.
+- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
+
+The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.

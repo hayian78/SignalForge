@@ -52,6 +52,7 @@ __all__ = [
     "TRIAGE_BATCH_SIZE",
     "TRIAGE_MAX_TOKENS",
     "TRIAGE_MODEL",
+    "WEB_SEARCH_USD_PER_REQUEST",
     "LlmError",
     "ScoutEvidence",
     "ScoutProposal",
@@ -139,6 +140,14 @@ SCOUT_PROPOSE_TOOL_NAME: Final = "propose_source_changes"
 Public so `curate/prompts.py` can name it in the instructions without keeping a
 second copy of the string — the prompt telling the model to call a tool that does
 not exist is a silent, expensive failure."""
+
+WEB_SEARCH_USD_PER_REQUEST: Final = 0.01
+"""What one web search costs: $10 per 1,000 requests (DESIGN §8).
+
+Here because cost belongs to this module and nowhere else (CLAUDE.md §6), even
+though the only consumer is a `status` readout. Reached by the CLI through
+`curate.scout.search_spend_usd` rather than imported directly — `cli.py` does not
+import this module, deliberately."""
 
 SCOUT_MONTHLY_CEILING_USD: Final = 2.50
 """The agreed monthly budget for this feature, recorded next to the constants that

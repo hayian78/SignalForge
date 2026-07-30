@@ -145,21 +145,22 @@ hackernews:
 # --------------------------------------------------------------------------- #
 # Adaptive source curation (DESIGN §7.1) — meta-config, not a source.
 #
-# Configured now, wired when `curate` lands; editing these today has no effect.
-#
-# A weekly scout reads per-source yield from the stored corpus, searches the live
-# web for where attention has moved, and proposes edits to THIS file. Proposals
-# surface as tick-boxes at the foot of the next daily digest; approved ones are
-# applied by `curate apply` at the start of the following morning's run, before
-# ingest, so a feed approved yesterday is fetched today.
+# `signalforge curate run` (weekly) reads per-source yield from the stored corpus,
+# searches the live web for where attention has moved, and proposes edits to THIS
+# file. Proposals surface as tick-boxes at the foot of the next daily digest;
+# approved ones are applied by `signalforge curate apply` at the start of the
+# following morning's run, before ingest, so a feed approved yesterday is fetched
+# today. `signalforge curate list` and `curate decide <id> approve|reject --note`
+# are the terminal equivalents of the tick-boxes.
 #
 # Nothing here changes a source without a tick, and every applied change lands as
 # an uncommitted git diff on this file for review. `interests.yaml` is never
 # proposed against — what the operator cares about is a deliberate choice; where
 # it comes from is a fact about the world.
 #
-# Delete this block to turn the feature off; `curate` will say so and exit rather
-# than invent its own spend caps.
+# Delete this block to turn the feature off; `curate run` will say so and exit
+# rather than invent its own spend caps, and `curate apply` drops out of the daily
+# chain entirely.
 curation:
   # At most N proposals per run — one week cannot rewire the feed.
   max_proposals_per_run: 5
@@ -168,8 +169,7 @@ curation:
   # this caps the one line of curation spend that token counts don't show. Turn
   # this first if the *search* figure in `signalforge status` surprises you. Set
   # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
-  # beyond the one Opus call. (That figure arrives with the `curate` commands; the
-  # count is recorded from the first run either way.)
+  # beyond the one Opus call.
   #
   # Starts at 6, one below the 7 the budget affords. How many input tokens a search
   # actually drags into context cannot be measured from tests — the suite never calls

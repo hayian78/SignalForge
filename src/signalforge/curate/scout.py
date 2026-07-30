@@ -71,6 +71,7 @@ __all__ = [
     "persist_candidates",
     "reprobe_invalid_proposals",
     "scout_for_proposals",
+    "search_spend_usd",
 ]
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,19 @@ against everything else in the feed.
 The band is drawn around the identity element, a little wider than the 1.0-1.3 the
 operator's own config uses, so a genuine "trust this author" or "read but discount"
 suggestion still survives the clamp intact."""
+
+
+def search_spend_usd(requests: int) -> float:
+    """What `requests` web searches cost, in dollars.
+
+    A pass-through to `llm.WEB_SEARCH_USD_PER_REQUEST`, and the indirection is the
+    point: `cli.py` states that it never imports `llm.py` (so the Anthropic SDK stays
+    out of the CLI's direct dependencies), but `status` has to turn a search count
+    into a dollar figure or the $30 alarm cannot see the whole bill (DESIGN §8).
+    `curate/` already imports `llm.py` legitimately, so it carries the number across
+    rather than the price being copied into a second module where it would drift.
+    """
+    return requests * llm.WEB_SEARCH_USD_PER_REQUEST
 
 
 def _error(target: str, message: str) -> dict[str, str]:
