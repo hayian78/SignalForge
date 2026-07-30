@@ -482,6 +482,12 @@ reject while reading in Obsidian. The next morning's `daily` run harvests those 
 the vault markdown (read-only, before the render overwrites it) and applies the approved ones
 **before ingest**, so a feed approved yesterday is fetched this morning.
 
+A pending proposal follows forward into every digest until it is decided, so it cannot scroll
+out of sight. Once decided it keeps rendering as a settled one-line note for
+`curation.settled_display_days`, counted from the day it first surfaced — re-reading an old
+digest should still show what was approved that week, rather than silently losing the record
+the moment the render overwrites the file.
+
 Three constraints make this safe:
 
 - **Nothing changes without a tick.** There is no auto-apply path, and no confidence

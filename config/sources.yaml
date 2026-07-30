@@ -141,3 +141,40 @@ arxiv:
 # policy terms.
 hackernews:
   keywords: [llm, claude, gemini, openai, anthropic, reasoning, agent, agi, policy]
+
+# --------------------------------------------------------------------------- #
+# Adaptive source curation (DESIGN §7.1) — meta-config, not a source.
+#
+# Configured now, wired when `curate` lands; editing these today has no effect.
+#
+# A weekly scout reads per-source yield from the stored corpus, searches the live
+# web for where attention has moved, and proposes edits to THIS file. Proposals
+# surface as tick-boxes at the foot of the next daily digest; approved ones are
+# applied by `curate apply` at the start of the following morning's run, before
+# ingest, so a feed approved yesterday is fetched today.
+#
+# Nothing here changes a source without a tick, and every applied change lands as
+# an uncommitted git diff on this file for review. `interests.yaml` is never
+# proposed against — what the operator cares about is a deliberate choice; where
+# it comes from is a fact about the world.
+#
+# Delete this block to turn the feature off; `curate` will say so and exit rather
+# than invent its own spend caps.
+curation:
+  # At most N proposals per run — one week cannot rewire the feed.
+  max_proposals_per_run: 5
+
+  # The money knob: web search is billed per call, not per token (DESIGN §8), so
+  # this caps the one line of curation spend that token counts don't show. Turn
+  # this first if the *search* figure in `signalforge status` surprises you. Set
+  # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
+  # beyond the one Opus call.
+  max_searches_per_run: 12
+
+  # Lookback for the yield stats that justify a retirement.
+  yield_window_days: 30
+
+  # How long a decided proposal keeps rendering as a settled one-liner, counted
+  # from the day it first surfaced, so re-reading an old digest still shows what
+  # was approved that week.
+  settled_display_days: 14
