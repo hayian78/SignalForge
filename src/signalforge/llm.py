@@ -508,6 +508,16 @@ class ScoutProposal(BaseModel):
     shape is checked before it can reach `db.insert_proposal`. `kind` is validated
     against `ProposalKind` — an invented kind is a rejected proposal, never a new
     edit shape the applier has never heard of.
+
+    **There is deliberately no `weight` field.** An added feed lands at
+    `RssSource.weight`'s identity element of 1.0, which is inert rather than tuned.
+    A scout-chosen multiplier would be a relevance-tuning decision made outside the
+    system that owns relevance tuning — `interests.yaml` plus `mark` feedback
+    (CLAUDE.md §4), with DESIGN §11's ±0.1/month cap and Phase 2's `tune` job — and
+    it would arrive bundled into a checkbox the operator ticks to mean "add this
+    source". The applier can still write a weight; nothing proposes one. An operator
+    who wants a trusted author weighted up edits the line the same way they always
+    have, which is a thing they can see themselves doing.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -522,7 +532,8 @@ class ScoutProposal(BaseModel):
     """Proposed `sources.yaml` id for an added RSS feed. Absent for other kinds."""
 
     url: str | None = None
-    weight: float | None = Field(default=None, gt=0)
+    """The feed URL for an added RSS source, when `target` is not itself the URL."""
+
     rationale: str = Field(min_length=1)
     evidence: list[ScoutEvidence] = Field(min_length=1)
     """Non-empty by validation. `db.insert_proposal` refuses an uncited proposal,
@@ -605,13 +616,6 @@ def _propose_tool_schema(max_proposals: int) -> ToolParam:
                                 ),
                             },
                             "url": {"type": "string"},
-                            "weight": {
-                                "type": "number",
-                                "description": (
-                                    "Score multiplier for a trusted author. Omit unless "
-                                    "you have a specific reason; 1.0 is the default."
-                                ),
-                            },
                             "rationale": {
                                 "type": "string",
                                 "description": (

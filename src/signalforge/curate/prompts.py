@@ -171,12 +171,27 @@ def _format_rejected(rejected: list[RejectedProposal]) -> str:
     return "\n".join(lines)
 
 
+def _format_titles(titles: list[str]) -> str:
+    """The kept titles, one per line.
+
+    Load-bearing rather than decorative: `gather._outbound_domains` can only see
+    hrefs where markup survived ingest, which excludes every RSS source, so for
+    most of the corpus these titles are the *only* evidence of what the operator
+    actually values. A scout given yield numbers alone knows which sources are
+    quiet but not what subject matter earned a mark.
+    """
+    if not titles:
+        return "(nothing kept in the window yet)"
+    return "\n".join(f"- {title}" for title in titles)
+
+
 def build_scout_user_prompt(
     *,
     sources: SourcesConfig,
     yield_rows: list[SourceYield],
     feedback_by_source: dict[str, dict[str, int]],
     outbound_domains: list[tuple[str, int]],
+    kept_titles: list[str],
     rejected: list[RejectedProposal],
     window_days: int,
     max_proposals: int,
@@ -209,6 +224,14 @@ second-hand.
 
 {domains}
 
+# What the operator's pipeline actually surfaced and they kept
+
+The highest-ranked items that survived triage in the window. This is the concrete
+picture of what earns a place in their reading — use it to judge whether a
+candidate publishes this kind of material, not just whether it is well regarded.
+
+{_format_titles(kept_titles)}
+
 # Current inventory (do not propose adding anything already here)
 
 {_format_inventory(sources)}
@@ -225,21 +248,21 @@ better. An empty list is a valid answer for a quiet week.
 """
 
 
-def proposal_payload(
-    *, source_id: str | None, url: str | None, weight: float | None, target: str
-) -> dict[str, object]:
+def proposal_payload(*, source_id: str | None, url: str | None, target: str) -> dict[str, object]:
     """The `proposals.payload` JSON for one accepted scout proposal.
 
     Carries `prompt_version` so a suggestion can be traced back to the wording
     that produced it without adding a column for it.
+
+    No `weight` key: the scout does not choose scoring multipliers, so an added
+    feed lands at the identity element and stays there until the operator moves it
+    by hand. See `llm.ScoutProposal` for why.
     """
     payload: dict[str, object] = {"target": target, "prompt_version": SCOUT_PROMPT_VERSION}
     if source_id:
         payload["id"] = source_id
     if url:
         payload["url"] = url
-    if weight is not None:
-        payload["weight"] = weight
     return payload
 
 

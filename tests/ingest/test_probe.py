@@ -290,7 +290,7 @@ async def test_probe_feed_recovers_what_it_can_from_a_malformed_feed(
     )
 
     # Pin the measurement. `assert probe.ok is (probe.items_total > 0)` reads like
-    # coverage of partial recovery but holds for every possible input — `_failed`
+    # coverage of partial recovery but holds for every possible input — `failed_probe`
     # always sets items_total=0 and the success path always has entries.
     assert probe.ok is True
     assert probe.items_total == 1, "the capture damages the feed after its first entry"

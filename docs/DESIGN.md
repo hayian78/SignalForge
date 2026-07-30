@@ -487,8 +487,26 @@ Weekly, `signalforge curate` runs four ordered stages:
    cost of re-probing is one HTTP request per invalid row per week; the cost of skipping is
    permanent, because the unique index means the scout can never re-suggest the candidate
    itself.
+
+   **The re-probe of existing `invalid` rows runs before the scout call, not after.** It
+   costs no tokens — HTTP and DB only — and running it first means a candidate the scout
+   re-proposes this week has already been refreshed and, if it now fetches, reopened. The
+   re-proposal then hits `ux_proposals_kind_key` and does nothing, instead of arriving with
+   fresh facts the conflict would discard. Running it afterwards would fetch the same URL
+   twice in one run and keep the same result.
 4. **Propose.** At most `curation.max_proposals_per_run` rows written to `proposals`,
    each carrying a rationale and at least one evidence URL.
+
+   This is where model output becomes something that will edit the operator's config, so it
+   is where meaning is checked rather than only shape. `llm.ScoutProposal` validates the
+   shape; `curate/scout.py` validates the proposal against the config it would land in: a
+   feed URL is an http(s) URL, a retirement names a source that actually exists (resolved to
+   the config's *own* spelling, because the applier matches lines literally), an addition is
+   not something already configured, a keyword cannot contain a character that would corrupt
+   the flow-style list it is spliced into. Each check exists because failing it produces
+   either a checkbox that does nothing when ticked or an edit the safety net reverts — both
+   of which spend the operator's attention and discard their decision. A proposal that fails
+   any of them is dropped with its reason recorded to `runs.errors`, never stored.
 
 ### The human gate
 
@@ -520,8 +538,14 @@ Three constraints make this safe:
   next run duplicating it — a duplicated config block is NEVER rule 4 at the file level, and
   the status guard in `db.py` cannot prevent it.
 - **Every applied change is a reviewable git diff** on `sources.yaml`, uncommitted, same
-  promise as §11's proposed tuning nudges. Weight *nudges* stay out of scope — those are
-  Phase 2's `tune`.
+  promise as §11's proposed tuning nudges.
+- **The scout cannot propose a weight.** There is no `weight` field in its tool schema, so
+  an added feed lands at `RssSource.weight`'s identity element of 1.0. A model-chosen
+  multiplier would be a relevance-tuning decision made outside the system that owns
+  relevance tuning (§11's ±0.1/month cap, Phase 2's `tune`), and it would arrive bundled
+  into a checkbox the operator ticks to mean "add this source". An operator who wants a
+  trusted author weighted up edits the line themselves, which is a thing they can see
+  themselves doing.
 
 ### Boundary exception
 

@@ -66,6 +66,7 @@ from signalforge.ingest.rss import parse_feed
 __all__ = [
     "PROBE_SOURCE_ID",
     "SourceProbe",
+    "failed_probe",
     "probe_feed",
     "probe_repo",
 ]
@@ -169,8 +170,13 @@ class SourceProbe:
         return facts
 
 
-def _failed(message: str, *, status_code: int | None = None) -> SourceProbe:
+def failed_probe(message: str, *, status_code: int | None = None) -> SourceProbe:
     """A probe that could not evaluate its candidate.
+
+    Public because the caller driving a batch of probes needs the same shape for
+    the one failure this module cannot produce: a bug escaping `probe_feed` or
+    `probe_repo` themselves. Constructing `SourceProbe`'s eight fields by hand at
+    that call site would be a second definition of "failed" waiting to drift.
 
     Note what is *not* here: a retry, a fallback URL, or a guess. A probe failure
     is a fact to record and re-check next week (`db.reopen_proposal` covers the
@@ -210,7 +216,7 @@ async def probe_feed(
         response = await fetcher.get(url, source_id=PROBE_SOURCE_ID, conditional=False)
     except FetchError as exc:
         logger.info("feed probe failed", extra={"url": url, "error": str(exc)})
-        return _failed(str(exc), status_code=exc.status_code)
+        return failed_probe(str(exc), status_code=exc.status_code)
     except Exception as exc:  # noqa: BLE001 - one candidate never kills a curate run
         # `HttpFetcher.get` wraps transport errors and bad statuses, but not every
         # `httpx.HTTPError`: a redirect loop raises `TooManyRedirects`, which is
@@ -219,10 +225,10 @@ async def probe_feed(
         # redirect-loop routinely, so anything escaping here would abort a run
         # partway through a batch of candidates (CLAUDE.md §7, NEVER rule 12).
         logger.warning("feed probe raised", extra={"url": url, "error": str(exc)})
-        return _failed(f"{type(exc).__name__}: {exc}")
+        return failed_probe(f"{type(exc).__name__}: {exc}")
 
     if response is None:  # pragma: no cover - only a non-compliant server does this
-        return _failed("server returned 304 to an unconditional request")
+        return failed_probe("server returned 304 to an unconditional request")
 
     items = parse_feed(
         response.content,
@@ -234,7 +240,7 @@ async def probe_feed(
         # Parsed cleanly to nothing, or was never a feed. Either way there is
         # nothing here to ingest, which is the one content-shaped call this
         # module does make — it needs no threshold.
-        return _failed("no parseable entries", status_code=response.status_code)
+        return failed_probe("no parseable entries", status_code=response.status_code)
 
     fresh = filter_by_age(items, max_age_days=max_item_age_days, now=stamp)
     published = [item.published_at for item in items if item.published_at is not None]
@@ -300,22 +306,22 @@ async def probe_repo(
         )
     except FetchError as exc:
         logger.info("repo probe failed", extra={"slug": slug, "error": str(exc)})
-        return _failed(str(exc), status_code=exc.status_code)
+        return failed_probe(str(exc), status_code=exc.status_code)
     except Exception as exc:  # noqa: BLE001 - one candidate never kills a curate run
         # Same reasoning as `probe_feed`: an unwrapped `httpx.HTTPError` escaping
         # here would abort a run midway through its candidates.
         logger.warning("repo probe raised", extra={"slug": slug, "error": str(exc)})
-        return _failed(f"{type(exc).__name__}: {exc}")
+        return failed_probe(f"{type(exc).__name__}: {exc}")
 
     if response is None:  # pragma: no cover - only a non-compliant server does this
-        return _failed("server returned 304 to an unconditional request")
+        return failed_probe("server returned 304 to an unconditional request")
 
     try:
         payload = json.loads(response.text)
     except json.JSONDecodeError as exc:
-        return _failed(f"unparseable JSON: {exc}", status_code=response.status_code)
+        return failed_probe(f"unparseable JSON: {exc}", status_code=response.status_code)
     if not isinstance(payload, list):
-        return _failed("releases response was not a list", status_code=response.status_code)
+        return failed_probe("releases response was not a list", status_code=response.status_code)
 
     # Drafts are skipped for parity with `github.py::_releases_to_items`, which
     # also skips them. Without this, an authenticated probe would measure releases
@@ -323,7 +329,7 @@ async def probe_repo(
     # thing it is validating.
     releases = [entry for entry in payload if isinstance(entry, dict) and not entry.get("draft")]
     if not releases:
-        return _failed("no published releases", status_code=response.status_code)
+        return failed_probe("no published releases", status_code=response.status_code)
 
     # Timestamp each release once and carry it alongside its entry: it is needed
     # three times below, and re-parsing inside a `max` key was easy to read as
