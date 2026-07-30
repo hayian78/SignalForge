@@ -380,6 +380,121 @@ def test_a_target_present_in_config_but_unlocatable_in_text_raises(
         )
 
 
+def test_adding_a_feed_whose_id_is_taken_by_a_different_feed_raises(
+    repo_config_dir: Path,
+) -> None:
+    """An id collision is not an already-applied edit, and must not read as one.
+
+    The two look identical from the outside — the id is in the config either way —
+    but they mean opposite things. `existing.url` already configured means the work
+    is done; a *different* feed holding the id means the operator's approved
+    addition has nowhere to land. Returning None for the second marks the proposal
+    `applied` with the file untouched and the feed never added.
+    """
+    current = load_sources(repo_config_dir)
+    existing = current.rss[0]
+
+    with pytest.raises(ValueError, match="already uses"):
+        apply_to_text(
+            (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+            make_proposal(
+                dedup_key="https://brand-new.example.com/feed",
+                payload={"id": existing.id, "url": "https://brand-new.example.com/feed"},
+            ),
+            today=TODAY,
+            current=current,
+        )
+
+
+def test_retiring_a_repo_whose_case_differs_from_the_config_still_retires_it(
+    repo_config_dir: Path,
+) -> None:
+    """GitHub slugs are case-insensitive; a literal `in` check is not.
+
+    `OpenHands/OpenHands` proposed as `openhands/openhands` used to miss the
+    membership check, return None, and be recorded as applied with the watch still
+    in place — the silent discard this module's docstring is about.
+    """
+    current = load_sources(repo_config_dir)
+    configured = current.github.releases[0] if current.github else ""
+    assert configured, "the shipped config must have at least one release watch"
+
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=9,
+            kind=ProposalKind.RETIRE_GITHUB_REPO,
+            dedup_key=configured.upper(),
+            payload={},
+        ),
+        today=TODAY,
+        current=current,
+    )
+
+    assert result is not None
+    assert f"    # - {configured}" in result
+
+
+def test_adding_a_repo_that_differs_only_in_case_is_a_no_op(repo_config_dir: Path) -> None:
+    """The same repo must not be watched twice under two spellings (NEVER rule 4)."""
+    current = load_sources(repo_config_dir)
+    configured = current.github.releases[0] if current.github else ""
+
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=10,
+            kind=ProposalKind.ADD_GITHUB_REPO,
+            dedup_key=configured.upper(),
+            payload={},
+        ),
+        today=TODAY,
+        current=current,
+    )
+
+    assert result is None
+
+
+def test_adding_an_hn_keyword_that_is_already_present_is_a_no_op(repo_config_dir: Path) -> None:
+    """The dual-write recovery path for the inline-list kinds.
+
+    A crash between writing the YAML and flipping the row to `applied` leaves this
+    exact state. Without a membership check the keyword kinds fell through to the
+    "present in config but unlocatable" error, so recovery reported a file-shape
+    failure for a file that was already correct.
+    """
+    current = load_sources(repo_config_dir)
+    keyword = current.hackernews.keywords[0] if current.hackernews else ""
+    assert keyword, "the shipped config must have at least one HN keyword"
+
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=11, kind=ProposalKind.ADD_HN_KEYWORD, dedup_key=keyword, payload={}
+        ),
+        today=TODAY,
+        current=current,
+    )
+
+    assert result is None
+
+
+def test_removing_an_hn_keyword_that_is_already_gone_is_a_no_op(repo_config_dir: Path) -> None:
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(
+            proposal_id=12,
+            kind=ProposalKind.REMOVE_HN_KEYWORD,
+            dedup_key="never-a-keyword",
+            payload={},
+        ),
+        today=TODAY,
+        current=load_sources(repo_config_dir),
+    )
+
+    assert result is None
+
+
 def test_adding_a_feed_with_no_source_id_raises(repo_config_dir: Path) -> None:
     with pytest.raises(ValueError, match="no source id"):
         apply_to_text(

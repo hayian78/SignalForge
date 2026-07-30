@@ -118,6 +118,19 @@ def _line_indent(line: str) -> int:
     return len(line) - len(line.lstrip())
 
 
+def _match_casefold(value: str, configured: list[str]) -> str | None:
+    """The configured entry equal to `value` ignoring case, or None.
+
+    Membership has to be case-insensitive and the text edit has to be exact, and
+    those are not the same string. Comparing case-sensitively lets a proposal for
+    `owner/Repo` miss the `owner/repo` already in the file — which `apply_to_text`
+    would read as "already retired", mark the row applied, and change nothing.
+    Returning the config's own spelling makes the later literal match succeed.
+    """
+    folded = value.casefold()
+    return next((entry for entry in configured if entry.casefold() == folded), None)
+
+
 def _block_bounds(lines: list[str], header: str) -> tuple[int, int] | None:
     """`(start, end)` line indices of the block introduced by `header`.
 
@@ -296,10 +309,19 @@ def apply_to_text(
             source_id = str(payload.get("id") or "")
             if not source_id:
                 raise ValueError(f"proposal {proposal.id} has no source id to add")
-            existing_ids = {source.id for source in current.rss}
-            existing_urls = {canonicalize_url(source.url) for source in current.rss}
-            if source_id in existing_ids or canonicalize_url(url) in existing_urls:
+            if canonicalize_url(url) in {canonicalize_url(source.url) for source in current.rss}:
+                # The feed itself is already configured — genuinely already applied.
                 return None
+            if source_id.casefold() in {source.id.casefold() for source in current.rss}:
+                # A *different* feed holds the id this proposal wants. Reading that
+                # as "already applied" would mark the row applied and discard the
+                # operator's approval with the file untouched, so it is an error.
+                # It can only happen when the config changed between the proposal
+                # and the apply, which is rare and worth a human's attention.
+                raise ValueError(
+                    f"proposal {proposal.id} wants the source id {source_id!r}, which "
+                    "another feed already uses; rename it in the proposal or the config"
+                )
             weight = payload.get("weight")
             result = _append_to_block(
                 lines,
@@ -313,14 +335,21 @@ def apply_to_text(
 
         case ProposalKind.RETIRE_RSS:
             source_id = str(payload.get("id") or target)
-            if source_id not in {source.id for source in current.rss}:
+            # Resolve to the config's own spelling before matching lines: the text
+            # edit below is literal, so a case difference between the proposal and
+            # the file would otherwise fail to find an entry that is plainly there.
+            configured = _match_casefold(source_id, [source.id for source in current.rss])
+            if configured is None:
                 return None
-            result = _comment_out_rss_entry(lines, source_id, comment)
+            result = _comment_out_rss_entry(lines, configured, comment)
 
         case ProposalKind.ADD_GITHUB_REPO:
             if current.github is None:
                 raise ValueError("cannot add a release watch: sources.yaml has no github block")
-            if target in current.github.releases:
+            # Case-insensitive because GitHub slugs are: appending `owner/Repo`
+            # beside an existing `owner/repo` would create a second release watch
+            # over the same repository, which is NEVER rule 4 at the file level.
+            if _match_casefold(target, current.github.releases) is not None:
                 return None
             result = _append_to_block(
                 lines,
@@ -331,21 +360,26 @@ def apply_to_text(
             )
 
         case ProposalKind.RETIRE_GITHUB_REPO:
-            if current.github is None or target not in current.github.releases:
+            if current.github is None:
                 return None
-            result = _comment_out_list_item(lines, "  releases:", target, comment, indent=4)
+            configured = _match_casefold(target, current.github.releases)
+            if configured is None:
+                return None
+            result = _comment_out_list_item(lines, "  releases:", configured, comment, indent=4)
 
-        case ProposalKind.ADD_HN_KEYWORD | ProposalKind.REMOVE_HN_KEYWORD:
+        case ProposalKind.ADD_HN_KEYWORD:
             if current.hackernews is None:
                 raise ValueError("cannot edit hn keywords: sources.yaml has no hackernews block")
-            adding = proposal.kind is ProposalKind.ADD_HN_KEYWORD
-            result = _edit_inline_list(
-                lines,
-                "keywords",
-                add=target if adding else None,
-                remove=None if adding else target,
-                comment=comment,
-            )
+            if target in current.hackernews.keywords:
+                return None
+            result = _edit_inline_list(lines, "keywords", add=target, remove=None, comment=comment)
+
+        case ProposalKind.REMOVE_HN_KEYWORD:
+            if current.hackernews is None:
+                raise ValueError("cannot edit hn keywords: sources.yaml has no hackernews block")
+            if target not in current.hackernews.keywords:
+                return None
+            result = _edit_inline_list(lines, "keywords", add=None, remove=target, comment=comment)
 
         case ProposalKind.ADD_ARXIV_KEYWORD:
             if current.arxiv is None:
