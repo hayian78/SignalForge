@@ -5,9 +5,12 @@ Phase 0 surface, and deliberately no more (NEVER rule 15):
 * `ingest` — fetch every configured source, persist the items, close a `runs` row.
 * `score` — triage/score unscored items via `score/` (DESIGN §8).
 * `digest` — assemble the day's markdown digest from scored items (DESIGN §13).
-* `daily` — `ingest` → `score` → `digest` in sequence, the cron entry (DESIGN §14).
-* `status` — last-run health, per-source freshness, month-to-date token spend
-  (DESIGN §14).
+* `curate run|apply|list|decide|reopen` — adaptive source curation (DESIGN §7.1):
+  propose `sources.yaml` changes, review them in the digest, apply the approved.
+  `run` is the only command in this CLI that spends money on being typed.
+* `daily` — `curate apply` → `ingest` → `score` → `digest`, the cron entry (DESIGN §14).
+* `status` — last-run health, per-source freshness, month-to-date token and
+  web-search spend (DESIGN §14).
 
 LLM work stays behind the `score/` boundary: this module drives the pipeline but
 must never import `llm.py` directly (NEVER rule 1 — `anthropic` lives in `llm.py`).
@@ -122,6 +125,18 @@ RUN_KIND_CURATE_APPLY: Final = "curate-apply"
 call and the other edits a file for free, and `status` shows the last run of each
 kind. Folding them together would hide a scout that has stopped running behind an
 apply that runs every morning."""
+
+_MIN_CURATE_INTERVAL_DAYS: Final = 6
+"""How recently a `curate` run may have happened before another is refused.
+
+A spend backstop, not a schedule: `curate run` is the one command here that costs
+money on being typed, and nothing else stops it running daily. The unique index
+prevents a re-run *storing* duplicates and does nothing about the call being billed
+again — wired into `daily` by mistake, that is ~$7/month expected against a $2.50
+budget for this feature. 6 rather than 7 so a weekly cron that drifts an hour is
+never refused. `--force` overrides it, which is what an operator tuning the prompt
+wants. In code rather than YAML for the same reason `SCOUT_MAX_SEARCHES_CEILING` is
+(CLAUDE.md §6): cost limits are this project's to set, not a knob to tune."""
 
 _RUN_LEVEL_SOURCE_ID: Final = "*"
 """`runs.errors[].source_id` for a failure that belongs to the run, not a source."""
@@ -890,6 +905,23 @@ def _render_proposal_preview(candidates: list[Candidate]) -> None:
             console.print(f"  [dim]- {entry['url']}[/dim]")
 
 
+def _too_soon(conn: sqlite3.Connection, *, now: datetime) -> int | None:
+    """Days since the last `curate` run, if that is inside the minimum interval.
+
+    Reads only the `curate` kind. `curate-apply` runs every morning and costs
+    nothing, so counting it would refuse every scout run forever — which is one of
+    the reasons the two have separate kinds.
+    """
+    row = conn.execute(
+        "SELECT MAX(started_at) AS latest FROM runs WHERE kind = ?", (RUN_KIND_CURATE,)
+    ).fetchone()
+    latest = _parse_iso(row["latest"] if row else None)
+    if latest is None:
+        return None
+    days = (now - latest).days
+    return days if days < _MIN_CURATE_INTERVAL_DAYS else None
+
+
 @curate_app.command("run")
 def curate_run(
     config_dir: Annotated[Path, typer.Option("--config-dir")] = DEFAULT_CONFIG_DIR,
@@ -905,6 +937,10 @@ def curate_run(
     ] = None,
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Print the proposals; write none of them.")
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Run even if the last scout run was days ago, not a week."),
     ] = False,
 ) -> None:
     """Run the weekly source scout (DESIGN §7.1, cron Sunday).
@@ -923,6 +959,11 @@ def curate_run(
 
     Proposals surface on tomorrow's digest by default: this command runs after the
     morning's digest has already been written, so today's is gone.
+
+    Refuses to run twice inside `_MIN_CURATE_INTERVAL_DAYS` unless `--force`, because
+    nothing else stops a weekly command being run daily and each run is billed
+    whether or not its proposals are new. `--dry-run` is guarded too: it spends the
+    same money.
     """
     sources, curation = _curation_or_exit(config_dir)
     interests = _load_interests_or_exit(config_dir)
@@ -935,6 +976,13 @@ def curate_run(
     )
 
     with connection(db) as conn:
+        if not force and (days := _too_soon(conn, now=now)) is not None:
+            err_console.print(
+                f"[yellow]too soon[/yellow]: the scout last ran {days} day(s) ago and this "
+                f"is a weekly job. Every run is billed whether or not its proposals are "
+                f"new, so pass --force if you mean it."
+            )
+            raise typer.Exit(code=1)
         run_id = start_run(conn, RUN_KIND_CURATE, started_at=now)
         errors: list[dict[str, str]] = []
         spent = ScoutOutcome()
@@ -986,7 +1034,10 @@ def curate_run(
                     f"They surface in the {resolved_surface.isoformat()} digest."
                 )
             status_value = "partial" if errors else "ok"
-        except Exception as exc:
+        except BaseException as exc:
+            # `BaseException`, matching `ingest`/`score`: a Ctrl-C'd run should still
+            # close its row *with a reason*, not just close it. Re-raised, so the
+            # interrupt still stops the process.
             logger.exception("curate run failed")
             errors.append(_run_level_error(exc))
             raise
@@ -1070,7 +1121,8 @@ def curate_apply(
             elif not outcome.changes:
                 console.print("[dim]nothing approved to apply.[/dim]")
             status_value = "partial" if errors else "ok"
-        except Exception as exc:
+        except BaseException as exc:
+            # See `curate_run` — a row closed with no reason is a row that lies.
             logger.exception("curate apply failed")
             errors.append(_run_level_error(exc))
             raise
@@ -1233,22 +1285,31 @@ def daily(
     `curate apply` runs first and only when `sources.yaml` has a `curation:` block:
     applying yesterday's approvals before ingest is what lets a feed approved in
     last night's digest be fetched this morning. Its failure is isolated like every
-    other step's — a broken applier costs the day's approvals, not the day's digest.
+    other step's — a broken applier costs the day's approvals, not the day's digest,
+    and a `sources.yaml` that does not parse costs only the steps that read it.
     """
     worst_exit = 0
 
+    def apply_approvals() -> None:
+        """`curate apply`, but only when the feature is configured.
+
+        The config load lives **inside** this closure, not above the loop. Reading it
+        outside would make a `ConfigError` in `sources.yaml` abort `daily` before any
+        step ran and before any `runs` row existed — no isolation, and no record that
+        6am happened at all (CLAUDE.md §3, §7). `sources.yaml` is a file the design
+        expects to be hand-edited, so a typo in it must cost the steps that need it,
+        not the whole morning: `score` needs only `interests.yaml` and should still
+        clear its backlog.
+        """
+        if _load_sources_or_exit(config_dir).curation is None:
+            # An operator who has not enabled curation should see no trace of it.
+            return
+        curate_apply(config_dir=config_dir, db=db, vault_dir=vault_dir)
+
     # `curate apply` leads so a source approved in yesterday's digest is fetched by
-    # this morning's ingest (DESIGN §7.1). Skipped entirely when the feature is off,
-    # rather than running and reporting nothing — an operator who has not enabled
-    # curation should see no trace of it in their daily output.
-    curation_enabled = _load_sources_or_exit(config_dir).curation is not None
-    apply_step: tuple[Callable[[], None], ...] = (
-        (lambda: curate_apply(config_dir=config_dir, db=db, vault_dir=vault_dir),)
-        if curation_enabled
-        else ()
-    )
+    # this morning's ingest (DESIGN §7.1).
     steps: tuple[Callable[[], None], ...] = (
-        *apply_step,
+        apply_approvals,
         lambda: ingest(
             config_dir=config_dir,
             db=db,

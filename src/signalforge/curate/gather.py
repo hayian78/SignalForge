@@ -77,6 +77,15 @@ _OUTBOUND_DOMAIN_LIMIT: Final = 15
 reasoning as the item limit: a long tail of once-seen domains is noise the scout
 would have to read past."""
 
+_YIELD_ROW_LIMIT: Final = 60
+"""How many per-source yield rows reach the prompt, busiest first.
+
+Comfortably above the ~20 sources the shipped config produces, because this is a
+backstop rather than a tuning knob — it exists so the bound is *declared* rather
+than emerging from how fast the operator approves new sources. A source with nothing
+in the window is the least informative row in the table, so ordering by volume means
+the cut, if it ever bites, drops the rows worth least."""
+
 _REJECTED_PROMPT_LIMIT: Final = 40
 """How many past rejections reach the prompt, most recent first.
 
@@ -262,7 +271,7 @@ def gather_evidence(
     stamp = now or datetime.now(UTC)
     since = stamp - timedelta(days=window_days)
 
-    yield_rows = db.source_yield_stats(conn, since=since)
+    yield_rows = db.source_yield_stats(conn, since=since, limit=_YIELD_ROW_LIMIT)
     verdicts = db.feedback_verdicts_since(conn, since=since)
     kept = db.kept_items(conn, since=since, limit=_KEPT_ITEM_PROMPT_LIMIT)
 

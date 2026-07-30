@@ -23,8 +23,9 @@ from typer.testing import CliRunner, Result
 from signalforge import llm
 from signalforge.cli import app
 from signalforge.curate.approvals import proposal_marker
-from signalforge.db import connection, insert_proposal
+from signalforge.db import connection, insert_proposal, upsert_item
 from signalforge.models import ProposalKind, ProposalStatus, ProposalTier
+from tests.conftest import make_item
 from tests.curate.conftest import fixture_bytes, make_scout_proposal
 
 runner = CliRunner()
@@ -275,7 +276,9 @@ def test_running_curate_twice_stores_each_proposal_once(
 
     first = _curate_run(db_path, config_dir, tmp_path / "cache")
     before = _proposals(db_path)
-    second = _curate_run(db_path, config_dir, tmp_path / "cache")
+    # `--force` because the cadence guard would otherwise refuse a same-day re-run;
+    # what is under test here is storage idempotency, not the guard.
+    second = _curate_run(db_path, config_dir, tmp_path / "cache", "--force")
 
     assert (first.exit_code, second.exit_code) == (0, 0)
     assert [tuple(row) for row in _proposals(db_path)] == [tuple(row) for row in before]
@@ -688,3 +691,112 @@ def test_status_shows_a_zero_search_line_before_any_scout_run(
 
     assert result.exit_code == 0, result.output
     assert "$0.00" in result.output
+
+
+@respx.mock
+def test_spend_is_recorded_even_when_the_run_fails_after_the_call(
+    db_path: Path, config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paid run must never record $0 (NEVER rule 11).
+
+    `run_source_scout` already promises not to raise for an API failure so its cost
+    is never lost. Everything *after* it — normalizing, probing — is free but can
+    still have a bug, and the caller reads the spend off the returned value. Both
+    reviews of this branch found that gap independently, so it is pinned here: the
+    probe stage explodes, and the row still shows what the call cost.
+    """
+    _fake_scout(monkeypatch, proposals=[make_scout_proposal(target=FEED_URL)])
+
+    async def _explode(*_args: object, **_kwargs: object) -> object:
+        raise ZeroDivisionError("a bug in the free half of the run")
+
+    monkeypatch.setattr("signalforge.curate.scout.probe_requests", _explode)
+
+    result = _curate_run(db_path, config_dir, tmp_path / "cache")
+
+    assert result.exit_code == 0, result.output
+    run = _runs(db_path, "curate")[-1]
+    assert run["llm_input_tokens"] == 4200
+    assert run["server_tool_requests"] == 6
+    assert run["status"] == "partial"
+    assert "after the call was billed" in str(run["errors"])
+
+
+@respx.mock
+def test_a_broken_sources_yaml_does_not_black_out_the_whole_daily_run(
+    db_path: Path,
+    config_dir: Path,
+    vault_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sources.yaml` is hand-edited, so a typo in it must cost only what reads it.
+
+    Deciding whether curation is enabled *outside* the step loop made a ConfigError
+    abort `daily` before any step ran and before any `runs` row existed — no
+    isolation, and no record that 6am happened. `score` needs only `interests.yaml`
+    and has to still clear its backlog.
+    """
+    _fake_triage(monkeypatch)
+    with connection(db_path) as conn:
+        item_id, _ = upsert_item(conn, make_item())
+        assert item_id
+    (config_dir / "sources.yaml").write_text("rss: [unclosed\n", encoding="utf-8")
+
+    result = _invoke(
+        "daily",
+        "--config-dir",
+        str(config_dir),
+        "--db",
+        str(db_path),
+        "--cache-dir",
+        str(tmp_path / "cache"),
+        "--vault-dir",
+        str(vault_dir),
+    )
+
+    assert result.exit_code == 2, result.output
+    assert [row["kind"] for row in _runs(db_path, "score")] == ["score"], (
+        "score reads only interests.yaml and must still run"
+    )
+
+
+@respx.mock
+def test_a_second_run_inside_the_week_is_refused_unless_forced(
+    db_path: Path, config_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The scout is weekly, and nothing but this stops it being run daily.
+
+    The unique index stops a re-run *storing* duplicates; it does nothing about the
+    call being billed again. Wired into `daily` by accident, that is ~$7/month
+    expected instead of ~$1 — inside the $30 alarm but several times this feature's
+    own budget.
+    """
+    _mock_feed()
+    _fake_scout(monkeypatch, proposals=[make_scout_proposal(target=FEED_URL)])
+
+    first = _curate_run(db_path, config_dir, tmp_path / "cache")
+    second = _curate_run(db_path, config_dir, tmp_path / "cache")
+    forced = _curate_run(db_path, config_dir, tmp_path / "cache", "--force")
+
+    assert first.exit_code == 0, first.output
+    assert second.exit_code == 1
+    assert "--force" in second.output
+    assert forced.exit_code == 0, forced.output
+    # Two billed runs, not three: the refusal happened before the call.
+    assert len(_runs(db_path, "curate")) == 2
+
+
+def test_the_cadence_guard_does_not_look_at_the_apply_runs(
+    db_path: Path, config_dir: Path, vault_dir: Path, tmp_path: Path
+) -> None:
+    """`curate apply` runs every morning and costs nothing.
+
+    Counting it as "the scout ran recently" would refuse every scout run forever,
+    which is why the two have separate `runs.kind` values.
+    """
+    assert _apply(db_path, config_dir, vault_dir).exit_code == 0
+
+    result = _curate_run(db_path, config_dir, tmp_path / "cache", "--dry-run")
+
+    assert "--force" not in result.output

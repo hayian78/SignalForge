@@ -1438,7 +1438,9 @@ class SourceYield:
     unscored: int
 
 
-def source_yield_stats(conn: sqlite3.Connection, *, since: datetime) -> list[SourceYield]:
+def source_yield_stats(
+    conn: sqlite3.Connection, *, since: datetime, limit: int
+) -> list[SourceYield]:
     """Triage outcomes per source for items fetched at or after `since`.
 
     Uses `fetched_at`, not `published_at`: the question is what this source has
@@ -1446,6 +1448,14 @@ def source_yield_stats(conn: sqlite3.Connection, *, since: datetime) -> list[Sou
     the operator had to skim past. Note the deliberate asymmetry with feedback —
     the window is on when we fetched the item, so a mark made this week on an
     item fetched last month falls outside it.
+
+    **Bounded, like every other list that reaches the scout's prompt.** One row per
+    source is small and grows only when the operator approves a new source, so this
+    is nowhere near the money the rejection list was — but a bound that is merely
+    *emergent from how the config grows* is not a bound, and this is the same class of
+    unbounded prompt input. Ordered by items delivered so the busiest sources survive
+    the cut, since a source with nothing in the window is the least informative row
+    in the table.
     """
     rows = conn.execute(
         """
@@ -1459,9 +1469,10 @@ def source_yield_stats(conn: sqlite3.Connection, *, since: datetime) -> list[Sou
         LEFT JOIN scores ON scores.item_id = items.id
         WHERE items.fetched_at >= ?
         GROUP BY items.source_id, items.source_type
-        ORDER BY items.source_id
+        ORDER BY items_total DESC, items.source_id ASC
+        LIMIT ?
         """,
-        (_window_start(since),),
+        (_window_start(since), limit),
     ).fetchall()
     return [
         SourceYield(

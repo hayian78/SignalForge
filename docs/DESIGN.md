@@ -602,8 +602,8 @@ input volume is the one figure here that no code enforces. Raising any knob, edi
 config, or growing the prompt past what the budget affords fails CI rather than the invoice.
 
 Every list of evidence in that prompt is bounded for the same reason: kept titles, outbound
-domains, and past rejections all reach an Opus-priced call, and rejections in particular
-only ever accumulate — nothing deletes one — so an unbounded suppression list would raise
+domains, per-source yield rows, and past rejections all reach an Opus-priced call, and
+rejections in particular only ever accumulate — nothing deletes one — so an unbounded suppression list would raise
 the weekly bill for the life of the pipeline. Bounding it is safe because
 `ux_proposals_kind_key`, not the prompt, is what stops a candidate being re-proposed.
 
@@ -882,7 +882,7 @@ is what stops a newly-added source backfilling its history into one digest.
 
 - **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
 
-The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
+The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$7/month expected against this feature's $2.50 budget. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.

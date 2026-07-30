@@ -475,6 +475,13 @@ async def scout_for_proposals(
     off. There is no client seam: `llm.py` is faked at its boundary in tests
     (CLAUDE.md §8), which is also what keeps the `anthropic` SDK out of this module
     (NEVER rule 1).
+
+    **Never raises once the call has been billed.** `llm.run_source_scout` already
+    promises not to raise for an API failure, so that its cost is never lost; this
+    function extends the same promise across everything it does *afterwards*
+    (normalizing, probing), because the caller reads the spend off the returned
+    value. Raising there would report a paid run as having spent nothing, which is
+    precisely the accounting NEVER rule 11 exists to protect.
     """
     stamp = now or datetime.now(UTC)
     evidence = gather_evidence(conn, sources, window_days=curation.yield_window_days, now=stamp)
@@ -505,6 +512,36 @@ async def scout_for_proposals(
         web_search_requests=result.web_search_requests,
     )
 
+    try:
+        return await _shape_candidates(
+            result, outcome, sources=sources, curation=curation, cache_dir=cache_dir, stamp=stamp
+        )
+    except Exception as exc:  # noqa: BLE001 - see the docstring: the money is already spent
+        # Everything from here on is free — normalizing, probing, counting. A bug in
+        # any of it must not take the *record* of what the call cost with it: the
+        # caller reads spend off the returned value, so raising would report a paid
+        # run as having spent nothing (NEVER rule 11). Both reviews of this branch
+        # found that gap independently, which is why the guarantee lives here rather
+        # than in the CLI's `finally` — the function holding the numbers is the one
+        # that has to promise to hand them back.
+        logger.exception("shaping scout candidates failed after the call was billed")
+        outcome.candidates = []
+        outcome.errors.append(
+            _error("scout", f"proposals were lost after the call was billed: {exc}")
+        )
+        return outcome
+
+
+async def _shape_candidates(
+    result: llm.ScoutResult,
+    outcome: ScoutOutcome,
+    *,
+    sources: SourcesConfig,
+    curation: CurationConfig,
+    cache_dir: Path,
+    stamp: datetime,
+) -> ScoutOutcome:
+    """Validate, cap, and probe what the scout returned. No further spend."""
     proposals = result.proposals
     if len(proposals) > curation.max_proposals_per_run:
         # The tool schema's `maxItems` asks for this; the cap is enforced here
