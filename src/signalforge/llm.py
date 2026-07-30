@@ -79,7 +79,7 @@ answers ("who is worth reading on these topics now, and which sources have gone
 quiet") is judgment over a whole corpus at once; there is no per-item version of
 it to make cheap."""
 
-SCOUT_MAX_SEARCHES_CEILING: Final = 7
+SCOUT_MAX_SEARCHES_CEILING: Final = 12
 """Hard cap on web searches per scout run, regardless of config.
 
 Web search bills **per call** ($10/1,000) on top of the tokens its results consume,
@@ -88,17 +88,24 @@ only lower it. Living here rather than in `config.py` is deliberate — model an
 decisions belong to this module and nowhere else (CLAUDE.md §6) — and `config.py`
 could not import it anyway without a cycle.
 
-**7, chosen so that the ceiling is consistent with the budget.** It was 15, which
-was not: the worst case at 15 searches is ~$3.13/month even on optimistic
-assumptions, so any config value the code accepted between 7 and 15 would breach
-`SCOUT_MONTHLY_CEILING_USD` while every test stayed green. A ceiling that permits
-values the budget forbids is not a ceiling. 7 leaves one search of headroom above
-the shipped 6, which is enough for the backstop job this constant exists to do —
-catching a typo like `60`, not enabling a bigger appetite.
+**12, a deliberate operator decision made after three real runs, not a default.**
+It was 7, chosen only so the ceiling would not exceed a $2.50/month budget set
+before any real run existed. Three runs on 2026-07-30/31 (6, 6, and 7 searches)
+measured 22k-31k input tokens per search — 4-5x the 6k/search this feature's budget
+had assumed — and the operator judged the later runs' results a real improvement
+and wanted more research depth per run, not more proposals (`max_proposals_per_run`
+is the separate, unchanged knob for that). 12 sits under the 15 this scout's search
+tool was originally designed around, leaving headroom for a genuine typo (`60`) to
+still be caught while affording real research breadth: enough to check a handful of
+addition candidates are still active and cross-reference a few retirement calls,
+without so many that results dilute rather than sharpen the proposals.
 
-Wanting more searches is therefore a deliberate budget decision: raise
-`SCOUT_MONTHLY_CEILING_USD`, re-run the arithmetic, and raise this. The test that
-guards the ceiling will tell you if the sum stops working."""
+`SCOUT_MONTHLY_CEILING_USD` was raised alongside this to the real worst case at 12
+searches on the corrected per-search assumption — raising one without the other is
+exactly the "ceiling permits values the budget forbids" failure this constant exists
+to prevent. Wanting more still means: re-run the arithmetic, get the operator's
+sign-off, raise both. The test that guards the ceiling will tell you if the sum
+stops working."""
 
 SCOUT_MAX_TOKENS: Final = 10240
 """Output ceiling for one scout call: thinking plus a handful of proposals.
@@ -149,9 +156,26 @@ though the only consumer is a `status` readout. Reached by the CLI through
 `curate.scout.search_spend_usd` rather than imported directly — `cli.py` does not
 import this module, deliberately."""
 
-SCOUT_MONTHLY_CEILING_USD: Final = 2.50
+SCOUT_MONTHLY_CEILING_USD: Final = 13.00
 """The agreed monthly budget for this feature, recorded next to the constants that
 enforce it (DESIGN §7.1, §8).
+
+Raised from $2.50 on 2026-07-31, the same day `SCOUT_MAX_SEARCHES_CEILING` went
+from 7 to 12 — see that docstring for why. This is the operator's deliberate
+decision, not a code default: three real runs cost ~$1.00-1.20 each at 6-7 searches,
+and weekly-times-more-research-depth was judged worth paying for, against a stated
+tolerance of "a dollar a run, still under a cup of coffee a month." Still small
+against the $30 whole-pipeline alarm (CLAUDE.md §6), but no longer small against
+this project's overall $5-10/month target — this one feature can now cost as much
+as the rest of the pipeline combined, which is worth knowing next time total spend
+is reviewed.
+
+Set to the worst case at `SCOUT_MAX_SEARCHES_CEILING`'s new value with real margin,
+not scraped to the edge of it: an initial version of this raise set both this and
+`PESSIMISTIC_TOKENS_PER_SEARCH` right at the highest of only two known real runs,
+leaving 2-5% headroom — and a cost-guard review then found a *third* real run
+already sitting in `runs`, higher than either. Three samples spanning ~22k-31k
+tokens/search in one day is not a distribution to price at its observed edge.
 
 Here rather than only in a doc because the two knobs below are tuned *to* it: a
 future editor raising `curation.max_searches_per_run` needs the number in front of
@@ -168,16 +192,18 @@ including an earlier version of this very docstring. It is computed instead, by
 it *reads* rather than assumes:
 
     input   the rendered prompt (measured from curate/prompts.py, at full evidence)
-            + SCOUT_MAX_SEARCHES_CEILING x a pessimistic 6k tokens per search
+            + SCOUT_MAX_SEARCHES_CEILING x a pessimistic per-search token figure
     output  SCOUT_MAX_TOKENS, the enforced ceiling
     search  SCOUT_MAX_SEARCHES_CEILING x $0.01
     x 4.33 weeks, asserted <= this budget
 
-Only the per-search input volume is an assumption, and it is pitched at 3x what
-dynamic filtering is expected to deliver, because it is the one term no code
-enforces. Raising a knob, editing the config, or growing the prompt past what this
-budget affords fails that test rather than the invoice. A realistic run — the shipped
-6 searches, expected search volume, ~4k of output — is ~$1.00/month."""
+The per-search input figure is the one term no code enforces, and it used to be a
+guess (6k, "3x what dynamic filtering is expected to deliver") made before any real
+run existed. It is now grounded in the three real runs that guess was wrong about,
+priced with margin above their observed max rather than at it —
+see `PESSIMISTIC_TOKENS_PER_SEARCH` in the test. Raising a knob, editing the config,
+or growing the prompt past what this budget affords fails that test rather than the
+invoice."""
 
 TRIAGE_BATCH_SIZE: Final = 25
 """Items grouped into one Messages request within the batch (DESIGN §8)."""

@@ -576,9 +576,14 @@ never writes an `items` row. `ingest/` still imports no LLM.
 
 ### Cost
 
-**Budget: ≤ $2.50/month for this feature.** That number is the decision, and it lives in
-code as `llm.SCOUT_MONTHLY_CEILING_USD`, beside the constants that enforce it. Expected
-spend is ≈ **$1.00/month**.
+**Budget: ≤ $13.00/month for this feature.** That number is the decision, and it lives in
+code as `llm.SCOUT_MONTHLY_CEILING_USD`, beside the constants that enforce it. Raised from
+$2.50 on 2026-07-31 — the original figure was set before any real run existed, and the
+first three real runs measured per-search input volume 4-5x higher than that budget assumed
+(see `llm.SCOUT_MAX_SEARCHES_CEILING`'s docstring for the full history). The operator's own
+call, made deliberately after comparing several real runs' output quality, not a default —
+and priced with real margin above the highest of those runs, not at it, after a first pass
+at this same raise left only single-digit-percent headroom.
 
 The worst case is **not restated here**, because a figure written in prose is a figure that
 goes stale — every arithmetic error found in this feature's reviews was a number that had
@@ -596,10 +601,11 @@ rather than assumes:
    tokens here; the real figure is ~4,000, and the assumption had already been overtaken by
    a prompt change once.)
 
-It is computed at the *ceiling*, not the shipped default, and with a pessimistic 6k input
-tokens per search — 3× what dynamic filtering is expected to deliver, because per-search
-input volume is the one figure here that no code enforces. Raising any knob, editing the
-config, or growing the prompt past what the budget affords fails CI rather than the invoice.
+It is computed at the *ceiling*, not the shipped default, and with a pessimistic per-search
+input figure — the higher of two real measurements now, not a multiple of a guess, because
+per-search input volume is the one figure here that no code enforces (`PESSIMISTIC_TOKENS_PER_SEARCH`
+in the test). Raising any knob, editing the config, or growing the prompt past what the
+budget affords fails CI rather than the invoice.
 
 Every list of evidence in that prompt is bounded for the same reason: kept titles, outbound
 domains, per-source yield rows, and past rejections all reach an Opus-priced call, and
@@ -678,15 +684,15 @@ Two notes for anyone extending this:
 | Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
-| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4k at full evidence) plus search results; output capped by `SCOUT_MAX_TOKENS`; ships at 6 searches |
+| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4.5k at full evidence) plus search results, measured at ~22-30k tokens per search on the first two real runs; output capped by `SCOUT_MAX_TOKENS`; ships at 12 searches |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (16k in ≈ $0.08 + 4k out ≈ $0.10 + 6 searches ≈ $0.06) ≈ **$1.00**. **Itemized total ≈ $8.00/month**, against a **$5–10 target** and a **$30 alarm**.
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (12 searches × ~28k in/search, the average of the three real runs measured so far ≈ $1.69 + ~7.6k out ≈ $0.19 + 12 searches ≈ $0.12) ≈ **$8.65**. **Itemized total ≈ $15.65/month**, against a **$5–10 target** and a **$30 alarm**.
 
 Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
-Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$8.00 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
+Two things that estimate is not. It is not measured: the only measured figures to date are **≈ $0.40/month actual** on triage (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku) and **three real scout runs** on 2026-07-30/31 (~$1.20 at 6 searches, ~$1.20 at 6 again, ~$1.02 at 7), because everything else prices a component that does not exist yet or has run too few times to average. And the band is no longer mid-range: the scout alone, raised deliberately to 12 searches after the operator judged the extra research depth worth it, now accounts for over half the itemized total and has pushed the **whole pipeline past its own $5–10 target on paper** — still nowhere near the $30 alarm, but the next new LLM consumer, or a scout re-tune in the other direction, needs the band revisited rather than absorbed.
 
 **Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
 
@@ -882,7 +888,7 @@ is what stops a newly-added source backfilling its history into one digest.
 
 - **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
 
-The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$7/month expected against this feature's $2.50 budget. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
+The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$60/month at real measured cost (≈$2.00/run at the shipped 12 searches × 30 daily runs) — over this feature's own $13 budget and the whole pipeline's $30 alarm, on one mis-wired command. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.

@@ -435,12 +435,26 @@ def _rendered_prompt_tokens(config_dir: Path) -> int:
     return int(len(system + user) / CHARS_PER_TOKEN)
 
 
-PESSIMISTIC_TOKENS_PER_SEARCH = 6_000
-"""3x the ~2k dynamic filtering is expected to deliver.
+PESSIMISTIC_TOKENS_PER_SEARCH = 40_000
+"""A real per-search token figure, priced with margin above the observed max —
+not at it.
+
+Was 6,000 — "3x the ~2k dynamic filtering is expected to deliver" — a guess made
+before any real run existed. The first three real runs (2026-07-30/31, 6, 6, and 7
+searches) measured ~31,006, ~30,023, and ~22,324 input tokens per search: 4-5x that
+guess, in the direction that matters. A first pass at fixing this set the constant to
+the bare max of *two* of those three runs — an earlier version of this file missed
+the third, which turned out to be the highest — leaving only 2-5% headroom to the
+ceiling. This value restores real margin above all three: 40,000 is ~29% above the
+highest observed (~31,006), the same kind of cushion the old "3x expected" reasoning
+was trying to provide, but grounded in what actually happened instead of a guess.
 
 Deliberately pessimistic because it is the **only** figure in this calculation that
 no code enforces — everything else is a module constant or a server-side cap. A
-budget that holds only if the model behaves as hoped is a forecast, not a ceiling."""
+budget that holds only if the model behaves as hoped is a forecast, not a ceiling.
+Three data points spanning ~22k-31k in one day is not a distribution to price at its
+edge; re-measure and adjust this as more real runs land rather than trusting it
+indefinitely."""
 
 
 def _worst_case_monthly_usd(searches: int, tokens_per_search: int, prompt_tokens: int) -> float:
@@ -499,11 +513,15 @@ def test_the_expected_cost_sits_well_below_the_ceiling(repo_config_dir: Path) ->
     # Sanity from the other side: the *expected* figure should sit comfortably under
     # the budget, not scrape beneath it. If the shipped config ever makes the
     # realistic case marginal, the ceiling is doing all the work.
+    #
+    # 20,000 is the lower of the two real per-search measurements (~30,023 and
+    # ~22,324) rounded down — a real "typical" case, not the old 2,000 guess that
+    # PESSIMISTIC_TOKENS_PER_SEARCH's docstring explains was 4-5x too low.
     curation = load_sources(repo_config_dir).curation
     assert curation is not None
 
     expected = _worst_case_monthly_usd(
-        curation.max_searches_per_run, 2_000, _rendered_prompt_tokens(repo_config_dir)
+        curation.max_searches_per_run, 20_000, _rendered_prompt_tokens(repo_config_dir)
     )
 
     assert expected <= SCOUT_MONTHLY_CEILING_USD * 0.85

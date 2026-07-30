@@ -171,15 +171,19 @@ curation:
   # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
   # beyond the one Opus call.
   #
-  # Raised from 6 to 7 (the code-level ceiling — llm.py clamps anything above it)
-  # on 2026-07-31, after the first real run measured ~30k input tokens per search —
-  # about 5x the "pessimistic" 6k/search this feature's $2.50/month budget assumed.
-  # A weekly run at that real rate is closer to ~$5.20/month for this feature alone,
-  # not the ~$1/month the design doc estimated. Still trivial against the $30
-  # overall alarm, and 7 is the most this can spend without a code change to
-  # SCOUT_MAX_SEARCHES_CEILING — but treat 7 as an open experiment, not confirmed
-  # headroom. Re-check `signalforge status` after the next scheduled run.
-  max_searches_per_run: 7
+  # Raised 6 -> 7 -> 12 on 2026-07-31, in that order, same day. 6 -> 7 came after
+  # the first real run measured ~30k input tokens per search — 5x the "pessimistic"
+  # 6k/search this feature's original $2.50/month budget assumed. 7 -> 12 is the
+  # operator's own call, made after comparing the 6- and 7-search runs directly and
+  # judging the extra research depth worth paying for ("a dollar a run is still
+  # under a cup of coffee a month") — not more proposals, `max_proposals_per_run`
+  # above is unchanged, but more grounding behind each one. `llm.py`'s
+  # SCOUT_MAX_SEARCHES_CEILING and SCOUT_MONTHLY_CEILING_USD were raised alongside
+  # this to $13/month, the real worst case at 12 searches priced with margin above
+  # (not at) the highest of three real runs — this feature can now cost as much as
+  # the rest of the pipeline combined, still trivial against the $30 overall alarm.
+  # Re-check `signalforge status` after a few more runs; this is still an experiment.
+  max_searches_per_run: 12
 
   # Lookback for the yield stats that justify a retirement.
   yield_window_days: 30
