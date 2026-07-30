@@ -96,8 +96,18 @@ class ApplyOutcome:
 
 
 def _one_line_note(text: str) -> str:
-    """Flatten a rationale into a single comment-safe line."""
+    """Flatten a rationale into a single comment-safe line.
+
+    `str.split` collapses whitespace, which covers newlines and tabs — the
+    characters that could end the comment and start a line of YAML. The explicit
+    drop afterwards covers the rest of the control range (an escape sequence, a NUL),
+    which cannot corrupt the parse but would sit invisibly in the operator's config
+    forever. Dropped rather than refused: unlike a URL, a rationale is prose that no
+    later code reads, so losing a stray byte from it costs nothing, while raising
+    would discard an approved change over a cosmetic flaw in its explanation.
+    """
     collapsed = " ".join(text.split())
+    collapsed = "".join(char for char in collapsed if ord(char) >= 0x20 and ord(char) != 0x7F)
     if len(collapsed) <= _MAX_NOTE_CHARS:
         return collapsed
     return collapsed[:_MAX_NOTE_CHARS].rsplit(" ", 1)[0] + "…"

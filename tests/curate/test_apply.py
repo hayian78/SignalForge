@@ -806,3 +806,25 @@ def test_nothing_is_written_when_there_is_nothing_approved(
     assert outcome.changes == []
     assert outcome.errors == []
     assert (config_dir / "sources.yaml").read_text(encoding="utf-8") == before
+
+
+def test_a_control_character_in_a_rationale_is_dropped_from_the_comment(
+    repo_config_dir: Path,
+) -> None:
+    """The rationale is prose, so a stray byte is dropped rather than refused.
+
+    Whitespace collapsing already handles the characters that could end the comment
+    and start a YAML line. This covers the rest of the control range, which cannot
+    corrupt the parse but would live in the operator's config invisibly. Raising here
+    would discard an approved change over a cosmetic flaw in its explanation.
+    """
+    result = apply_to_text(
+        (repo_config_dir / "sources.yaml").read_text(encoding="utf-8"),
+        make_proposal(rationale="Cited\x1b[31m four times\x00 by items you marked useful."),
+        today=TODAY,
+        current=load_sources(repo_config_dir),
+    )
+
+    assert result is not None
+    assert not any(ord(char) < 0x20 or ord(char) == 0x7F for char in "".join(result.splitlines()))
+    assert "Cited[31m four times by items you marked useful." in result
