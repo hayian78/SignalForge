@@ -171,14 +171,15 @@ curation:
   # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
   # beyond the one Opus call.
   #
-  # Starts at 6, one below the 7 the budget affords. How many input tokens a search
-  # actually drags into context cannot be measured from tests — the suite never calls
-  # the real API (NEVER rule 13) — so the first real run IS the instrument. Read
-  # `signalforge status` after two runs; if the per-search figure is where DESIGN §8
-  # expects, 7 is available. It is not much headroom: at 7 searches the *pessimistic*
-  # worst case sits at ~96% of this feature's $2.50 budget, and llm.py clamps
-  # anything above 7 rather than spending past it.
-  max_searches_per_run: 6
+  # Raised from 6 to 7 (the code-level ceiling — llm.py clamps anything above it)
+  # on 2026-07-31, after the first real run measured ~30k input tokens per search —
+  # about 5x the "pessimistic" 6k/search this feature's $2.50/month budget assumed.
+  # A weekly run at that real rate is closer to ~$5.20/month for this feature alone,
+  # not the ~$1/month the design doc estimated. Still trivial against the $30
+  # overall alarm, and 7 is the most this can spend without a code change to
+  # SCOUT_MAX_SEARCHES_CEILING — but treat 7 as an open experiment, not confirmed
+  # headroom. Re-check `signalforge status` after the next scheduled run.
+  max_searches_per_run: 7
 
   # Lookback for the yield stats that justify a retirement.
   yield_window_days: 30
