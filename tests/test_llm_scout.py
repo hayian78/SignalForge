@@ -19,6 +19,7 @@ What these tests are actually protecting:
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,6 +27,7 @@ import pytest
 from anthropic import APIError
 from anthropic.types import Message, ServerToolUsage, TextBlock, ToolUseBlock, Usage
 
+from signalforge.config import load_sources
 from signalforge.llm import (
     SCOUT_EFFORT,
     SCOUT_MAX_SEARCHES_CEILING,
@@ -120,7 +122,10 @@ def _run(responses: list[Message | Exception], **overrides: Any) -> Any:
     kwargs: dict[str, Any] = {
         "system_prompt": SYSTEM_PROMPT,
         "user_prompt": USER_PROMPT,
-        "max_searches": 12,
+        # The shipped default. Deliberately not a number above
+        # SCOUT_MAX_SEARCHES_CEILING: that would trip the clamp and add an error to
+        # every test that asserts a clean run.
+        "max_searches": 6,
         "max_proposals": 5,
         "client": client,
     }
@@ -156,13 +161,13 @@ def test_an_empty_proposal_list_is_a_valid_quiet_week() -> None:
 
 
 def test_the_request_declares_web_search_with_the_configured_cap() -> None:
-    _, client = _run([_message(proposals=[])], max_searches=9)
+    _, client = _run([_message(proposals=[])], max_searches=5)
 
     tools = client.messages.requests[0]["tools"]
     search = next(tool for tool in tools if str(tool["type"]).startswith("web_search"))
     # `max_uses` is enforced server-side, so this is the real spend limit rather
     # than an instruction the model may ignore.
-    assert search["max_uses"] == 9
+    assert search["max_uses"] == 5
     # Drops the nested search blocks from the assistant message once dynamic
     # filtering has consumed them — an output-token saving.
     assert search["response_inclusion"] == "excluded"
@@ -354,29 +359,80 @@ def test_the_search_budget_reaches_the_only_request() -> None:
     assert _search_budget(client.messages.requests[0]) == 6
 
 
+IN_RATE_USD_PER_TOKEN = 5 / 1e6
+OUT_RATE_USD_PER_TOKEN = 25 / 1e6
+SEARCH_USD = 0.01
+WEEKS_PER_MONTH = 4.33
+PROMPT_TOKENS = 2_500
+"""Measured: the rendered system + user prompt against the live config with a full
+evidence set is ~1.6-1.9k tokens. 2.5k is that with headroom."""
+
+PESSIMISTIC_TOKENS_PER_SEARCH = 6_000
+"""3x the ~2k dynamic filtering is expected to deliver.
+
+Deliberately pessimistic because it is the **only** figure in this calculation that
+no code enforces — everything else is a module constant or a server-side cap. A
+budget that holds only if the model behaves as hoped is a forecast, not a ceiling."""
+
+
+def _worst_case_monthly_usd(searches: int, tokens_per_search: int) -> float:
+    tokens_in = PROMPT_TOKENS + searches * tokens_per_search
+    per_run = (
+        tokens_in * IN_RATE_USD_PER_TOKEN
+        + SCOUT_MAX_TOKENS * OUT_RATE_USD_PER_TOKEN
+        + searches * SEARCH_USD
+    )
+    return per_run * WEEKS_PER_MONTH
+
+
 def test_the_worst_case_cost_stays_within_the_recorded_ceiling() -> None:
-    """Guards the budget arithmetic against a later constant change.
+    """Guards the budget against any change to the constants *or the config*.
 
-    Recomputes the absolute worst case from the module's own constants — one
-    request, searches maxed, output maxed — and checks it against the ceiling
-    recorded beside them. Raising `SCOUT_MAX_TOKENS`, or the shipped search budget,
-    without re-checking the sum fails here rather than on an invoice.
+    Asserted at `SCOUT_MAX_SEARCHES_CEILING`, **not** at the shipped config value.
+    An earlier version hardcoded the shipped 6, which made the guarantee hollow for
+    the knob most likely to move: `curation.max_searches_per_run` is data, an
+    operator can raise it without touching Python, and at the old ceiling of 15 the
+    real worst case was ~$3.13/month while this test stayed green.
+
+    Asserting at the ceiling covers every value the code will *accept*, so no config
+    edit can breach the budget without also failing here.
     """
-    in_rate, out_rate, per_search_usd, weeks = 5 / 1e6, 25 / 1e6, 0.01, 4.33
-    shipped_searches = 6  # config/sources.yaml curation.max_searches_per_run
-    prompt_tokens = 2_500
-    per_search_result_tokens = 2_000
+    worst = _worst_case_monthly_usd(SCOUT_MAX_SEARCHES_CEILING, PESSIMISTIC_TOKENS_PER_SEARCH)
 
-    tokens_in = prompt_tokens + shipped_searches * per_search_result_tokens
-    worst_per_run = (
-        tokens_in * in_rate + SCOUT_MAX_TOKENS * out_rate + shipped_searches * per_search_usd
+    assert worst <= SCOUT_MONTHLY_CEILING_USD, (
+        f"worst case at the search ceiling is ${worst:.2f}/month against a "
+        f"${SCOUT_MONTHLY_CEILING_USD:.2f} budget. Lower SCOUT_MAX_SEARCHES_CEILING or "
+        "SCOUT_MAX_TOKENS, or raise the budget deliberately with the operator."
     )
 
-    assert worst_per_run * weeks <= SCOUT_MONTHLY_CEILING_USD, (
-        f"worst case is ${worst_per_run * weeks:.2f}/month against a "
-        f"${SCOUT_MONTHLY_CEILING_USD:.2f} ceiling; re-tune the constants or "
-        "renegotiate the budget with the operator"
+
+def test_the_shipped_search_budget_cannot_exceed_the_ceiling(repo_config_dir: Path) -> None:
+    """The shipped config must be a value the ceiling actually permits.
+
+    `_effective_search_budget` clamps at runtime and records the clamp, so a config
+    above the ceiling is not a *cost* failure — but it is a silently reduced setting,
+    which is the failure `_StrictModel` exists to prevent. Checking the real file
+    catches it in CI instead of in a digest footnote.
+    """
+    curation = load_sources(repo_config_dir).curation
+
+    assert curation is not None
+    assert curation.max_searches_per_run <= SCOUT_MAX_SEARCHES_CEILING, (
+        f"config ships {curation.max_searches_per_run} searches but llm.py caps at "
+        f"{SCOUT_MAX_SEARCHES_CEILING}; the surplus would be clamped away"
     )
+
+
+def test_the_expected_cost_sits_well_below_the_ceiling(repo_config_dir: Path) -> None:
+    # Sanity from the other side: the *expected* figure should sit comfortably under
+    # the budget, not scrape beneath it. If the shipped config ever makes the
+    # realistic case marginal, the ceiling is doing all the work.
+    curation = load_sources(repo_config_dir).curation
+    assert curation is not None
+
+    expected = _worst_case_monthly_usd(curation.max_searches_per_run, 2_000)
+
+    assert expected <= SCOUT_MONTHLY_CEILING_USD * 0.85
 
 
 # --------------------------------------------------------------------------- #

@@ -534,16 +534,20 @@ never writes an `items` row. `ingest/` still imports no LLM.
 
 **Budget: ≤ $2.50/month for this feature**, recorded in code as
 `llm.SCOUT_MONTHLY_CEILING_USD` beside the constants that enforce it. Expected spend is
-≈ **$1.00/month**; the *absolute* worst case is ≈ **$2.35/month**, and it is a ceiling
+≈ **$1.00/month**; the *absolute* worst case is ≈ **$2.38/month**, and it is a ceiling
 derived from enforced limits rather than a forecast of good behaviour — three facts, each
 checkable from code:
 
 1. exactly one API request per run, no resumes;
-2. searches capped server-side by `max_uses` at the configured budget (ships at 6);
-3. output capped by `SCOUT_MAX_TOKENS` for that single request.
+2. searches capped server-side by `max_uses`, at `SCOUT_MAX_SEARCHES_CEILING` (7) or the
+   lower configured value (ships at 6);
+3. output capped by `SCOUT_MAX_TOKENS` (10,240) for that single request.
 
-Raising `curation.max_searches_per_run` to 12 puts the same worst case at ≈ $2.87/month,
-over the ceiling — the search budget and the output ceiling are not independent knobs.
+That worst case is computed at the *ceiling*, not the shipped default, and with a
+pessimistic 6k input tokens per search — 3× what dynamic filtering is expected to deliver,
+because per-search input volume is the one figure here that no code enforces. A test
+recomputes it from those constants and fails if it exceeds the budget, so raising either
+knob — or the config value — breaks CI rather than the invoice.
 
 Two notes for §8's accounting:
 
@@ -586,14 +590,15 @@ Prompt-caching discipline (from day one, it's free to get right): system prompt 
 
 Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
-Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$7.80 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
+Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$8.00 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
 
 **Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
 
 **Two cost facts about the search tool that are easy to get wrong**, both learned the expensive way on this branch:
 
 - `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`.
-- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling is 3 × 16,384 output tokens ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which bounds its absolute worst case at ≈ **$2.35/month** from constants alone — see `llm.SCOUT_MONTHLY_CEILING_USD`.
+- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling was ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which bounds its absolute worst case at ≈ **$2.38/month** from constants alone — see `llm.SCOUT_MONTHLY_CEILING_USD`.
+- **A ceiling that permits values the budget forbids is not a ceiling.** `SCOUT_MAX_SEARCHES_CEILING` was 15 while the budget only afforded 7, so any config value in between would have breached it with every test green. Two rules fell out of that: the hard ceiling is derived from the budget, and the test that guards the budget asserts **at the ceiling**, never at the shipped default — otherwise a pure data edit to `curation.max_searches_per_run` moves real spend without failing anything.
 - Search-result content is billed as **input** tokens on every request that carries it, so a resume re-sending the accumulated conversation pays for the same results twice.
 - **State a budget as a ceiling derived from enforced limits, not from expected behaviour.** The scout's first worst-case figure assumed ~4k of output per turn and looked comfortable; recomputed against the `max_tokens` the code actually permits, the same scenario was 3× over. An estimate that assumes good behaviour is a forecast, not a bound.
 

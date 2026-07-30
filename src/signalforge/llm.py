@@ -78,25 +78,43 @@ answers ("who is worth reading on these topics now, and which sources have gone
 quiet") is judgment over a whole corpus at once; there is no per-item version of
 it to make cheap."""
 
-SCOUT_MAX_SEARCHES_CEILING: Final = 15
+SCOUT_MAX_SEARCHES_CEILING: Final = 7
 """Hard cap on web searches per scout run, regardless of config.
 
-Web search bills **per call** ($10/1,000) on top of the tokens its results
-consume, so this is a spend limit, not a quality knob. `curation.max_searches_per_run`
-can only lower it: config expresses intent, this expresses the ceiling that intent
-cannot exceed. Living here rather than in `config.py` is deliberate — model and
-cost decisions belong to this module and nowhere else (CLAUDE.md §6) — and
-`config.py` could not import it anyway without a cycle."""
+Web search bills **per call** ($10/1,000) on top of the tokens its results consume,
+so this is a spend limit, not a quality knob. `curation.max_searches_per_run` can
+only lower it. Living here rather than in `config.py` is deliberate — model and cost
+decisions belong to this module and nowhere else (CLAUDE.md §6) — and `config.py`
+could not import it anyway without a cycle.
 
-SCOUT_MAX_TOKENS: Final = 16384
+**7, chosen so that the ceiling is consistent with the budget.** It was 15, which
+was not: the worst case at 15 searches is ~$3.13/month even on optimistic
+assumptions, so any config value the code accepted between 7 and 15 would breach
+`SCOUT_MONTHLY_CEILING_USD` while every test stayed green. A ceiling that permits
+values the budget forbids is not a ceiling. 7 leaves one search of headroom above
+the shipped 6, which is enough for the backstop job this constant exists to do —
+catching a typo like `60`, not enabling a bigger appetite.
+
+Wanting more searches is therefore a deliberate budget decision: raise
+`SCOUT_MONTHLY_CEILING_USD`, re-run the arithmetic, and raise this. The test that
+guards the ceiling will tell you if the sum stops working."""
+
+SCOUT_MAX_TOKENS: Final = 10240
 """Output ceiling for one scout call: thinking plus a handful of proposals.
 
-Deliberately well above the ~4k the estimate assumes, and **not** a cost control —
-output is billed for what is produced, not for the ceiling, so raising this costs
-nothing unless it is used. What it buys is protection from the expensive failure:
-thinking counts against `max_tokens` on this model, so a tight cap means a run that
-pays for every search and then truncates before the tool call lands, producing
-nothing. `effort` is the actual lever on output spend."""
+Output is billed for what is produced, not for the ceiling — but the ceiling is
+still the *bound*, and on a single-request call at $25/M it is the largest term in
+the worst case (~$0.26 of a ~$0.41 run). So it is set by two competing constraints
+rather than by generosity:
+
+* high enough that a run which has already paid for its searches does not truncate
+  before the tool call lands, which would waste the whole run. Thinking counts
+  against this on Opus 5, and 8192 was judged too tight for that reason.
+* low enough that the worst case fits `SCOUT_MONTHLY_CEILING_USD` **at the search
+  ceiling and on a pessimistic input assumption** — see the test.
+
+10240 satisfies both with margin: a 5-proposal tool call is under 1k tokens, so this
+leaves ~9k for thinking at `effort: "high"`."""
 
 SCOUT_EFFORT: Final = "high"
 """Reasoning effort for the scout call.
@@ -134,17 +152,21 @@ them. Enforced by three facts, all checkable from code:
 * `max_uses` caps searches server-side at `SCOUT_MAX_SEARCHES_CEILING` or below;
 * `SCOUT_MAX_TOKENS` caps output for that single request.
 
-Absolute worst case, assuming the model maxes its output ceiling every week:
+Absolute worst case — at the **search ceiling** rather than the shipped default, and
+with a pessimistic 6k input tokens per search rather than the ~2k dynamic filtering
+is expected to deliver, because that figure is an assumption about model behaviour
+and everything else here is code-enforced:
 
-    input   2.5k prompt + 6 searches x ~2k filtered results = 14.5k  -> $0.073
-    output  16,384 tokens (the enforced ceiling, not an estimate)    -> $0.410
-    search  6 x $0.01                                                -> $0.060
-    = $0.54/run x 4.33 weeks = ~$2.35/month, under the ceiling
+    input   2.5k prompt + 7 searches x 6k results = 44.5k  -> $0.223
+    output  10,240 tokens (the enforced ceiling)           -> $0.256
+    search  7 x $0.01                                      -> $0.070
+    = $0.549/run x 4.33 weeks = ~$2.38/month, under the ceiling
 
-Expected is ~$1.01/month, because a real run produces ~4k of output, not 16k.
+On the expected ~2k-per-search figure the same worst case is ~$1.77/month, and a
+realistic run (6 searches, ~4k output) is ~$1.00/month.
 
-**Recheck when changing `curation.max_searches_per_run`.** At 12 searches the same
-worst case is ~$2.87/month, over this ceiling. The knobs are not independent."""
+The margin is deliberately robust to the input assumption being wrong by 3x, because
+that is the one number here that no code enforces."""
 
 TRIAGE_BATCH_SIZE: Final = 25
 """Items grouped into one Messages request within the batch (DESIGN §8)."""
@@ -623,19 +645,18 @@ def _propose_tool_schema(max_proposals: int) -> ToolParam:
     )
 
 
-def _scout_tools(*, remaining_searches: int, max_proposals: int) -> list[ToolUnionParam]:
-    """The tool list for one request, carrying the searches still affordable.
+def _scout_tools(*, searches: int, max_proposals: int) -> list[ToolUnionParam]:
+    """The tool list for the run's single request.
 
-    **`max_uses` is per API request, not per logical run.** A `pause_turn` resume is
-    a new request, so a tool list built once outside the resume loop hands every
-    resume a fresh full budget — turning a "hard ceiling" of 15 into
-    `(1 + _MAX_PAUSE_RESUMES) x 15 = 90` searches, and a $0.35 run into a $5 one.
-    Rebuilding here with the budget *decremented by what has already been spent* is
-    what makes the ceiling in `SCOUT_MAX_SEARCHES_CEILING` actually hard.
+    **`max_uses` is per API request, not per logical run**, which is why
+    `run_source_scout` makes exactly one. A second request — a `pause_turn` resume —
+    would arrive with a fresh full budget unless it were decremented, and would
+    multiply the `max_tokens` output ceiling besides. One request removes both
+    problems and makes `SCOUT_MAX_SEARCHES_CEILING` a real bound rather than a
+    per-request one.
 
-    Floored at 0: a run that has already exhausted its budget still needs a valid
-    tool list, because the model may yet call `propose_source_changes` with what it
-    found before the searches ran out.
+    Floored at 0 so a configured budget of 0 — the supported corpus-only mode — still
+    produces a valid tool list, letting the model propose from stored evidence alone.
     """
     return [
         WebSearchTool20260318Param(
@@ -643,10 +664,11 @@ def _scout_tools(*, remaining_searches: int, max_proposals: int) -> list[ToolUni
             name="web_search",
             # Enforced server-side, so this is a real limit rather than an
             # instruction the model may ignore.
-            max_uses=max(0, remaining_searches),
+            max_uses=max(0, searches),
             # Drops the nested search blocks from the assistant message once dynamic
-            # filtering has consumed them, which is an output-token saving: this is
-            # a single-turn call, so nothing needs to echo search content back.
+            # filtering has consumed them, which is an output-token saving. Safe
+            # because this is a single-request call: nothing needs to echo search
+            # content back on a later turn.
             response_inclusion="excluded",
         ),
         _propose_tool_schema(max_proposals),
@@ -764,7 +786,7 @@ def run_source_scout(
             model=model,
             max_tokens=SCOUT_MAX_TOKENS,
             system=system_prompt,
-            tools=_scout_tools(remaining_searches=budget, max_proposals=max_proposals),
+            tools=_scout_tools(searches=budget, max_proposals=max_proposals),
             output_config=OutputConfigParam(effort=SCOUT_EFFORT),
             messages=[{"role": "user", "content": user_prompt}],
         )
