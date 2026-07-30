@@ -26,22 +26,40 @@ from dataclasses import dataclass, field
 from typing import Final, Literal
 
 import anthropic
+from anthropic.types import (
+    MessageParam,
+    OutputConfigParam,
+    ToolParam,
+    ToolUnionParam,
+    ToolUseBlock,
+    WebSearchTool20260318Param,
+)
 from anthropic.types.message_create_params import MessageCreateParamsNonStreaming
 from anthropic.types.messages import MessageBatchIndividualResponse
 from anthropic.types.messages.batch_create_params import Request
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from signalforge.config import InterestsConfig, get_secret
+from signalforge.models import ProposalKind, ProposalTier
 from signalforge.score.rubrics import build_triage_system_prompt
 
 __all__ = [
+    "SCOUT_EFFORT",
+    "SCOUT_MAX_SEARCHES_CEILING",
+    "SCOUT_MAX_TOKENS",
+    "SCOUT_MODEL",
+    "SCOUT_PROPOSE_TOOL_NAME",
     "TRIAGE_BATCH_SIZE",
     "TRIAGE_MAX_TOKENS",
     "TRIAGE_MODEL",
     "LlmError",
+    "ScoutEvidence",
+    "ScoutProposal",
+    "ScoutResult",
     "TriageBatchResult",
     "TriageResult",
     "get_anthropic_client",
+    "run_source_scout",
     "run_triage_batch",
 ]
 
@@ -50,6 +68,84 @@ logger = logging.getLogger(__name__)
 TRIAGE_MODEL: Final = "claude-haiku-4-5"
 """Triage/scoring model (CLAUDE.md §6). Never Sonnet/Opus on a per-item path —
 those are reserved for the 1-2 weekly/monthly synthesis calls (Phase 1+)."""
+
+SCOUT_MODEL: Final = "claude-opus-5"
+"""Source-curation scout (DESIGN §7.1, §8).
+
+Opus on a **weekly, single-call** path — which is the existing Opus slot in §8's
+budget table, not a new one, and emphatically not a per-item path. The question it
+answers ("who is worth reading on these topics now, and which sources have gone
+quiet") is judgment over a whole corpus at once; there is no per-item version of
+it to make cheap."""
+
+SCOUT_MAX_SEARCHES_CEILING: Final = 15
+"""Hard cap on web searches per scout run, regardless of config.
+
+Web search bills **per call** ($10/1,000) on top of the tokens its results
+consume, so this is a spend limit, not a quality knob. `curation.max_searches_per_run`
+can only lower it: config expresses intent, this expresses the ceiling that intent
+cannot exceed. Living here rather than in `config.py` is deliberate — model and
+cost decisions belong to this module and nowhere else (CLAUDE.md §6) — and
+`config.py` could not import it anyway without a cycle."""
+
+SCOUT_MAX_TOKENS: Final = 16384
+"""Output ceiling for one scout call: thinking plus a handful of proposals.
+
+Deliberately well above the ~4k the estimate assumes, and **not** a cost control —
+output is billed for what is produced, not for the ceiling, so raising this costs
+nothing unless it is used. What it buys is protection from the expensive failure:
+thinking counts against `max_tokens` on this model, so a tight cap means a run that
+pays for every search and then truncates before the tool call lands, producing
+nothing. `effort` is the actual lever on output spend."""
+
+SCOUT_EFFORT: Final = "high"
+"""Reasoning effort for the scout call.
+
+`high` rather than `xhigh`/`max`: this is a judgment task over evidence that has
+already been gathered, not a long-horizon agentic one, and the output is read by a
+human who can reject it. The cheaper setting is also the one that keeps the weekly
+figure inside §8's estimate."""
+
+_WEB_SEARCH_TOOL_TYPE: Final = "web_search_20260318"
+"""Web search with dynamic filtering and `response_inclusion`.
+
+Dynamic filtering (available from `web_search_20260209`) has the model filter
+results *before* they enter the context window, which is the single biggest lever
+on this call's input tokens. `code_execution` is deliberately **not** declared
+alongside it: on this tool version the API provisions the execution it needs
+itself, and declaring a second execution environment confuses the model."""
+
+SCOUT_PROPOSE_TOOL_NAME: Final = "propose_source_changes"
+"""Name of the tool the scout calls to return its proposals.
+
+Public so `curate/prompts.py` can name it in the instructions without keeping a
+second copy of the string — the prompt telling the model to call a tool that does
+not exist is a silent, expensive failure."""
+
+_MAX_PAUSE_RESUMES: Final = 2
+"""How many times a paused search turn may be resumed.
+
+A long server-tool turn returns `stop_reason: "pause_turn"` and is continued by
+re-sending it unchanged. Bounded because a resume **re-sends the accumulated
+conversation**, so the resume count multiplies input cost even though the search
+budget is now decremented across requests.
+
+2 rather than the 5 an agentic loop would use, because 5 does not fit the budget.
+Worst case is every run pausing the maximum number of times with all searches
+already spent, so each resume re-sends the full result set:
+
+    6 searches x 2k tokens = 12k of results, plus a ~2.5k prompt
+    resumes=5 -> 6 requests x 14.5k in + ~14k out  = $0.85/run = $3.66/month
+    resumes=2 -> 3 requests x 14.5k in + ~8k out   = $0.48/run = $2.07/month
+
+$3.66 breaches the ≤$2.50/month budget agreed for this feature; $2.07 does not.
+With only 6 searches on offer the server-side loop rarely pauses at all, so this
+costs nothing in practice — it converts a worst case that broke the budget into one
+that fits inside it.
+
+**Recheck this alongside `curation.max_searches_per_run`.** Raising the search
+budget to 12 puts the 2-resume worst case at $3.11/month, back over the gate. The
+two numbers are not independent."""
 
 TRIAGE_BATCH_SIZE: Final = 25
 """Items grouped into one Messages request within the batch (DESIGN §8)."""
@@ -364,6 +460,372 @@ def run_triage_batch(
             "error_count": len(outcome.errors),
             "input_tokens": outcome.input_tokens,
             "output_tokens": outcome.output_tokens,
+        },
+    )
+    return outcome
+
+
+# --------------------------------------------------------------------------- #
+# source curation scout (DESIGN §7.1)
+# --------------------------------------------------------------------------- #
+
+
+class ScoutEvidence(BaseModel):
+    """One citation behind a proposal. At least one is mandatory (NEVER rule 7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str = Field(min_length=1)
+    note: str = ""
+
+
+class ScoutProposal(BaseModel):
+    """One proposed `sources.yaml` change, as the model returned it.
+
+    Validated here rather than trusted: this is the boundary where model output
+    becomes something the pipeline will write into the operator's config, so the
+    shape is checked before it can reach `db.insert_proposal`. `kind` is validated
+    against `ProposalKind` — an invented kind is a rejected proposal, never a new
+    edit shape the applier has never heard of.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ProposalKind
+    target: str = Field(min_length=1)
+    """What is being added or retired: a feed URL, an `owner/repo` slug, or a
+    keyword. Normalized into `proposals.dedup_key` by the caller, not here — the
+    normalization differs per kind and belongs next to the code that knows which."""
+
+    source_id: str | None = None
+    """Proposed `sources.yaml` id for an added RSS feed. Absent for other kinds."""
+
+    url: str | None = None
+    weight: float | None = Field(default=None, gt=0)
+    rationale: str = Field(min_length=1)
+    evidence: list[ScoutEvidence] = Field(min_length=1)
+    """Non-empty by validation. `db.insert_proposal` refuses an uncited proposal,
+    so catching it here turns a wasted paid slot into a recorded error."""
+
+    tier: ProposalTier = ProposalTier.WEB
+
+
+@dataclass(slots=True)
+class ScoutResult:
+    """Proposals, per-proposal errors, and everything the run spent.
+
+    Same shape and reasoning as `TriageBatchResult`: the spend comes back in the
+    same value as the output, so persisting proposals without also seeing what
+    they cost takes an extra line of code to skip rather than zero (NEVER rule 11).
+
+    `web_search_requests` is the field the token counters cannot express — search
+    bills per call, so a run's cost is not derivable from tokens alone.
+    """
+
+    proposals: list[ScoutProposal] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    """Per-proposal validation failures and run-level notes (including a clamped
+    search budget). The caller writes these into `runs.errors` so they surface in
+    the next digest rather than only in cron.log (DESIGN §7)."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    web_search_requests: int = 0
+
+
+def _propose_tool_schema(max_proposals: int) -> ToolParam:
+    """The tool the scout calls to return its proposals.
+
+    A **tool** rather than `output_config.format`, deliberately. Structured
+    outputs are this module's normal habit (see `_TRIAGE_OUTPUT_SCHEMA`), but their
+    documented interaction with *server-side* tools is unspecified, and this call
+    is the one path in the pipeline that cannot be exercised against the real API
+    in tests (NEVER rule 13) — so its first real run is the operator's. A custom
+    tool alongside a server tool is explicitly supported, which makes it the
+    lower-risk shape for the one thing that has to work first time.
+
+    Nothing executes this tool: the model calling it *is* the answer, and the run
+    ends there. `strict` is deliberately absent — `ScoutProposal` re-validates
+    every field anyway, so requiring it would add a compatibility surface for a
+    guarantee already held elsewhere.
+    """
+    return ToolParam(
+        name=SCOUT_PROPOSE_TOOL_NAME,
+        description=(
+            "Submit your proposed changes to the operator's sources.yaml. Call this "
+            "exactly once, after you have finished searching. Pass an empty list if "
+            "the evidence does not support any change this week."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "proposals": {
+                    "type": "array",
+                    "maxItems": max_proposals,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "enum": [kind.value for kind in ProposalKind],
+                            },
+                            "target": {
+                                "type": "string",
+                                "description": (
+                                    "The feed URL, owner/repo slug, or keyword being "
+                                    "added or retired."
+                                ),
+                            },
+                            "source_id": {
+                                "type": "string",
+                                "description": (
+                                    "Short stable id for an added RSS feed, e.g. "
+                                    "'import-ai'. Omit for other kinds."
+                                ),
+                            },
+                            "url": {"type": "string"},
+                            "weight": {
+                                "type": "number",
+                                "description": (
+                                    "Score multiplier for a trusted author. Omit unless "
+                                    "you have a specific reason; 1.0 is the default."
+                                ),
+                            },
+                            "rationale": {
+                                "type": "string",
+                                "description": (
+                                    "One or two sentences for the operator, naming the "
+                                    "specific evidence."
+                                ),
+                            },
+                            "evidence": {
+                                "type": "array",
+                                "minItems": 1,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "url": {"type": "string"},
+                                        "note": {"type": "string"},
+                                    },
+                                    "required": ["url"],
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "tier": {"type": "string", "enum": ["corpus", "web"]},
+                        },
+                        "required": ["kind", "target", "rationale", "evidence"],
+                        "additionalProperties": False,
+                    },
+                }
+            },
+            "required": ["proposals"],
+            "additionalProperties": False,
+        },
+    )
+
+
+def _scout_tools(*, remaining_searches: int, max_proposals: int) -> list[ToolUnionParam]:
+    """The tool list for one request, carrying the searches still affordable.
+
+    **`max_uses` is per API request, not per logical run.** A `pause_turn` resume is
+    a new request, so a tool list built once outside the resume loop hands every
+    resume a fresh full budget — turning a "hard ceiling" of 15 into
+    `(1 + _MAX_PAUSE_RESUMES) x 15 = 90` searches, and a $0.35 run into a $5 one.
+    Rebuilding here with the budget *decremented by what has already been spent* is
+    what makes the ceiling in `SCOUT_MAX_SEARCHES_CEILING` actually hard.
+
+    Floored at 0: a run that has already exhausted its budget still needs a valid
+    tool list, because the model may yet call `propose_source_changes` with what it
+    found before the searches ran out.
+    """
+    return [
+        WebSearchTool20260318Param(
+            type=_WEB_SEARCH_TOOL_TYPE,
+            name="web_search",
+            # Enforced server-side, so this is a real limit rather than an
+            # instruction the model may ignore.
+            max_uses=max(0, remaining_searches),
+            # Drops the nested search blocks from the assistant message once dynamic
+            # filtering has consumed them, which is an output-token saving: this is
+            # a single-turn call, so nothing needs to echo search content back.
+            response_inclusion="excluded",
+        ),
+        _propose_tool_schema(max_proposals),
+    ]
+
+
+def _effective_search_budget(requested: int, outcome: ScoutResult) -> int:
+    """Clamp the configured search budget to this module's ceiling, loudly.
+
+    Silently handing back a smaller number than the operator configured is the
+    "config that quietly does nothing" failure `_StrictModel` exists to prevent —
+    they would set 100, get 15, and never learn. So the clamp is recorded into
+    `ScoutResult.errors`, which the caller writes to `runs.errors`, which the next
+    digest surfaces (DESIGN §7's monitoring channel is the reports, not cron.log).
+    """
+    if requested <= SCOUT_MAX_SEARCHES_CEILING:
+        return requested
+    message = (
+        f"curation.max_searches_per_run is {requested}, above llm.py's ceiling of "
+        f"{SCOUT_MAX_SEARCHES_CEILING}; using {SCOUT_MAX_SEARCHES_CEILING}. Lower the "
+        "config value to silence this."
+    )
+    logger.warning("clamped the scout search budget", extra={"requested": requested})
+    outcome.errors.append(message)
+    return SCOUT_MAX_SEARCHES_CEILING
+
+
+def _accumulate_usage(outcome: ScoutResult, usage: object) -> None:
+    """Fold one response's usage into the running total.
+
+    Every attempt counts, including a paused turn that produced no proposals —
+    those searches and tokens were spent and must not vanish from the run's
+    accounting (NEVER rule 11). Attribute access is guarded because `usage` shapes
+    grow over time and a missing field must not lose the fields that are present.
+    """
+    outcome.input_tokens += (
+        int(getattr(usage, "input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_creation_input_tokens", 0) or 0)
+        + int(getattr(usage, "cache_read_input_tokens", 0) or 0)
+    )
+    outcome.output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+    server_tool_use = getattr(usage, "server_tool_use", None)
+    if server_tool_use is not None:
+        outcome.web_search_requests += int(getattr(server_tool_use, "web_search_requests", 0) or 0)
+
+
+def _collect_proposals(tool_input: object, outcome: ScoutResult) -> None:
+    """Validate the model's tool input into `ScoutProposal`s.
+
+    One bad proposal is recorded and skipped rather than failing the run: the
+    searches are already paid for, so discarding four good suggestions because a
+    fifth omitted its citation would waste the money twice (CLAUDE.md §7).
+    """
+    raw_proposals = tool_input.get("proposals") if isinstance(tool_input, dict) else None
+    if not isinstance(raw_proposals, list):
+        outcome.errors.append(f"{SCOUT_PROPOSE_TOOL_NAME} input had no 'proposals' list")
+        return
+    for index, raw in enumerate(raw_proposals):
+        try:
+            outcome.proposals.append(ScoutProposal.model_validate(raw))
+        except ValidationError as exc:
+            outcome.errors.append(f"proposal {index} failed validation: {exc}")
+
+
+def run_source_scout(
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    max_searches: int,
+    max_proposals: int,
+    client: anthropic.Anthropic | None = None,
+    model: str = SCOUT_MODEL,
+) -> ScoutResult:
+    """Ask the scout for `sources.yaml` changes, with web search, once.
+
+    Prompt text is built by `curate/prompts.py` and passed in — this module never
+    writes prompts (see the module docstring).
+
+    **No `cache_control` anywhere in this call, deliberately.** The system prompt is
+    stable enough to cache and caching it would still be wrong: the call runs once
+    a week, every cache entry has expired long before the next one, so a breakpoint
+    would pay the ~1.25x write premium for exactly zero reads. This is the one
+    place in the pipeline where the caching discipline is correctly inverted; do
+    not "fix" it (DESIGN §8).
+
+    **Never raises for an API failure** — that is deliberate and differs from
+    `run_triage_batch`. This call spends money in two places (searches and tokens)
+    across possibly several requests, so an exception thrown from the middle of the
+    loop would take the only record of that spend with it. Everything — a clamped
+    budget, a failed request, an invalid proposal, a turn that never called the
+    tool — comes back inside `ScoutResult` for the caller to record. The one
+    `LlmError` still possible comes from `get_anthropic_client`, which fails before
+    anything has been spent.
+    """
+    outcome = ScoutResult()
+    active_client = client if client is not None else get_anthropic_client()
+    budget = _effective_search_budget(max_searches, outcome)
+
+    messages: list[MessageParam] = [{"role": "user", "content": user_prompt}]
+    resumes = 0
+    while True:
+        try:
+            response = active_client.messages.create(
+                model=model,
+                max_tokens=SCOUT_MAX_TOKENS,
+                system=system_prompt,
+                # Rebuilt every iteration, because the remaining budget changes.
+                tools=_scout_tools(
+                    remaining_searches=budget - outcome.web_search_requests,
+                    max_proposals=max_proposals,
+                ),
+                output_config=OutputConfigParam(effort=SCOUT_EFFORT),
+                messages=messages,
+            )
+        except anthropic.APIError as exc:
+            # Recorded, not raised. By the time a resume fails, searches and tokens
+            # have already been spent, and raising would discard the only record of
+            # them — spend you cannot see is spend you cannot cap (NEVER rule 11).
+            # The caller writes `errors` into `runs.errors` and decides the run's
+            # status, which is the same isolation every other stage uses (§7).
+            logger.warning("source scout call failed", extra={"error": str(exc)})
+            outcome.errors.append(f"source scout call failed: {exc}")
+            break
+
+        _accumulate_usage(outcome, response.usage)
+
+        # `isinstance` rather than duck-typing on `.type`: the content union holds a
+        # dozen block types (server tool results, thinking, code execution) and only
+        # a real `ToolUseBlock` carries `.input`.
+        tool_calls = [
+            block
+            for block in response.content
+            if isinstance(block, ToolUseBlock) and block.name == SCOUT_PROPOSE_TOOL_NAME
+        ]
+        if tool_calls:
+            # The model calling the tool *is* the answer; nothing executes it and
+            # no tool_result goes back, so the conversation ends here.
+            _collect_proposals(tool_calls[0].input, outcome)
+            break
+
+        if response.stop_reason == "pause_turn":
+            resumes += 1
+            if resumes > _MAX_PAUSE_RESUMES:
+                outcome.errors.append(
+                    f"scout turn still paused after {_MAX_PAUSE_RESUMES} resumes; "
+                    "giving up with whatever it had"
+                )
+                break
+            # Resume by handing the paused turn straight back, unchanged. The
+            # server picks up where its search loop stopped.
+            messages = [
+                {"role": "user", "content": user_prompt},
+                {"role": "assistant", "content": response.content},
+            ]
+            continue
+
+        if response.stop_reason == "refusal":
+            outcome.errors.append("scout call was refused by safety classifiers")
+            break
+
+        # Ended without calling the tool. A legitimate "nothing to propose" should
+        # have been an empty tool call, so this is worth recording rather than
+        # reading as a quiet week.
+        outcome.errors.append(
+            f"scout finished with stop_reason={response.stop_reason!r} without calling "
+            f"{SCOUT_PROPOSE_TOOL_NAME}"
+        )
+        break
+
+    logger.info(
+        "source scout complete",
+        extra={
+            "proposal_count": len(outcome.proposals),
+            "error_count": len(outcome.errors),
+            "input_tokens": outcome.input_tokens,
+            "output_tokens": outcome.output_tokens,
+            "web_search_requests": outcome.web_search_requests,
+            "search_budget": budget,
         },
     )
     return outcome

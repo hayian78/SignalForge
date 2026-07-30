@@ -537,7 +537,8 @@ hard ceiling in `llm.py`: ≈ **$1.80/month** (12 searches at $10/1,000 = $0.52,
 input and ~4k output tokens at Opus rates). Two notes for §8's accounting:
 
 - Web search is billed **per search**, not per token, so token counts alone would hide it.
-  `runs.server_tool_requests` records the count and `status` prints the dollar figure.
+  `runs.server_tool_requests` records the count; the `status` readout that turns it
+  into a dollar figure lands with the `curate` CLI commands.
 - This call carries **no `cache_control`**, deliberately breaking the project's
   cache-everything discipline. At a weekly cadence every cache entry has long expired before
   the next run, so a breakpoint would pay the 1.25× write premium for exactly zero reads.
@@ -566,13 +567,20 @@ input and ~4k output tokens at Opus rates). Two notes for §8's accounting:
 | Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
-| Source curation scout (§7.1) | `claude-opus-5` | One call with the **web search server tool**, `max_uses` capped by config under a hard ceiling in `llm.py`; structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium) | 1 call/week, ~40k in / ~4k out, ≤ 12 searches |
+| Source curation scout (§7.1) | `claude-opus-5` | One call (plus bounded `pause_turn` resumes) with the **web search server tool**; `max_uses` capped by config under a hard ceiling in `llm.py`, **decremented per request** so resumes cannot re-arm it; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week, ~26k in / ~4k out, ships at 6 searches |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate:** triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **~$1.60/mo**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **~$2.40/mo**; deep reads and monthly report ≈ ~$3/mo; curation scout ≈ 4 × ($0.30 tokens + $0.12 searches) ≈ **~$1.80/mo**. **Total ≈ $5–10/month**, with $30 as the alarm threshold (the `runs` table tracks actual token spend; the weekly brief prints the month-to-date number).
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4 × ($0.13 tokens at 6 searches + $0.06 searches) ≈ **$0.80**. **Itemized total ≈ $7.80/month**, against a **$5–10 target** and a **$30 alarm**.
 
-**Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count and `signalforge status` prints its dollar figure beside the token spend, so the $30 alarm sees the whole invoice.
+Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$7.80 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
+
+**Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
+
+**Two cost facts about the search tool that are easy to get wrong**, both learned the expensive way on this branch:
+
+- `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`. The budget must be decremented by what has already been spent before each request.
+- Search-result content is billed as **input** tokens on every request that carries it, and a resume re-sends the accumulated conversation. Resume count therefore multiplies input cost, which is why it is bounded at 2 rather than the 5 an agentic loop would use: 5 puts the worst case at ~$3.66/month, over this feature's budget, and 2 puts it at ~$2.07, under. The resume bound and the search budget are **not independent** — raising searches to 12 puts the 2-resume worst case back over — so they are tuned together, not one at a time.
 
 ---
 

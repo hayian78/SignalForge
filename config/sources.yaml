@@ -168,8 +168,16 @@ curation:
   # this caps the one line of curation spend that token counts don't show. Turn
   # this first if the *search* figure in `signalforge status` surprises you. Set
   # to 0 to keep the scout entirely inside the stored corpus, which costs nothing
-  # beyond the one Opus call.
-  max_searches_per_run: 12
+  # beyond the one Opus call. (That figure arrives with the `curate` commands; the
+  # count is recorded from the first run either way.)
+  #
+  # Starts at 6 rather than the 12 the budget allows, deliberately. How many input
+  # tokens a search actually drags into context cannot be measured from tests — the
+  # suite never calls the real API (NEVER rule 13) — so the first real run IS the
+  # instrument. Read `signalforge status` after two runs and raise this to 12 if the
+  # figure is where DESIGN §8 expects. Halving it halves both billed lines while
+  # that is unknown.
+  max_searches_per_run: 6
 
   # Lookback for the yield stats that justify a retirement.
   yield_window_days: 30
