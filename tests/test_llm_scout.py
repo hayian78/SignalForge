@@ -9,10 +9,10 @@ stand-in would pass a test the real API would fail.
 What these tests are actually protecting:
 
 * **The spend caps.** `max_uses` on the search tool, the ceiling that config
-  cannot exceed, and the resume bound. Each of those is real money if it breaks.
-* **The accounting.** Tokens *and* `web_search_requests`, accumulated across every
-  attempt including paused ones. Search bills per call, so a run's cost is not
-  derivable from tokens (NEVER rule 11).
+  cannot exceed, and the one-request-per-run rule that makes the monthly ceiling
+  provable rather than estimated. Each is real money if it breaks.
+* **The accounting.** Tokens *and* `web_search_requests`. Search bills per call, so
+  a run's cost is not derivable from tokens (NEVER rule 11).
 * **Failure isolation.** One malformed proposal must not discard the others from a
   call that has already been paid for.
 """
@@ -27,11 +27,11 @@ from anthropic import APIError
 from anthropic.types import Message, ServerToolUsage, TextBlock, ToolUseBlock, Usage
 
 from signalforge.llm import (
-    _MAX_PAUSE_RESUMES,
     SCOUT_EFFORT,
     SCOUT_MAX_SEARCHES_CEILING,
     SCOUT_MAX_TOKENS,
     SCOUT_MODEL,
+    SCOUT_MONTHLY_CEILING_USD,
     SCOUT_PROPOSE_TOOL_NAME,
     LlmError,
     run_source_scout,
@@ -163,8 +163,8 @@ def test_the_request_declares_web_search_with_the_configured_cap() -> None:
     # `max_uses` is enforced server-side, so this is the real spend limit rather
     # than an instruction the model may ignore.
     assert search["max_uses"] == 9
-    # Drops raw search blocks from the response once dynamic filtering has used
-    # them — pure output-token saving on a single-turn call.
+    # Drops the nested search blocks from the assistant message once dynamic
+    # filtering has consumed them — an output-token saving.
     assert search["response_inclusion"] == "excluded"
 
 
@@ -311,102 +311,72 @@ def test_usage_without_server_tool_use_does_not_lose_the_token_counts() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_a_paused_turn_is_resumed_and_its_spend_still_counted() -> None:
-    """A long search turn pauses; resuming it is how the answer arrives.
-
-    The paused attempt's tokens and searches are spent whether or not it produced
-    proposals, so they are accumulated too — the failure mode being guarded is a
-    run that reports half its real cost.
-    """
-    paused = _message(proposals=None, stop_reason="pause_turn", input_tokens=20_000, web_searches=4)
-    finished = _message(proposals=[_proposal()], input_tokens=25_000, web_searches=3)
-
-    result, client = _run([paused, finished])
-
-    assert len(result.proposals) == 1
-    assert result.input_tokens == 45_000
-    assert result.web_search_requests == 7
-    assert len(client.messages.requests) == 2
-    # The paused turn is handed straight back, unchanged, so the server resumes
-    # its search loop rather than starting over.
-    resumed = client.messages.requests[1]["messages"]
-    assert resumed[0] == {"role": "user", "content": USER_PROMPT}
-    assert resumed[1]["role"] == "assistant"
-    assert resumed[1]["content"] == paused.content
-
-
 def _search_budget(request: dict[str, Any]) -> int:
     search = next(tool for tool in request["tools"] if str(tool["type"]).startswith("web_search"))
     return int(search["max_uses"])
 
 
-def test_a_resume_cannot_re_arm_the_search_budget() -> None:
-    """The bug that made "hard ceiling" a lie, and the most expensive one on this branch.
+def test_the_scout_makes_exactly_one_api_request() -> None:
+    """One request per run is the fact that makes this call's ceiling provable.
 
-    `max_uses` bounds searches **per API request**, and a `pause_turn` resume is a
-    new request. Building the tool list once outside the resume loop therefore
-    handed every resume a fresh full budget: a ceiling of 15 became
-    `(1 + 5 resumes) x 15 = 90` searches, and a ~$0.35 run became a ~$5 one — one
-    bad Sunday exceeding the entire monthly budget.
+    `max_tokens` bounds output *per request*, so resuming a paused turn multiplies
+    it: at two resumes the enforced ceiling is 3 x 16,384 output tokens ~ $6.52/month,
+    past this feature's budget, and no `max_tokens` that avoids truncation fixes
+    that while resumes exist. With one request the absolute worst case is ~$2.35/month
+    from code constants alone.
 
-    So each request must carry the budget *decremented by what has already been
-    spent*. Asserting the numbers on the wire, because this is invisible from the
-    result object: the run still looks fine while costing six times as much.
+    Asserted rather than commented because re-adding a resume loop is a natural
+    "improvement" that would silently triple the ceiling.
     """
-    paused_one = _message(proposals=None, stop_reason="pause_turn", web_searches=4)
-    paused_two = _message(proposals=None, stop_reason="pause_turn", web_searches=3)
-    finished = _message(proposals=[_proposal()], web_searches=2)
+    _, client = _run([_message(proposals=[_proposal()])])
 
-    result, client = _run([paused_one, paused_two, finished], max_searches=10)
-
-    budgets = [_search_budget(request) for request in client.messages.requests]
-    assert budgets == [10, 6, 3], "each request must offer only the searches still unspent"
-    assert result.web_search_requests == 9
-    assert sum(budgets) > 10, "sanity: the naive bug would have made every entry 10"
+    assert len(client.messages.requests) == 1
 
 
-def test_an_exhausted_budget_still_sends_a_valid_zero_use_tool() -> None:
-    # The model may still call `propose_source_changes` with what it found before
-    # the searches ran out, so the request has to remain well-formed.
-    paused = _message(proposals=None, stop_reason="pause_turn", web_searches=10)
-    finished = _message(proposals=[_proposal()], web_searches=0)
+def test_a_paused_turn_is_recorded_and_not_resumed() -> None:
+    # The cost of the single-request rule: a turn that pauses yields nothing this
+    # week. Recorded so it reaches `runs.errors` and the next digest, because a run
+    # that silently produced nothing looks identical to a quiet week.
+    paused = _message(proposals=None, stop_reason="pause_turn", web_searches=4)
 
-    _, client = _run([paused, finished], max_searches=10)
+    result, client = _run([paused, _message(proposals=[_proposal()])])
 
-    assert _search_budget(client.messages.requests[1]) == 0
-
-
-def test_an_overspending_response_cannot_drive_the_budget_negative() -> None:
-    # Defensive: if the server ever reports more searches than were offered, the
-    # next request must clamp at 0 rather than send a negative `max_uses`.
-    paused = _message(proposals=None, stop_reason="pause_turn", web_searches=99)
-    finished = _message(proposals=[_proposal()], web_searches=0)
-
-    _, client = _run([paused, finished], max_searches=10)
-
-    assert _search_budget(client.messages.requests[1]) == 0
-
-
-def test_endless_pausing_is_bounded_rather_than_looping_forever() -> None:
-    """The resume bound is a budget line, not just a loop guard.
-
-    Each resume re-sends the accumulated conversation, so the resume count
-    multiplies input cost even with the search budget decremented across requests.
-    The exact bound is asserted rather than "fewer than twenty" because the
-    arithmetic that chose it is what keeps the worst case inside the ≤$2.50/month
-    budget: 5 resumes costs ~$3.66/month, 2 costs ~$2.07 (see
-    `llm._MAX_PAUSE_RESUMES`).
-    """
-    always_paused = [
-        _message(proposals=None, stop_reason="pause_turn", web_searches=1) for _ in range(20)
-    ]
-
-    result, client = _run(always_paused)
-
+    assert len(client.messages.requests) == 1, "must not resume"
     assert result.proposals == []
-    assert any("still paused" in error for error in result.errors)
-    # One initial request plus exactly the permitted resumes.
-    assert len(client.messages.requests) == 1 + _MAX_PAUSE_RESUMES
+    assert any("paused" in error for error in result.errors)
+    # The searches it did run are still on the invoice and still counted.
+    assert result.web_search_requests == 4
+
+
+def test_the_search_budget_reaches_the_only_request() -> None:
+    _, client = _run([_message(proposals=[])], max_searches=6)
+
+    assert _search_budget(client.messages.requests[0]) == 6
+
+
+def test_the_worst_case_cost_stays_within_the_recorded_ceiling() -> None:
+    """Guards the budget arithmetic against a later constant change.
+
+    Recomputes the absolute worst case from the module's own constants — one
+    request, searches maxed, output maxed — and checks it against the ceiling
+    recorded beside them. Raising `SCOUT_MAX_TOKENS`, or the shipped search budget,
+    without re-checking the sum fails here rather than on an invoice.
+    """
+    in_rate, out_rate, per_search_usd, weeks = 5 / 1e6, 25 / 1e6, 0.01, 4.33
+    shipped_searches = 6  # config/sources.yaml curation.max_searches_per_run
+    prompt_tokens = 2_500
+    per_search_result_tokens = 2_000
+
+    tokens_in = prompt_tokens + shipped_searches * per_search_result_tokens
+    worst_per_run = (
+        tokens_in * in_rate + SCOUT_MAX_TOKENS * out_rate + shipped_searches * per_search_usd
+    )
+
+    assert worst_per_run * weeks <= SCOUT_MONTHLY_CEILING_USD, (
+        f"worst case is ${worst_per_run * weeks:.2f}/month against a "
+        f"${SCOUT_MONTHLY_CEILING_USD:.2f} ceiling; re-tune the constants or "
+        "renegotiate the budget with the operator"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -495,6 +465,24 @@ def _api_error() -> APIError:
     return APIError("boom", request=request, body=None)
 
 
+def test_a_failed_request_still_reports_the_searches_it_paid_for() -> None:
+    """Searches run server-side before the response is read, so a failure that
+    discarded the record would hide real spend (NEVER rule 11).
+
+    Exercised through the single request the scout now makes: the failure path has
+    to preserve whatever the run had, even though there is no resume to accumulate
+    across any more.
+    """
+    result, _ = _run([_api_error()])
+
+    assert result.proposals == []
+    assert any("source scout call failed" in error for error in result.errors)
+    # Nothing was read back, so the counts are zero — but the *shape* is intact and
+    # the caller still gets a result to record rather than an exception.
+    assert result.input_tokens == 0
+    assert result.web_search_requests == 0
+
+
 def test_an_api_error_is_recorded_rather_than_raised() -> None:
     # Deliberately unlike `run_triage_batch`, which raises. This call spends money
     # in two places across possibly several requests, so an exception thrown from
@@ -502,24 +490,6 @@ def test_an_api_error_is_recorded_rather_than_raised() -> None:
     result, _ = _run([_api_error()])
 
     assert result.proposals == []
-    assert any("source scout call failed" in error for error in result.errors)
-
-
-def test_a_failure_after_a_resume_keeps_the_spend_already_incurred() -> None:
-    """The reason the API error is recorded and not raised.
-
-    A first request that ran searches and then a resume that 529s must not report
-    zero cost: those searches and tokens are on the invoice whether or not the run
-    produced anything. Raising here would have made real spend invisible, which is
-    exactly what NEVER rule 11 forbids.
-    """
-    paused = _message(proposals=None, stop_reason="pause_turn", input_tokens=30_000, web_searches=5)
-
-    result, _ = _run([paused, _api_error()])
-
-    assert result.proposals == []
-    assert result.input_tokens == 30_000
-    assert result.web_search_requests == 5, "the searches happened; the bill will say so"
     assert any("source scout call failed" in error for error in result.errors)
 
 

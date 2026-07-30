@@ -27,7 +27,6 @@ from typing import Final, Literal
 
 import anthropic
 from anthropic.types import (
-    MessageParam,
     OutputConfigParam,
     ToolParam,
     ToolUnionParam,
@@ -48,6 +47,7 @@ __all__ = [
     "SCOUT_MAX_SEARCHES_CEILING",
     "SCOUT_MAX_TOKENS",
     "SCOUT_MODEL",
+    "SCOUT_MONTHLY_CEILING_USD",
     "SCOUT_PROPOSE_TOOL_NAME",
     "TRIAGE_BATCH_SIZE",
     "TRIAGE_MAX_TOKENS",
@@ -122,30 +122,29 @@ Public so `curate/prompts.py` can name it in the instructions without keeping a
 second copy of the string — the prompt telling the model to call a tool that does
 not exist is a silent, expensive failure."""
 
-_MAX_PAUSE_RESUMES: Final = 2
-"""How many times a paused search turn may be resumed.
+SCOUT_MONTHLY_CEILING_USD: Final = 2.50
+"""The agreed monthly budget for this feature, recorded next to the constants that
+enforce it (DESIGN §7.1, §8).
 
-A long server-tool turn returns `stop_reason: "pause_turn"` and is continued by
-re-sending it unchanged. Bounded because a resume **re-sends the accumulated
-conversation**, so the resume count multiplies input cost even though the search
-budget is now decremented across requests.
+Here rather than only in a doc because the two knobs below are tuned *to* it: a
+future editor raising `curation.max_searches_per_run` needs the number in front of
+them. Enforced by three facts, all checkable from code:
 
-2 rather than the 5 an agentic loop would use, because 5 does not fit the budget.
-Worst case is every run pausing the maximum number of times with all searches
-already spent, so each resume re-sends the full result set:
+* exactly one API request per run — no resumes (see `run_source_scout`);
+* `max_uses` caps searches server-side at `SCOUT_MAX_SEARCHES_CEILING` or below;
+* `SCOUT_MAX_TOKENS` caps output for that single request.
 
-    6 searches x 2k tokens = 12k of results, plus a ~2.5k prompt
-    resumes=5 -> 6 requests x 14.5k in + ~14k out  = $0.85/run = $3.66/month
-    resumes=2 -> 3 requests x 14.5k in + ~8k out   = $0.48/run = $2.07/month
+Absolute worst case, assuming the model maxes its output ceiling every week:
 
-$3.66 breaches the ≤$2.50/month budget agreed for this feature; $2.07 does not.
-With only 6 searches on offer the server-side loop rarely pauses at all, so this
-costs nothing in practice — it converts a worst case that broke the budget into one
-that fits inside it.
+    input   2.5k prompt + 6 searches x ~2k filtered results = 14.5k  -> $0.073
+    output  16,384 tokens (the enforced ceiling, not an estimate)    -> $0.410
+    search  6 x $0.01                                                -> $0.060
+    = $0.54/run x 4.33 weeks = ~$2.35/month, under the ceiling
 
-**Recheck this alongside `curation.max_searches_per_run`.** Raising the search
-budget to 12 puts the 2-resume worst case at $3.11/month, back over the gate. The
-two numbers are not independent."""
+Expected is ~$1.01/month, because a real run produces ~4k of output, not 16k.
+
+**Recheck when changing `curation.max_searches_per_run`.** At 12 searches the same
+worst case is ~$2.87/month, over this ceiling. The knobs are not independent."""
 
 TRIAGE_BATCH_SIZE: Final = 25
 """Items grouped into one Messages request within the batch (DESIGN §8)."""
@@ -733,11 +732,25 @@ def run_source_scout(
     place in the pipeline where the caching discipline is correctly inverted; do
     not "fix" it (DESIGN §8).
 
-    **Never raises for an API failure** — that is deliberate and differs from
-    `run_triage_batch`. This call spends money in two places (searches and tokens)
-    across possibly several requests, so an exception thrown from the middle of the
-    loop would take the only record of that spend with it. Everything — a clamped
-    budget, a failed request, an invalid proposal, a turn that never called the
+    **Exactly one API request. A paused turn is not resumed.** That is a cost
+    decision, and it is what makes this call's ceiling provable rather than
+    estimated. `max_tokens` bounds output *per request*, so resuming multiplies it:
+    with two resumes the enforced ceiling is 3 × 16,384 output tokens ≈ $6.52/month,
+    well past this feature's ≤$2.50 budget, and no `max_tokens` that avoids
+    truncation fixes that while resumes exist. One request bounds the absolute worst
+    case at ~$2.35/month from code constants alone — no assumption about how much
+    the model actually writes.
+
+    What that costs: a turn that pauses yields nothing that week. Acceptable here
+    because the searches are capped at 6 (so the server-side loop rarely reaches a
+    pause at all), the pause is recorded and surfaces in the next digest, and the
+    run simply happens again next Sunday. If pauses turn out to be common, that will
+    be visible in `runs.errors` and is the moment to revisit with real data.
+
+    **Never raises for an API failure** — deliberate, and unlike `run_triage_batch`.
+    Searches and tokens are spent before the response is read, so an exception would
+    take the only record of that spend with it. Everything — a clamped budget, a
+    failed request, a pause, an invalid proposal, a turn that never called the
     tool — comes back inside `ScoutResult` for the caller to record. The one
     `LlmError` still possible comes from `get_anthropic_client`, which fails before
     anything has been spent.
@@ -746,77 +759,55 @@ def run_source_scout(
     active_client = client if client is not None else get_anthropic_client()
     budget = _effective_search_budget(max_searches, outcome)
 
-    messages: list[MessageParam] = [{"role": "user", "content": user_prompt}]
-    resumes = 0
-    while True:
-        try:
-            response = active_client.messages.create(
-                model=model,
-                max_tokens=SCOUT_MAX_TOKENS,
-                system=system_prompt,
-                # Rebuilt every iteration, because the remaining budget changes.
-                tools=_scout_tools(
-                    remaining_searches=budget - outcome.web_search_requests,
-                    max_proposals=max_proposals,
-                ),
-                output_config=OutputConfigParam(effort=SCOUT_EFFORT),
-                messages=messages,
-            )
-        except anthropic.APIError as exc:
-            # Recorded, not raised. By the time a resume fails, searches and tokens
-            # have already been spent, and raising would discard the only record of
-            # them — spend you cannot see is spend you cannot cap (NEVER rule 11).
-            # The caller writes `errors` into `runs.errors` and decides the run's
-            # status, which is the same isolation every other stage uses (§7).
-            logger.warning("source scout call failed", extra={"error": str(exc)})
-            outcome.errors.append(f"source scout call failed: {exc}")
-            break
+    try:
+        response = active_client.messages.create(
+            model=model,
+            max_tokens=SCOUT_MAX_TOKENS,
+            system=system_prompt,
+            tools=_scout_tools(remaining_searches=budget, max_proposals=max_proposals),
+            output_config=OutputConfigParam(effort=SCOUT_EFFORT),
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+    except anthropic.APIError as exc:
+        # Recorded, not raised: see the docstring. Searches may already have run.
+        logger.warning("source scout call failed", extra={"error": str(exc)})
+        outcome.errors.append(f"source scout call failed: {exc}")
+        return _finished(outcome, budget)
 
-        _accumulate_usage(outcome, response.usage)
+    _accumulate_usage(outcome, response.usage)
 
-        # `isinstance` rather than duck-typing on `.type`: the content union holds a
-        # dozen block types (server tool results, thinking, code execution) and only
-        # a real `ToolUseBlock` carries `.input`.
-        tool_calls = [
-            block
-            for block in response.content
-            if isinstance(block, ToolUseBlock) and block.name == SCOUT_PROPOSE_TOOL_NAME
-        ]
-        if tool_calls:
-            # The model calling the tool *is* the answer; nothing executes it and
-            # no tool_result goes back, so the conversation ends here.
-            _collect_proposals(tool_calls[0].input, outcome)
-            break
-
-        if response.stop_reason == "pause_turn":
-            resumes += 1
-            if resumes > _MAX_PAUSE_RESUMES:
-                outcome.errors.append(
-                    f"scout turn still paused after {_MAX_PAUSE_RESUMES} resumes; "
-                    "giving up with whatever it had"
-                )
-                break
-            # Resume by handing the paused turn straight back, unchanged. The
-            # server picks up where its search loop stopped.
-            messages = [
-                {"role": "user", "content": user_prompt},
-                {"role": "assistant", "content": response.content},
-            ]
-            continue
-
-        if response.stop_reason == "refusal":
-            outcome.errors.append("scout call was refused by safety classifiers")
-            break
-
-        # Ended without calling the tool. A legitimate "nothing to propose" should
-        # have been an empty tool call, so this is worth recording rather than
-        # reading as a quiet week.
+    # `isinstance` rather than duck-typing on `.type`: the content union holds a
+    # dozen block types (server tool results, thinking, code execution) and only a
+    # real `ToolUseBlock` carries `.input`.
+    tool_calls = [
+        block
+        for block in response.content
+        if isinstance(block, ToolUseBlock) and block.name == SCOUT_PROPOSE_TOOL_NAME
+    ]
+    if tool_calls:
+        # The model calling the tool *is* the answer; nothing executes it and no
+        # tool_result goes back, so the exchange ends here.
+        _collect_proposals(tool_calls[0].input, outcome)
+    elif response.stop_reason == "pause_turn":
+        outcome.errors.append(
+            "scout turn paused mid-search and is not resumed (resuming multiplies the "
+            "per-request output ceiling past this feature's budget); nothing proposed "
+            "this run"
+        )
+    elif response.stop_reason == "refusal":
+        outcome.errors.append("scout call was refused by safety classifiers")
+    else:
+        # A legitimate "nothing to propose" should have been an empty tool call, so
+        # this is worth recording rather than reading as a quiet week.
         outcome.errors.append(
             f"scout finished with stop_reason={response.stop_reason!r} without calling "
             f"{SCOUT_PROPOSE_TOOL_NAME}"
         )
-        break
+    return _finished(outcome, budget)
 
+
+def _finished(outcome: ScoutResult, budget: int) -> ScoutResult:
+    """Log the run's shape and spend, then hand it back."""
     logger.info(
         "source scout complete",
         extra={

@@ -532,9 +532,20 @@ never writes an `items` row. `ingest/` still imports no LLM.
 
 ### Cost
 
-One weekly Opus call plus web searches capped by `curation.max_searches_per_run` under a
-hard ceiling in `llm.py`: ≈ **$1.80/month** (12 searches at $10/1,000 = $0.52, plus ~40k
-input and ~4k output tokens at Opus rates). Two notes for §8's accounting:
+**Budget: ≤ $2.50/month for this feature**, recorded in code as
+`llm.SCOUT_MONTHLY_CEILING_USD` beside the constants that enforce it. Expected spend is
+≈ **$1.00/month**; the *absolute* worst case is ≈ **$2.35/month**, and it is a ceiling
+derived from enforced limits rather than a forecast of good behaviour — three facts, each
+checkable from code:
+
+1. exactly one API request per run, no resumes;
+2. searches capped server-side by `max_uses` at the configured budget (ships at 6);
+3. output capped by `SCOUT_MAX_TOKENS` for that single request.
+
+Raising `curation.max_searches_per_run` to 12 puts the same worst case at ≈ $2.87/month,
+over the ceiling — the search budget and the output ceiling are not independent knobs.
+
+Two notes for §8's accounting:
 
 - Web search is billed **per search**, not per token, so token counts alone would hide it.
   `runs.server_tool_requests` records the count; the `status` readout that turns it
@@ -567,11 +578,13 @@ input and ~4k output tokens at Opus rates). Two notes for §8's accounting:
 | Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
-| Source curation scout (§7.1) | `claude-opus-5` | One call (plus bounded `pause_turn` resumes) with the **web search server tool**; `max_uses` capped by config under a hard ceiling in `llm.py`, **decremented per request** so resumes cannot re-arm it; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week, ~26k in / ~4k out, ships at 6 searches |
+| Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week, ~14.5k in / ~4k out, ships at 6 searches |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4 × ($0.13 tokens at 6 searches + $0.06 searches) ≈ **$0.80**. **Itemized total ≈ $7.80/month**, against a **$5–10 target** and a **$30 alarm**.
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (14.5k in ≈ $0.07 + 4k out ≈ $0.10 + 6 searches ≈ $0.06) ≈ **$1.00**. **Itemized total ≈ $8.00/month**, against a **$5–10 target** and a **$30 alarm**.
+
+Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
 Two things that estimate is not. It is not measured: the only measured figure to date is **≈ $0.40/month actual** (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku), because only triage is built — every other line prices a component that does not exist yet. And it is no longer comfortably mid-band: adding the scout put the itemization at ~$7.80 inside a range written when the items summed to ~$7.00. The headroom is real given actual spend, but it is nearly gone on paper, so the *next* new LLM consumer needs the band revisited rather than absorbed.
 
@@ -579,8 +592,10 @@ Two things that estimate is not. It is not measured: the only measured figure to
 
 **Two cost facts about the search tool that are easy to get wrong**, both learned the expensive way on this branch:
 
-- `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`. The budget must be decremented by what has already been spent before each request.
-- Search-result content is billed as **input** tokens on every request that carries it, and a resume re-sends the accumulated conversation. Resume count therefore multiplies input cost, which is why it is bounded at 2 rather than the 5 an agentic loop would use: 5 puts the worst case at ~$3.66/month, over this feature's budget, and 2 puts it at ~$2.07, under. The resume bound and the search budget are **not independent** — raising searches to 12 puts the 2-resume worst case back over — so they are tuned together, not one at a time.
+- `max_uses` bounds searches **per API request**, not per logical run. A `pause_turn` resume is a new request, so a tool definition built once and reused across resumes re-arms the full budget each time — turning a ceiling of N into `(1 + resumes) × N`.
+- `max_tokens` also bounds output **per request**, so resuming multiplies the *output* ceiling too. That is the fact that decided the scout's shape: at two resumes the enforced ceiling is 3 × 16,384 output tokens ≈ **$6.52/month**, and no `max_tokens` low enough to fix it is high enough to avoid truncating a run that has already paid for its searches. So the scout makes **one request and does not resume**, which bounds its absolute worst case at ≈ **$2.35/month** from constants alone — see `llm.SCOUT_MONTHLY_CEILING_USD`.
+- Search-result content is billed as **input** tokens on every request that carries it, so a resume re-sending the accumulated conversation pays for the same results twice.
+- **State a budget as a ceiling derived from enforced limits, not from expected behaviour.** The scout's first worst-case figure assumed ~4k of output per turn and looked comfortable; recomputed against the `max_tokens` the code actually permits, the same scenario was 3× over. An estimate that assumes good behaviour is a forecast, not a bound.
 
 ---
 
