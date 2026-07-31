@@ -25,23 +25,26 @@ rss:
   - id: simonwillison
     url: https://simonwillison.net/atom/everything/
     weight: 1.3
-  - id: interconnects
-    url: https://www.interconnects.ai/feed
+  # 2026-08-01 curate #2: 22 items in 30 days, 0 kept, no operator marks — the worst signal-per-item in the RSS tier. The author states a 1-3 post/week cadence, so this cost will keep recurring at the same rate; Nathan…
+  # - id: interconnects
+  #   url: https://www.interconnects.ai/feed
   - id: karpathy
     url: https://karpathy.bearblog.dev/feed/
   - id: chip-huyen
     url: https://huyenchip.com/feed.xml
   - id: hamel-husain
     url: https://hamel.dev/index.xml
-  - id: swyx
-    url: https://www.swyx.io/rss.xml
+  # 2026-08-01 curate #3: 432 items, 393 killed, one noise mark and zero useful marks — 91% of your triage load in the RSS tier for nothing a human flagged. The same author's concentrated output already comes in via…
+  # - id: swyx
+  #   url: https://www.swyx.io/rss.xml
   # Company engineering blogs (added 2026-07-17). Higher volume and more product
   # marketing than the personal blogs above — triage against the `signal`
   # rubric dimension (which scores contentless hype at 1) is the filter.
   - id: openai-news
     url: https://openai.com/news/rss.xml
-  - id: deepmind
-    url: https://deepmind.google/blog/rss.xml
+  # 2026-08-01 curate #5: 9 items, 1 kept, 8 killed, no operator marks. The lab-comms feed is release-announcement copy rather than the strategy or engineering detail your kept list is made of (Cognition on multi-agent,…
+  # - id: deepmind
+  #   url: https://deepmind.google/blog/rss.xml
   - id: microsoft-research
     url: https://www.microsoft.com/en-us/research/feed/
   # Removed 2026-07-24 as part of the executive-briefing rebalance: engineering
@@ -76,6 +79,12 @@ rss:
   # the last 10 items are one-sentence teaser stubs (~100-150 chars, no article
   # body; only the weekly "This Week in Stratechery" roundup emails carry real
   # content) — paywalled to uselessness as expected for a members-only pub.
+  # 2026-08-01 curate #6: policy.regulation is a priority topic with no dedicated source in the inventory — import-ai and ai-snake-oil cover it incidentally. Transformer is a weekly reported briefing that is currently…
+  - id: transformer-news
+    url: https://www.transformernews.ai/feed
+  # 2026-08-01 curate #7: openai-news earned 4 'useful' marks and anthropics/claude-code 14 kept / 4 useful, yet there is no first-party Anthropic feed in the inventory; anthropic.com ships no official RSS, so this maintained…
+  - id: anthropic-news
+    url: https://raw.githubusercontent.com/taobojlen/anthropic-rss-feed/main/anthropic_news_rss.xml
 # Anthropic's engineering blog publishes no RSS feed (every plausible path 404s
 # as of 2026-07-16). Its posts reach HN within hours, and `hackernews.keywords`
 # below already covers them — same reasoning DESIGN §7 applies to X/Twitter.
