@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import os
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -22,12 +23,16 @@ import yaml
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
 
+from signalforge.models import has_control_characters
+
 __all__ = [
     "SETTINGS_FILENAME",
     "SOURCES_FILENAME",
     "ArxivConfig",
     "ConfigError",
     "CurationConfig",
+    "DeliveryConfig",
+    "EmailChannelConfig",
     "GithubConfig",
     "HackerNewsConfig",
     "IgnoreRules",
@@ -326,6 +331,125 @@ class InterestsConfig(_StrictModel):
 # --------------------------------------------------------------------------- #
 
 
+_RESEND_KEY_PREFIX: Final = "re_"
+"""The prefix a real Resend API key carries. Matched against `api_key_env` to catch a
+pasted secret, the same guard `GithubConfig.token_env` applies to a PAT."""
+
+_RESEND_KEY_MIN_LENGTH: Final = 20
+"""Length below which a `re_`-prefixed string is too short to be a real Resend key.
+Real ones run ~35 characters; this only has to separate them from an env-var name."""
+
+
+class EmailChannelConfig(_StrictModel):
+    """The `delivery.email:` block — a read-only mirror of a rendered report.
+
+    Email is an *outbound* channel and nothing more. The vault stays canonical
+    (DESIGN §13.2): marks and curation ticks are harvested from `<vault>/daily/*.md`
+    only, so a digest that was emailed but not written is not a digest that
+    happened. Nothing here can make the vault write conditional.
+    """
+
+    enabled: bool
+    """Required rather than defaulted. Writing this block is a deliberate act, and an
+    off-switch you have to delete the block to reach is not an off-switch. A missing
+    `enabled` is the invisible-misconfig failure `_StrictModel` exists to catch."""
+
+    api_key_env: str = Field(min_length=1)
+    """Name of the env var holding the provider API key — never the key itself
+    (CLAUDE.md §10 rule 16)."""
+
+    from_address: str = Field(min_length=1)
+    """Sender, bare (`digest@example.com`) or with a display name
+    (`SignalForge <digest@example.com>`)."""
+
+    to: list[str] = Field(min_length=1)
+    """Recipients. Single-user tool, but a list costs nothing and reads honestly."""
+
+    # Deliberately absent: a `provider:` selector and a `send_on:` list.
+    #
+    # `deliver/email.py` posts to one hardcoded endpoint, so a `provider` field
+    # could not change behaviour — a config option nothing reads is worse than no
+    # option, because it looks like a choice. `daily` is likewise the only report
+    # that renders, so `send_on` would be a knob with one legal value that could
+    # also be set to `[]` for an `enabled: true` channel that sends nothing.
+    #
+    # Both get added with the thing that needs them — a second provider, the Weekly
+    # Brief — when their shape is known rather than guessed (CLAUDE.md §1: when in
+    # doubt, build less).
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _reject_inline_secret(cls, value: str) -> str:
+        """`api_key_env` must name an env var, not carry the key.
+
+        Same guard, same reasoning as `GithubConfig.token_env`: the likely mistake is
+        pasting a live `re_...` key into YAML.
+
+        Matched case-sensitively and with a length floor, unlike the GitHub check.
+        `ghp_`/`github_pat_` are distinctive enough to match case-insensitively; `re_`
+        is three characters and collides with legitimate names — `RE_DIGEST_KEY`
+        lowercases to something starting `re_`. Requiring the literal lowercase prefix
+        *and* a body too long to be a variable name keeps that name usable while a
+        pasted key, which is lowercase-prefixed and ~35 characters, still fails.
+        """
+        looks_like_a_key = (
+            value.startswith(_RESEND_KEY_PREFIX) and len(value) >= _RESEND_KEY_MIN_LENGTH
+        )
+        if not value.replace("_", "").isalnum() or looks_like_a_key:
+            raise ValueError(
+                "api_key_env must be the NAME of an environment variable "
+                "(e.g. RESEND_API_KEY), never a key value"
+            )
+        return value
+
+    @field_validator("from_address", "to")
+    @classmethod
+    def _validate_addresses(cls, value: str | list[str]) -> str | list[str]:
+        """Reject anything that is not a parseable address, and any control character.
+
+        The control-character check is the load-bearing half. These strings are
+        attacker-adjacent only in theory for a local config file, but they end up in
+        message headers, where a stray `\\r\\n` is header injection. Identity fields
+        are *refused* rather than repaired (DESIGN §13.1) — silently rewriting an
+        address changes who the mail goes to.
+
+        Refusal is why `parseaddr`'s output is checked for *containment* rather than
+        just parsed. `parseaddr` repairs as it reads: it strips interior whitespace,
+        so `a@e.com x` parses to `a@e.comx` and `a @e.com` to `a@e.com`. Validating
+        the repair and then storing the original would approve a domain the operator
+        never wrote and hand the provider the broken string anyway. Requiring the
+        parsed address to appear verbatim in the input closes that gap while still
+        accepting a display-name form, where the address is a substring.
+        """
+        for address in [value] if isinstance(value, str) else value:
+            if has_control_characters(address):
+                raise ValueError(f"address contains a control character: {address!r}")
+            _, parsed = parseaddr(address)
+            local, _, domain = parsed.partition("@")
+            labels = domain.split(".")
+            if (
+                not local
+                or len(labels) < 2
+                or not all(labels)
+                or parsed not in address  # see the docstring: refuse, never repair
+            ):
+                raise ValueError(
+                    f"expected an email address, optionally with a display name, got {address!r}"
+                )
+        return value
+
+
+class DeliveryConfig(_StrictModel):
+    """The `delivery:` block — where a rendered report is mirrored to, beyond the vault.
+
+    One channel today. A second (Telegram, per DESIGN §13.2) is a new field here and a
+    new module in `deliver/`, not a plugin registry: at this scale the explicit list
+    is shorter than the machinery that would avoid it.
+    """
+
+    email: EmailChannelConfig | None = None
+
+
 class SettingsConfig(_StrictModel):
     """Root model for `settings.yaml` — machine-local app and locale settings.
 
@@ -359,6 +483,11 @@ class SettingsConfig(_StrictModel):
             "the historical location — and the `--vault-dir` flag overrides it."
         ),
     )
+
+    delivery: DeliveryConfig = Field(default_factory=DeliveryConfig)
+    """Outbound mirrors of a rendered report (DESIGN §13.2's push channel). Absent means
+    the vault is the only destination, which is the historical behaviour and stays the
+    default: delivery is additive, never a substitute for the vault write."""
 
     @field_validator("vault_dir", mode="before")
     @classmethod

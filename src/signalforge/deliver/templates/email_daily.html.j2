@@ -1,0 +1,66 @@
+{# Autoescaped — see `deliver/email.py`. Item titles are feed-controlled text. #}
+{# Styles are inline rather than in a <style> block: enough mail clients strip or #}
+{# ignore embedded stylesheets that inline attributes are the only reliable form. #}
+<div style="margin:0;padding:16px;background:#f6f7f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+  <div style="max-width:640px;margin:0 auto;background:#ffffff;border-radius:10px;padding:20px;">
+
+    <p style="margin:0 0 4px;font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:#6b7280;">SignalForge</p>
+    <h1 style="margin:0 0 20px;font-size:20px;line-height:1.3;color:#111827;">Daily Digest — {{ context.date.isoformat() }}</h1>
+
+    {% if context.items %}
+    {% for line in context.items %}
+    <div style="padding:14px 0;border-top:1px solid #e5e7eb;">
+      {# `is_safe_url` gates the anchor, not the escaping. A `javascript:` or #}
+      {# `data:` URL is perfectly well-formed text — escaping does nothing to it — #}
+      {# and this is the one place a feed-controlled URL lands in a live href. #}
+      <h2 style="margin:0 0 6px;font-size:16px;line-height:1.4;">
+        {% if is_safe_url(line.url) %}
+        <a href="{{ line.url }}" style="color:#1d4ed8;text-decoration:none;">{{ line.title }}</a>
+        {% else %}
+        {{ line.title }}
+        {% endif %}
+      </h2>
+      <p style="margin:0 0 8px;font-size:12px;color:#6b7280;">
+        signal {{ line.signal if line.signal is not none else "—" }}
+        · relevance {{ line.relevance if line.relevance is not none else "—" }}
+        · novelty {{ line.novelty if line.novelty is not none else "—" }}
+      </p>
+      <p style="margin:0;font-size:14px;line-height:1.55;color:#374151;">{{ line.why_it_matters }}</p>
+    </div>
+    {% endfor %}
+    {% else %}
+    <p style="margin:0;font-size:14px;line-height:1.55;color:#374151;">
+      No items cleared triage today — a quiet news day, or a pipeline problem worth
+      checking with <code>signalforge status</code>.
+    </p>
+    {% endif %}
+
+    <p style="margin:20px 0 0;padding-top:14px;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;">
+      {{ context.killed_count }} item(s) killed at triage{% if context.hidden_kept_count > 0 %} · {{ context.hidden_kept_count }} more kept item(s) not shown{% endif %} · {{ context.scored_count }} scored today.
+    </p>
+
+    {% if context.source_failures %}
+    <p style="margin:12px 0 0;font-size:12px;color:#b45309;">
+      <strong>Source failures (last ingest run):</strong><br>
+      {% for failure in context.source_failures %}
+      {{ failure.source_id }}: {{ failure.message }}<br>
+      {% endfor %}
+    </p>
+    {% endif %}
+
+    {# The nudge that keeps the feedback loop closed once the phone becomes the #}
+    {# read surface: a count and a filename, never a checkbox (DESIGN §13.1). #}
+    {% if context.pending_proposals %}
+    <p style="margin:12px 0 0;padding:10px 12px;background:#fef3c7;border-radius:6px;font-size:13px;color:#92400e;">
+      <strong>{{ context.pending_proposals | length }} source change(s) awaiting your decision.</strong><br>
+      Open <code>daily/{{ context.date.isoformat() }}.md</code> in Obsidian to approve or reject.
+    </p>
+    {% endif %}
+
+    <p style="margin:16px 0 0;font-size:11px;line-height:1.5;color:#9ca3af;">
+      This is a read-only copy. Marks and approvals are only read from the vault —
+      tick them in <code>daily/{{ context.date.isoformat() }}.md</code>.
+    </p>
+
+  </div>
+</div>

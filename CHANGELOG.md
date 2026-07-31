@@ -9,6 +9,19 @@ consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
 ## [Unreleased]
 
 ### Added
+- **Email delivery of the daily digest** (`deliver/`, DESIGN §13.2). A read-only
+  mirror so the digest can be read away from the desk. The vault write stays
+  canonical and unconditional; the email is sent only after it succeeds, carries
+  no checkboxes (feedback still round-trips through vault markdown only), and a
+  dead provider is an error in `runs.errors` rather than a failed run. Two
+  idempotency guards: a `UNIQUE(channel, report_kind, target_date)` index on the
+  new `deliveries` table (migration 4), and a *stateless* freshness window, so a
+  deleted-and-rebuilt database cannot mail weeks of history. `digest` gains
+  `--no-send` / `--resend`; `signalforge deliver test` sends one sample without
+  touching the pipeline. Config lives in `settings.yaml` under `delivery:`; the
+  API key is named there, never written there. **Zero LLM cost, zero new
+  dependencies** — and shipped ahead of its phase, recorded as a deliberate
+  exception with its cost in DESIGN §13.2 rather than normalised.
 - **A third feedback rung, `exceptional`** (#8), above `useful` — aggregations
   read "useful or better", so an item marked only `exceptional` still counts
   toward the Phase 1 gate.

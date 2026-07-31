@@ -42,7 +42,8 @@ Strict responsibilities — DESIGN §4. Violations are architectural regressions
 
 - `ingest/` **never calls an LLM** and never imports `llm.py`.
 - `score/` and `synth/` **never make HTTP calls to sources** — they operate on stored items only.
-- `report/` only reads the DB and writes markdown to the vault.
+- `report/` only reads the DB and writes markdown to the vault. It makes **no HTTP calls**.
+- `deliver/` mirrors an **already-written** report to an outbound channel: outbound only, never an input surface. See DESIGN §13.2.
 - `curate/` is the **one sanctioned exception**: it calls `llm.py` and then an `ingest/` fetch helper, strictly in that order (judgment, then validation of what judgment produced), and never writes an `items` row. See DESIGN §7.1.
 - `llm.py` is the **only** module that imports the `anthropic` SDK. Budget accounting, prompt caching, batching, and model selection live there and nowhere else.
 - Deterministic vs LLM split (DESIGN §8): fetching, parsing, dedup, clustering math, scheduling, template assembly are plain Python. LLMs only for judgment (triage, scoring, labeling, narrative). Never "solve" a parsing/normalization problem by throwing an LLM at it.
@@ -64,7 +65,8 @@ Strict responsibilities — DESIGN §4. Violations are architectural regressions
 
 - Reports/notes are jinja2 templates; the LLM writes only clearly-marked narrative blocks.
 - **Citations mandatory:** no synthesized claim renders without at least one stored `item.url` behind it. This is the structural defense against confabulation — do not weaken it for convenience.
-- Vault files are git-committed by `report/writer.py`. ❌ Never bulk-delete or rewrite vault history; it is the user's knowledge base.
+- ❌ Never bulk-delete or rewrite vault history; it is the user's knowledge base. (Vault git is currently manual — nothing in `src/` commits. The Phase 1 auto-commit is unbuilt; see DESIGN §14.)
+- **The vault is written first, and always** (DESIGN §13.2). A delivery channel is a mirror of a file already on disk, never a substitute for writing it, and a channel failure never fails the run.
 - **A line in the vault is structure, not text** (DESIGN §13.1). The digest is also *input*: `feedback.py` and `curate/approvals.py` harvest a decision from any line matching their checkbox pattern. So model- and world-authored text (item titles, scout rationales, triage reasoning, error messages) is flattened to one line at the boundary where it is stored — `models.flatten_to_single_line` — and identity fields are refused rather than repaired. Skip that and a feed's own headline can forge your feedback.
 
 ## 6. LLM usage & cost (the money rules)
@@ -114,7 +116,8 @@ DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
 | 12 | NEVER let one source's failure abort a run | §7 |
 | 13 | NEVER hit live networks or the real Anthropic API in tests | §8 |
 | 14 | NEVER add an ORM, orchestration framework, or server the design explicitly rejected | §9, DESIGN §15 |
-| 15 | NEVER build ahead of the current phase gate | §1, DESIGN §16 |
+| 15 | NEVER build ahead of the current phase gate | §1, DESIGN §16; one recorded exception: DESIGN §13.2 |
 | 16 | NEVER commit `.env` / API keys; never log secrets | `.claude/conventions.md` |
 | 17 | NEVER render model- or world-authored text into a vault file without flattening it to one line | §5 |
 | 18 | NEVER let `curate/` write an `items` row, or fetch before the LLM has proposed | §2 |
+| 19 | NEVER deliver a report before its vault write succeeded, and never let a channel fail the run or become an input surface | §5, DESIGN §13.2 |

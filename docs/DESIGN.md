@@ -57,6 +57,7 @@ flowchart TB
         SCORE[Scoring<br/>LLM triage + rubrics]
         SYNTH[Synthesis<br/>clustering, trends,<br/>impact engine]
         REP[Report Writer]
+        DEL[Delivery<br/>outbound mirror only]
     end
 
     subgraph storage [Local Storage]
@@ -80,6 +81,7 @@ flowchart TB
     SCORE --> DB
     SYNTH <--> DB
     REP --> VAULT
+    VAULT --> DEL --> MAIL[Mail provider API]
     config -.-> ING & SCORE & SYNTH
 
     CRON[cron / systemd timers] -->|daily / weekly / monthly| core
@@ -142,7 +144,7 @@ signalforge/
 │       └── trading-platform.md
 ├── src/signalforge/
 │   ├── __init__.py
-│   ├── cli.py                  # typer app: ingest | score | report | status | backfill
+│   ├── cli.py                  # typer app: ingest | score | digest | daily | mark | curate | deliver | status
 │   ├── config.py               # pydantic models for the YAML configs
 │   ├── models.py               # Item, Score, Cluster, Insight (pydantic)
 │   ├── db.py                   # SQLite connection, migrations, queries
@@ -177,6 +179,10 @@ signalforge/
 │   ├── report/
 │   │   ├── templates/          # jinja2: daily.md.j2, weekly.md.j2, monthly.md.j2
 │   │   └── writer.py           # fills templates, commits vault to git
+│   ├── deliver/                # §13.2: outbound mirrors of an already-written report
+│   │   ├── templates/          # jinja2: email_daily.html.j2, email_daily.txt.j2
+│   │   └── email.py            # renders + POSTs to a mail provider API
+│   ├── feedback.py             # harvests item marks back out of vault markdown (§11)
 │   ├── llm.py                  # single Anthropic client wrapper (caching, batching, budget)
 │   └── mcp_server.py           # Phase 3: expose vault + DB to Claude Code
 ├── vault/                      # Obsidian vault — THE PRODUCT (own git repo or subdir)
@@ -192,7 +198,7 @@ signalforge/
 └── tests/
 ```
 
-**Module responsibilities are strict:** `ingest/` never calls an LLM; `score/` and `synth/` never make HTTP calls to sources; `report/` only reads the DB and writes markdown; `llm.py` is the *only* module that touches the Anthropic SDK, so budget accounting, prompt caching, and model selection live in exactly one place. The single sanctioned exception is `curate/`, which calls both `llm.py` and `ingest/probe.py` in that fixed order and writes no `items` row — see §7.1.
+**Module responsibilities are strict:** `ingest/` never calls an LLM; `score/` and `synth/` never make HTTP calls to sources; `report/` only reads the DB and writes markdown; `llm.py` is the *only* module that touches the Anthropic SDK, so budget accounting, prompt caching, and model selection live in exactly one place. `deliver/` makes HTTP calls but only *outbound*, mirroring a report `report/` has already written; it never queries items, never writes to the vault, and is never an input surface — see §13.2. The single sanctioned exception is `curate/`, which calls both `llm.py` and `ingest/probe.py` in that fixed order and writes no `items` row — see §7.1.
 
 ---
 
@@ -330,9 +336,22 @@ CREATE TABLE proposals (                     -- proposed sources.yaml changes, a
     applied_at    TEXT
 );
 CREATE UNIQUE INDEX ux_proposals_kind_key ON proposals (kind, dedup_key);
+
+CREATE TABLE deliveries (                    -- one row per report handed to an outbound channel (§13.2)
+    id          INTEGER PRIMARY KEY,
+    run_id      INTEGER REFERENCES runs(id),
+    channel     TEXT NOT NULL,               -- email (one channel today)
+    report_kind TEXT NOT NULL,               -- daily
+    target_date TEXT NOT NULL,               -- the report's date, not the send time
+    body_hash   TEXT NOT NULL,               -- sha256 of what went out; audit trail only, never
+                                             -- part of the key — a re-render is the same report
+    provider_id TEXT,                        -- the provider's message id, when it gives one
+    sent_at     TEXT NOT NULL
+);
+CREATE UNIQUE INDEX ux_deliveries_channel_kind_date ON deliveries (channel, report_kind, target_date);
 ```
 
-Three details that pay for themselves later: **`rubric_version` on every score** (when you change a prompt, you know which scores are comparable), **the `feedback` table** (a `signalforge mark <id> useful|noise` command builds the ground-truth set that V2 scoring tuning — and the V3 analyst — will need), and **`ux_proposals_kind_key`** (one row per distinct proposal ever, so re-running the scout is a no-op and a rejected proposal never comes back — the same trick `ux_feedback_item_verdict` plays for marks).
+Four details that pay for themselves later: **`rubric_version` on every score** (when you change a prompt, you know which scores are comparable), **the `feedback` table** (a `signalforge mark <id> useful|noise` command builds the ground-truth set that V2 scoring tuning — and the V3 analyst — will need), **`ux_proposals_kind_key`** (one row per distinct proposal ever, so re-running the scout is a no-op and a rejected proposal never comes back — the same trick `ux_feedback_item_verdict` plays for marks), and **`ux_deliveries_channel_kind_date`** (one send per report per channel ever, so re-rendering a digest mails nothing). That last one is the only idempotency lever here with a *stateless* partner — `deliver.MAX_DELIVERY_AGE_DAYS` — because this table lives in a database §14 says you may delete and rebuild.
 
 ---
 
@@ -882,6 +901,95 @@ still scored, still eligible for the weekly brief. They are also not a
 substitute for the ingest-side freshness window (`max_item_age_days`), which
 is what stops a newly-added source backfilling its history into one digest.
 
+### 13.2 Delivery channels — the push channel, pulled forward
+
+**Status: shipped 2026-08-01, out of phase order, deliberately.** This section
+records that decision rather than quietly normalising it.
+
+§18 filed the push channel under *Future Extensions (beyond V3)* as "weekly brief
+to email/Telegram". What shipped is the **daily** digest by email, during Phase 1,
+whose gate (four consecutive Sunday briefs) is not met and whose Weekly Brief does
+not exist yet. Under NEVER 15 that requires a stated reason, not an assumption.
+
+**Why it was promoted.** The digests became good enough that not being able to read
+them away from the desk was the bottleneck — which is precisely the test §17 risk 1
+sets ("features must map to a felt gap in a real report"). Three things made the
+promotion cheap enough to justify jumping the queue:
+
+- **Zero LLM cost.** No new call site into `llm.py`, no prompt, no model choice, no
+  batching. The §8 budget band is untouched, so the "next new LLM consumer needs
+  the band revisited" constraint does not fire. Read that as "this does not make it
+  worse", not as reassurance: §8 already records the pipeline past its own $5–10
+  target on paper.
+- **Zero new dependencies.** `httpx`, `jinja2` and `tenacity` were already there; a
+  hosted mail API is one POST.
+- **It blocks nothing.** The Weekly Brief plugs into the same channel when it
+  lands, and no Phase 1 work is reordered around it.
+
+**What it cost.** Two things, stated because a promotion that appears free is a
+promotion nobody will scrutinise next time:
+
+- **This is the second exception granted on the identical argument.** §16 already
+  pulled adaptive source curation forward on "a felt gap in a digest already being
+  read daily, which is the test risk 1 sets" — word for word the reasoning above. A
+  gate that yields twice to one argument is not being applied; it is being routed
+  around. **Tripwire: no third §18 item ships before four consecutive Sunday briefs
+  exist.**
+- **Phase 1's actual deliverable is still at zero lines.** The Weekly Intelligence
+  Brief — the thing the phase gate measures — is unbuilt, while a delivery module,
+  a migration, a config surface and ~70 tests landed around it. The channel is
+  genuinely ready to carry the brief; that is not the same as having written it.
+
+**What did *not* come with it, and stays in §18:** the FastAPI read layer, any web
+UI, any inbound endpoint, and mobile feedback. Those are the parts that would trip
+NEVER 14, and the promotion argument above does not extend to them — they cost a
+server, and the felt gap was reading, not deciding.
+
+**The invariants a channel must hold.**
+
+1. **The vault stays canonical.** §18 committed to this before it was superseded
+   here. Delivery runs only after the vault write has succeeded, and it is
+   additive: a report that was emailed but not written is not a report that
+   happened. At runtime this is a **caller contract**, not a runtime check —
+   `deliver_digest` takes a `DigestContext`, never a path, so it cannot verify the
+   file itself. What holds it is the single call site (nested after `write_text`)
+   plus a test that asserts the vault file exists at the moment the POST fires. A
+   future channel with a different caller inherits the contract, not a guard.
+2. **A channel is not an input surface.** Marks and curation ticks are harvested
+   from `<vault>/daily/*.md` only (§13.1), so a mirrored digest renders no
+   checkboxes — it renders a *count of the pending source-curation decisions*, and
+   names the file to open. That is a partial mitigation for the real risk here: if
+   the phone becomes the read surface, the operator stops opening Obsidian and both
+   halves of the loop stall. It covers the proposal half, which is the one that
+   compounds — undecided proposals re-render daily and pile up. Mark decay gets only
+   a pointer back to the file, because there is no per-item count to give.
+3. **A channel failure is never a failed run** (§7). The digest is the product and
+   it is already on disk; a dead provider is an error in `runs.errors`, surfaced by
+   `signalforge status`. Note the limit: the digest's own failure block reads the
+   last **ingest** run and skips run-level records (`source_id == "*"`), so it does
+   *not* carry delivery errors. `status` is the only place a broken channel shows
+   up today — surfacing it in the digest would be a code change, not a doc one.
+4. **One send per report, ever** (idempotency, §3). Two guards, deliberately
+   redundant: a `UNIQUE(channel, report_kind, target_date)` index on `deliveries`,
+   and a *stateless* freshness window (`deliver.MAX_DELIVERY_AGE_DAYS`, in code
+   rather than `settings.yaml` deliberately: §4 governs knobs the operator tunes,
+   and this is a bound nobody should want to widen). The second
+   exists because the first lives in a database this document calls regenerable —
+   delete `signalforge.db`, re-render past dates, and the index would not stop a
+   month of history reaching the inbox. `--resend` overrules the send log and
+   cannot overrule the window.
+
+**Shape.** `deliver/` is a sibling of `report/`, not part of it: `report/`'s charter
+is "only reads the DB and writes markdown", and a channel makes HTTP calls. It
+renders from the same `DigestContext` the markdown came from, so the mirror cannot
+disagree with the file about what the day contained. Config lives in
+`settings.yaml` under `delivery:` — machine-local, gitignored, and the API key is
+named there, never written there (NEVER 16).
+
+One channel exists (`email`, via a hosted API). A second is a new module and a new
+config block, not a plugin registry: at this scale the explicit list is shorter
+than the machinery that would avoid it.
+
 ---
 
 ## 14. Scheduling & Operations
@@ -977,8 +1085,8 @@ The stretch goal, decomposed into stepwise-verifiable capabilities rather than "
 ## 18. Future Extensions (beyond V3)
 
 - **Postgres migration** — only if a second writer or remote access appears; the `db.py` chokepoint keeps SQL portable.
-- **FastAPI read layer** — a small read-only API/HTML view over the vault for phone reading.
-- **Push channel** — weekly brief to email/Telegram; the vault stays canonical.
+- **FastAPI read layer** — a small read-only API/HTML view over the vault for phone reading. Still deferred; see §13.2 for what was pulled forward instead, and why this was not.
+- ~~**Push channel** — weekly brief to email/Telegram; the vault stays canonical.~~ **Pulled forward 2026-08-01 — see §13.2.**
 - **Discord/Slack ingestion** — if a specific community proves consistently high-signal.
 - **Cross-user sharing** — publishing the sanitized weekly brief; explicitly out of scope until the personal loop is mature.
 

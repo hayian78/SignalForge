@@ -31,3 +31,42 @@ timezone: UTC
 #   vault_dir: /mnt/c/Users/<you>/Obsidian/SignalForge
 #
 # vault_dir: vault
+
+# --- Delivery -------------------------------------------------------------
+# Outbound mirrors of a rendered report, for reading away from the desk.
+# Entirely optional: leave the whole block out and the vault is the only
+# destination, which is the historical behaviour.
+#
+# Delivery is ADDITIVE, never a substitute. The vault file is written first and
+# always; only then is a copy sent. Feedback still round-trips through the vault
+# alone — you tick `useful` / `noise` / `exceptional` and approve source changes
+# in Obsidian, and the next run harvests those ticks from the markdown. An email
+# is a read-only mirror, so it carries no checkboxes; it tells you how many
+# decisions are waiting and which file to open.
+#
+# The API key is named here, never written here — put the value in `.env`.
+#
+# delivery:
+#   email:
+#     # Required. There is no default: an off-switch you have to delete your
+#     # config to reach is not an off-switch.
+#     enabled: true
+#
+#     # Name of the env var holding the provider key. The value goes in `.env`
+#     # as RESEND_API_KEY=re_...; pasting the key here is rejected at load.
+#     api_key_env: RESEND_API_KEY
+#
+#     # Sender. Bare or with a display name. Resend needs the domain verified
+#     # (DNS records) before it will send from it; until then use their
+#     # `onboarding@resend.dev` sender, which only delivers to the address on
+#     # your own Resend account — which is all a single-user tool needs.
+#     from_address: SignalForge <digest@example.com>
+#
+#     # Recipients.
+#     to:
+#       - you@example.com
+#
+# Those four keys are the whole surface. There is no `provider:` selector and no
+# `send_on:` list — Resend is the only endpoint and the daily digest is the only
+# report, so either would be a setting that cannot change anything. They arrive
+# with the second provider and the Weekly Brief respectively.

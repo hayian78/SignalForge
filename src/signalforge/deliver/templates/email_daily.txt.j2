@@ -1,0 +1,37 @@
+SignalForge — Daily Digest {{ context.date.isoformat() }}
+
+{% if context.items %}
+{% for line in context.items %}
+{{ loop.index }}. {{ line.title }}
+   signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
+
+   {{ line.why_it_matters }}
+
+{# Same gate as the HTML part's anchor. Mail clients auto-linkify plaintext, so #}
+{# printing a `javascript:` URL here would hand back the click the HTML part #}
+{# withholds — two parts disagreeing is how one of them stops being right. #}
+   {% if is_safe_url(line.url) %}{{ line.url }}{% else %}(link withheld: unsafe URL){% endif %}
+
+{% endfor %}
+{% else %}
+No items cleared triage today — a quiet news day, or a pipeline problem worth
+checking with `signalforge status`.
+
+{% endif %}
+--
+{{ context.killed_count }} item(s) killed at triage{% if context.hidden_kept_count > 0 %} · {{ context.hidden_kept_count }} more kept item(s) not shown{% endif %} · {{ context.scored_count }} scored today.
+{% if context.source_failures %}
+
+Source failures (last ingest run):
+{% for failure in context.source_failures %}
+  - {{ failure.source_id }}: {{ failure.message }}
+{% endfor %}
+{% endif %}
+{% if context.pending_proposals %}
+
+{{ context.pending_proposals | length }} source change(s) awaiting your decision.
+Open daily/{{ context.date.isoformat() }}.md in Obsidian to approve or reject them.
+{% endif %}
+
+This is a read-only copy. Marks and approvals are only read from the vault —
+tick them in daily/{{ context.date.isoformat() }}.md.

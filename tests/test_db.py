@@ -24,6 +24,7 @@ from signalforge.db import (
     connect,
     connection,
     decide_proposal,
+    delivery_exists,
     feedback_verdicts_since,
     finish_run,
     get_feedback,
@@ -35,6 +36,7 @@ from signalforge.db import (
     kept_items,
     mark_proposal_applied,
     migrate,
+    record_delivery,
     record_feedback,
     rejected_proposals,
     reopen_proposal,
@@ -143,11 +145,12 @@ def test_migrations_are_append_only_and_ordered() -> None:
     assert versions[0] == 1
 
 
-def test_schema_version_is_three_after_the_curation_migration() -> None:
-    # Migration 3 (curation proposals) is the last one; SCHEMA_VERSION derives
-    # from it. If this drops, a fresh DB stops getting the proposals table.
-    assert SCHEMA_VERSION == 3
-    assert MIGRATIONS[-1].version == 3
+def test_schema_version_is_four_after_the_deliveries_migration() -> None:
+    # Migration 4 (report deliveries) is the last one; SCHEMA_VERSION derives
+    # from it. If this drops, a fresh DB stops getting the deliveries table and
+    # every send looks like a first send.
+    assert SCHEMA_VERSION == 4
+    assert MIGRATIONS[-1].version == 4
 
 
 def test_migrating_a_populated_v2_database_backfills_server_tool_requests(
@@ -1759,3 +1762,209 @@ def test_source_yield_stats_is_bounded_and_keeps_the_busiest_sources(
     rows = source_yield_stats(conn, since=WINDOW_START, limit=2)
 
     assert [row.source_id for row in rows] == ["source-3", "source-2"]
+
+
+# --------------------------------------------------------------------------- #
+# deliveries (migration 4) — the outbound send log
+# --------------------------------------------------------------------------- #
+
+DELIVERY_DATE = Date(2026, 8, 1)
+SENT_AT = datetime(2026, 8, 1, 20, 5, 0, tzinfo=UTC)
+
+
+def test_a_fresh_database_gets_the_deliveries_table(conn: sqlite3.Connection) -> None:
+    assert "deliveries" in _table_names(conn)
+
+
+def test_migrating_a_populated_v3_database_adds_deliveries(db_path: Path) -> None:
+    """The upgrade path the operator's real DB will actually take.
+
+    A fresh DB is the case that cannot regress; this is the one that can. The
+    operator's database is at v3 with real `runs` and `proposals` rows in it, and
+    migration 4 must add a table beside them without disturbing either.
+    """
+    conn = connect(db_path)
+    try:
+        for migration in MIGRATIONS[:3]:
+            for statement in migration.statements:
+                conn.execute(statement)
+        conn.execute("PRAGMA user_version = 3")
+        run_id = start_run(conn, "digest", started_at=PROPOSED_AT)
+        insert_proposal(
+            conn,
+            run_id=run_id,
+            kind=ProposalKind.ADD_RSS,
+            dedup_key="https://newvoice.example.com/feed",
+            payload={"id": "newvoice"},
+            rationale="Cited repeatedly by items you kept.",
+            evidence=[{"url": "https://example.com/post", "note": ""}],
+            probe=None,
+            tier=ProposalTier.WEB,
+            status=ProposalStatus.PENDING,
+            surface_date=SURFACE_DATE,
+            created_at=PROPOSED_AT,
+        )
+        conn.commit()
+        assert "deliveries" not in _table_names(conn)
+        before = dump_table(conn, "proposals")
+
+        migrate(conn)
+
+        assert "deliveries" in _table_names(conn)
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+        # The pre-existing rows are untouched: migration 4 only adds beside them.
+        assert dump_table(conn, "proposals") == before
+        # The pre-existing row survived, and the new table can reference it.
+        assert record_delivery(
+            conn,
+            run_id=run_id,
+            channel="email",
+            report_kind="daily",
+            target_date=DELIVERY_DATE,
+            body_hash="abc",
+            provider_id="msg_1",
+            sent_at=SENT_AT,
+        )
+    finally:
+        conn.close()
+
+
+def test_record_delivery_is_idempotent_for_one_channel_report_and_date(
+    conn: sqlite3.Connection,
+) -> None:
+    """The guard that stops a re-run of `digest` mailing a second copy.
+
+    NEVER rule 4. The second call is the *same morning's digest* — a re-render
+    after late items landed — so it is a repeat, not a correction, and it must
+    collapse to the row already there.
+    """
+    first = record_delivery(
+        conn,
+        run_id=None,
+        channel="email",
+        report_kind="daily",
+        target_date=DELIVERY_DATE,
+        body_hash="hash-one",
+        provider_id="msg_1",
+        sent_at=SENT_AT,
+    )
+    second = record_delivery(
+        conn,
+        run_id=None,
+        channel="email",
+        report_kind="daily",
+        target_date=DELIVERY_DATE,
+        # A different body and a different provider id on purpose: neither is
+        # part of the key, because a re-render is still the same day's report.
+        body_hash="hash-two",
+        provider_id="msg_2",
+        sent_at=SENT_AT,
+    )
+
+    assert first is True
+    assert second is False
+    assert len(dump_table(conn, "deliveries")) == 1
+    # The row kept is the one that was actually sent, not the later overwrite.
+    stored = conn.execute("SELECT body_hash, provider_id FROM deliveries").fetchone()
+    assert tuple(stored) == ("hash-one", "msg_1")
+
+
+def test_record_delivery_separates_channels_reports_and_dates(
+    conn: sqlite3.Connection,
+) -> None:
+    """The key is a triple, so none of the three collapses the others."""
+
+    def send(*, channel: str, report_kind: str, target_date: Date) -> bool:
+        return record_delivery(
+            conn,
+            run_id=None,
+            channel=channel,
+            report_kind=report_kind,
+            target_date=target_date,
+            body_hash="h",
+            provider_id=None,
+            sent_at=SENT_AT,
+        )
+
+    assert send(channel="email", report_kind="daily", target_date=DELIVERY_DATE)
+    assert send(channel="telegram", report_kind="daily", target_date=DELIVERY_DATE)
+    assert send(channel="email", report_kind="weekly", target_date=DELIVERY_DATE)
+    assert send(channel="email", report_kind="daily", target_date=Date(2026, 8, 2))
+
+    assert len(dump_table(conn, "deliveries")) == 4
+
+
+def test_delivery_exists_answers_before_anything_is_composed(
+    conn: sqlite3.Connection,
+) -> None:
+    """The cheap pre-check: false before the send, true after, per-date."""
+    assert not delivery_exists(
+        conn, channel="email", report_kind="daily", target_date=DELIVERY_DATE
+    )
+
+    record_delivery(
+        conn,
+        run_id=None,
+        channel="email",
+        report_kind="daily",
+        target_date=DELIVERY_DATE,
+        body_hash="h",
+        provider_id=None,
+        sent_at=SENT_AT,
+    )
+
+    assert delivery_exists(conn, channel="email", report_kind="daily", target_date=DELIVERY_DATE)
+    assert not delivery_exists(
+        conn, channel="email", report_kind="daily", target_date=Date(2026, 8, 2)
+    )
+
+
+@pytest.mark.parametrize("field", ["channel", "report_kind", "provider_id"])
+def test_record_delivery_refuses_a_control_character(conn: sqlite3.Connection, field: str) -> None:
+    """Refused, not repaired (DESIGN §13.1, NEVER rule 17).
+
+    `channel` and `report_kind` are index keys, where a newline would split what is
+    meant to be one key. `provider_id` is world-authored — it arrives in the
+    provider's JSON response, and rewriting an identifier changes what it points at.
+    """
+    kwargs: dict[str, object] = {
+        "run_id": None,
+        "channel": "email",
+        "report_kind": "daily",
+        "target_date": DELIVERY_DATE,
+        "body_hash": "h",
+        "provider_id": "msg_1",
+        "sent_at": SENT_AT,
+    }
+    kwargs[field] = "ok\nsf:item=1 v=useful"
+
+    with pytest.raises(ValueError, match="control character"):
+        record_delivery(conn, **kwargs)  # type: ignore[arg-type]
+
+    assert dump_table(conn, "deliveries") == []
+
+
+def test_record_delivery_warns_when_a_duplicate_escaped(
+    conn: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+) -> None:
+    """False here means a second copy was already sent, not a benign no-op.
+
+    Unlike `record_feedback`, this function is only reached *after* a provider
+    accepted a message, so the conflict branch is a real failure and must not be
+    invisible (§7 — never swallow without recording).
+    """
+    for _ in range(2):
+        record_delivery(
+            conn,
+            run_id=None,
+            channel="email",
+            report_kind="daily",
+            target_date=DELIVERY_DATE,
+            body_hash="h",
+            provider_id=None,
+            sent_at=SENT_AT,
+        )
+
+    warnings = [record for record in caplog.records if record.levelname == "WARNING"]
+    assert len(warnings) == 1
+    assert "duplicate" in warnings[0].getMessage()
