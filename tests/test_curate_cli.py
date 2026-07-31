@@ -23,7 +23,7 @@ from typer.testing import CliRunner, Result
 from signalforge import llm
 from signalforge.cli import app
 from signalforge.curate.approvals import proposal_marker
-from signalforge.db import connection, insert_proposal, upsert_item
+from signalforge.db import connection, insert_proposal, start_run, upsert_item
 from signalforge.models import ProposalKind, ProposalStatus, ProposalTier
 from tests.conftest import make_item
 from tests.curate.conftest import fixture_bytes, make_scout_proposal
@@ -310,7 +310,9 @@ def _seed_pending(db_path: Path, *, dedup_key: str = FEED_URL) -> int:
     with connection(db_path) as conn:
         proposal_id = insert_proposal(
             conn,
-            run_id=None,
+            # A real run id, as production always has: a proposal is the audit
+            # trail for why a `sources.yaml` edit happened, never run-less.
+            run_id=start_run(conn, "curate", started_at=datetime(2026, 7, 30, 6, 30, tzinfo=UTC)),
             kind=ProposalKind.ADD_RSS,
             dedup_key=dedup_key,
             payload={"id": "newvoice", "url": dedup_key, "weight": 1.2},

@@ -377,13 +377,15 @@ def _seed_settled_proposal(db_path: Path) -> None:
     from datetime import UTC, datetime
     from datetime import date as Date
 
-    from signalforge.db import decide_proposal, insert_proposal
+    from signalforge.db import decide_proposal, insert_proposal, start_run
     from signalforge.models import ProposalKind, ProposalStatus, ProposalTier
 
     with connection(db_path) as conn:
         proposal_id = insert_proposal(
             conn,
-            run_id=None,
+            # A real run id, as production always has: a proposal is the audit
+            # trail for why a `sources.yaml` edit happened, never run-less.
+            run_id=start_run(conn, "curate", started_at=datetime(2026, 7, 11, 6, 30, tzinfo=UTC)),
             kind=ProposalKind.ADD_RSS,
             dedup_key="https://newvoice.example.com/feed",
             payload={"id": "newvoice", "url": "https://newvoice.example.com/feed"},

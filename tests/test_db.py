@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime, timedelta
 from datetime import date as Date
 from pathlib import Path
@@ -1522,7 +1522,10 @@ def test_kept_items_excludes_items_fetched_before_the_window(
     assert kept_items(conn, since=WINDOW_START, limit=50) == []
 
 
-WindowQuery = Callable[..., list[object]]
+# `Sequence`, not `list`: the three queries return lists of different element types,
+# and `list` is invariant, so `list[tuple[str, int, str]]` is not a `list[object]`.
+# Sequence is covariant and these tests only ever read from the result.
+WindowQuery = Callable[..., Sequence[object]]
 
 
 def _kept_items_window(conn: sqlite3.Connection, *, since: datetime) -> list[object]:

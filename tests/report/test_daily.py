@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from signalforge.curate.approvals import parse_proposal_marks
-from signalforge.db import decide_proposal, insert_proposal, upsert_item
+from signalforge.db import decide_proposal, insert_proposal, start_run, upsert_item
 from signalforge.feedback import parse_marks
 from signalforge.models import (
     Item,
@@ -915,7 +915,9 @@ def _add_proposal(
 ) -> int:
     proposal_id = insert_proposal(
         conn,
-        run_id=None,
+        # A real run id, as production always has: a proposal is the audit trail
+        # for why a `sources.yaml` edit happened, so it is never run-less.
+        run_id=start_run(conn, "curate", started_at=datetime(2026, 7, 16, 6, 30, tzinfo=UTC)),
         kind=kind,
         dedup_key=dedup_key,
         payload=payload if payload is not None else {"id": "newvoice", "url": dedup_key},
