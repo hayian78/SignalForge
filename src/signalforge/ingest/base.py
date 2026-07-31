@@ -77,6 +77,7 @@ __all__ = [
     "Ingestor",
     "ValidatorStore",
     "filter_by_age",
+    "parse_retry_after",
     "run_ingestors",
     "truncate_summary",
 ]
@@ -589,7 +590,7 @@ def _cache_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()[:32]
 
 
-def _parse_retry_after(value: str | None) -> float | None:
+def parse_retry_after(value: str | None) -> float | None:
     """Parse `Retry-After` — delta-seconds or an HTTP-date (RFC 9110)."""
     if not value:
         return None
@@ -720,9 +721,7 @@ class HttpFetcher:
                 url, headers=dict(headers), follow_redirects=follow_redirects
             )
         if response.status_code in _RETRYABLE_STATUS:
-            raise _RetryableStatus(
-                response, _parse_retry_after(response.headers.get("retry-after"))
-            )
+            raise _RetryableStatus(response, parse_retry_after(response.headers.get("retry-after")))
         return response
 
     async def get(
