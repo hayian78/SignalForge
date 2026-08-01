@@ -46,6 +46,7 @@ __all__ = [
     "connection",
     "count_killed_items",
     "decide_proposal",
+    "delivery_exists",
     "feedback_verdicts_since",
     "finish_run",
     "get_digest_items",
@@ -60,6 +61,7 @@ __all__ = [
     "kept_items",
     "mark_proposal_applied",
     "migrate",
+    "record_delivery",
     "record_feedback",
     "rejected_proposals",
     "reopen_proposal",
@@ -212,10 +214,45 @@ _MIGRATION_0003_CURATION = Migration(
     ),
 )
 
+_MIGRATION_0004_DELIVERIES = Migration(
+    version=4,
+    name="report_deliveries",
+    statements=(
+        # One row per report actually handed to an outbound channel (DESIGN §13.2's
+        # push channel). The vault file is the report; this is the send log.
+        """
+        CREATE TABLE deliveries (
+            id          INTEGER PRIMARY KEY,
+            run_id      INTEGER REFERENCES runs(id),
+            channel     TEXT NOT NULL,
+            report_kind TEXT NOT NULL,
+            target_date TEXT NOT NULL,
+            -- sha256 of the body that went out. Audit trail only: it answers "was
+            -- what I read the same text the vault holds now?" after a re-render.
+            -- Deliberately *not* part of the idempotency key — see the index below.
+            body_hash   TEXT NOT NULL,
+            -- The provider's message id, when it returns one. Nullable because a
+            -- channel is not obliged to have the concept.
+            provider_id TEXT,
+            sent_at     TEXT NOT NULL
+        )
+        """,
+        # The idempotency lever, mirroring `ux_feedback_item_verdict` and
+        # `ux_proposals_kind_key`: one send per (channel, report, date) *ever*, so a
+        # re-run of `digest` for a date rewrites the vault file and mails nothing
+        # (CLAUDE.md §3, NEVER rule 4). Keyed on the date rather than the body hash
+        # deliberately — a re-render after new items land is still the same morning's
+        # digest, and a second copy of it is spam, not a correction.
+        "CREATE UNIQUE INDEX ux_deliveries_channel_kind_date "
+        "ON deliveries (channel, report_kind, target_date)",
+    ),
+)
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     _MIGRATION_0001_PHASE0,
     _MIGRATION_0002_FEEDBACK_DEDUP,
     _MIGRATION_0003_CURATION,
+    _MIGRATION_0004_DELIVERIES,
 )
 """Ordered, append-only. Never edit an applied migration — add a new one."""
 
@@ -854,6 +891,116 @@ def record_feedback(
         "recorded feedback" if recorded else "feedback already present",
         extra={"item_id": item_id, "verdict": verdict},
     )
+    return recorded
+
+
+_INSERT_DELIVERY = """
+    INSERT INTO deliveries
+        (run_id, channel, report_kind, target_date, body_hash, provider_id, sent_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(channel, report_kind, target_date) DO NOTHING
+"""
+
+
+def delivery_exists(
+    conn: sqlite3.Connection,
+    *,
+    channel: str,
+    report_kind: str,
+    target_date: Date,
+) -> bool:
+    """Whether this report has already gone out on this channel.
+
+    The cheap pre-check that keeps a re-run of `digest` from re-sending: asking
+    first means no message is composed, no API call is made, and no key is read
+    for a send that `_INSERT_DELIVERY`'s conflict clause would discard anyway.
+    The unique index remains the actual guarantee — this is the polite path to it,
+    not the enforcement.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM deliveries WHERE channel = ? AND report_kind = ? AND target_date = ?",
+        (channel, report_kind, target_date.isoformat()),
+    ).fetchone()
+    return row is not None
+
+
+def record_delivery(
+    conn: sqlite3.Connection,
+    *,
+    run_id: int | None,
+    channel: str,
+    report_kind: str,
+    target_date: Date,
+    body_hash: str,
+    provider_id: str | None,
+    sent_at: datetime,
+    expect_existing: bool = False,
+) -> bool:
+    """Log one outbound send, returning True only when it is new.
+
+    Idempotent by construction (CLAUDE.md §3, NEVER rule 4), the same shape as
+    `record_feedback`: the `ux_deliveries_channel_kind_date` unique index
+    (migration 4) plus `ON CONFLICT DO NOTHING` collapse a repeat to a single row,
+    and `rowcount == 1` distinguishes the insert from the no-op.
+
+    Called *after* the provider accepted the message, so a failed send leaves no
+    row and the next run may legitimately retry. The window between a successful
+    POST and this insert is the one place a duplicate could escape; it is a local
+    SQLite write against an open connection, and the cost of losing that race is
+    one repeated email, so it is not worth a two-phase protocol.
+
+    Returning False here is therefore not the benign "already there" that
+    `record_feedback`'s False means. The caller only reaches this line *after* a
+    provider accepted a message, so a conflict means a second copy has already gone
+    out. It is logged at warning and the caller is expected to record it into
+    `runs.errors` (§7) rather than treat it as a no-op — unless `expect_existing`
+    says the caller deliberately re-sent (`digest --resend`), in which case the
+    conflict is the expected outcome and warning about it would put a false alarm
+    in the one channel §7 uses for monitoring.
+
+    On a conflict the stored row is left alone, so it keeps describing the **first**
+    send of that report: a later `--resend` does not update `body_hash`,
+    `provider_id`, `run_id` or `sent_at`. That is deliberate — the row's job is to
+    answer "has this report gone out?", which the first send settles for good.
+
+    `channel`, `report_kind` and `provider_id` are refused rather than repaired if
+    they carry a control character, matching `insert_proposal`'s treatment of
+    identity fields (DESIGN §13.1): the first two are index keys, where a newline
+    would split what is meant to be one key, and `provider_id` is world-authored —
+    it comes back from the provider's JSON and may one day render into a digest.
+    """
+    for name, field in (
+        ("channel", channel),
+        ("report_kind", report_kind),
+        ("provider_id", provider_id),
+    ):
+        if field is not None and has_control_characters(field):
+            raise ValueError(f"delivery {name} contains a control character: {field!r}")
+
+    cursor = conn.execute(
+        _INSERT_DELIVERY,
+        (
+            run_id,
+            channel,
+            report_kind,
+            target_date.isoformat(),
+            body_hash,
+            provider_id,
+            _to_iso(sent_at),
+        ),
+    )
+    recorded = cursor.rowcount == 1
+    context = {"channel": channel, "report_kind": report_kind, "target_date": str(target_date)}
+    if recorded:
+        logger.debug("recorded delivery", extra=context)
+    elif expect_existing:
+        logger.debug("delivery already recorded; deliberate resend", extra=context)
+    else:
+        logger.warning(
+            "delivery was already recorded for this channel, report and date — "
+            "a duplicate message has been sent",
+            extra=context,
+        )
     return recorded
 
 

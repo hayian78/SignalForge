@@ -10,11 +10,8 @@ It answers **"what changed that matters to me"**, not "what happened".
 
 ## Status
 
-**Phase 0 — prove the loop.** RSS + GitHub releases + Hacker News → normalize → exact dedup →
-batched Haiku triage → daily digest in the vault, via cron.
-
-The pipeline is built; the phase is not *proven* until the acceptance gate is met. Later phases are
-gated on the earlier ones being *used* — not merely built.
+**Phase 1 — the weekly question.** Phase 0's gate was met 2026-07-23. Later phases stay gated on the
+earlier ones being *used* — not merely built.
 
 **Built**
 - [x] Ingest: RSS + GitHub releases + Hacker News → SQLite (per-source isolation, conditional GET)
@@ -22,12 +19,14 @@ gated on the earlier ones being *used* — not merely built.
 - [x] Batched Haiku triage + 3-dimension scoring, on titles + summaries only
 - [x] Daily digest → Obsidian vault, with per-source / per-repo crowding limits
 - [x] Timezone-aware day boundary (UTC storage, configurable reader locale)
-- [x] `ANTHROPIC_API_KEY` configured
-
-**Remaining for the gate**
 - [x] Cron installed (06:00 daily `signalforge daily`)
-- [ ] Read the digest five mornings straight and it saved time
-- [ ] Live double-run produces zero duplicates
+- [x] Adaptive source curation: weekly scout, digest-based approval
+- [x] Daily digest mirrored to email, read-only (DESIGN §13.2 — shipped ahead of its phase, deliberately)
+
+**Remaining for the Phase 1 gate**
+- [ ] Weekly Intelligence Brief — *the product*, not yet built
+- [ ] Four consecutive Sunday briefs that answer the primary question
+- [ ] ≥ 80% of brief items rated `useful` or better
 
 Progress is logged in [`CHANGELOG.md`](CHANGELOG.md); the full roadmap lives in
 [DESIGN §16](docs/DESIGN.md#16-roadmap).
@@ -67,7 +66,30 @@ uv run signalforge score     # batched Haiku triage + scoring of unscored items
 uv run signalforge digest    # render today's Daily Digest into <vault_dir>/daily/
 uv run signalforge daily     # ingest -> score -> digest, in one call (cron 06:00)
 uv run signalforge status    # last-run health, per-source freshness, token spend
+
+uv run signalforge deliver test   # send one sample email, to prove the channel works
 ```
+
+## Reading it away from the desk
+
+The vault is the product, and it stays that way — but a digest you cannot read on
+your phone is a digest you do not read. `digest` can mirror each morning's file to
+an outbound channel once one is configured in `settings.yaml` (see
+`settings.yaml.example`, and DESIGN §13.2 for why this shipped ahead of its phase).
+
+Email is the one channel today. It is **read-only** by design:
+
+- The vault file is written first and always; the email is a mirror of a file that
+  already exists, never a substitute for it. A dead mail provider is a recorded
+  error, not a failed run.
+- Marks and source approvals still round-trip through vault markdown only, so the
+  email carries no checkboxes. It carries a count of the decisions waiting and the
+  filename to open — the nudge that keeps the loop closed.
+- One send per digest, ever. Re-rendering a date rewrites the file and mails
+  nothing (`--resend` overrides); a digest older than a day is never mailed at all,
+  even if the database is deleted and rebuilt.
+
+Costs nothing in tokens: no LLM call is involved.
 
 ## Configuration
 
@@ -78,7 +100,7 @@ Python change.
 |---|---|
 | `config/sources.yaml` | What to ingest |
 | `config/interests.yaml` | Priorities, ignores, learning goals, scoring thresholds |
-| `config/settings.yaml` | Machine-local: timezone, vault output path (gitignored; see `.example`) |
+| `config/settings.yaml` | Machine-local: timezone, vault output path, delivery channels (gitignored; see `.example`) |
 
 Tuning relevance means editing `interests.yaml` and marking items useful/noise — never editing
 prompts ad hoc.
@@ -87,7 +109,7 @@ prompts ad hoc.
 
 ```
 config/     YAML config — what to ingest, what you care about
-src/        the pipeline: ingest → enrich → score → synth → report
+src/        the pipeline: ingest → enrich → score → synth → report → deliver
 vault/      frozen pre-`vault_dir` digests; the live vault is wherever settings.yaml points
 data/       SQLite + HTTP cache (gitignored, regenerable)
 tests/      pytest, with recorded HTTP fixtures — never live network

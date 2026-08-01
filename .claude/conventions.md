@@ -50,7 +50,7 @@ Reserve Bash for: tests, `uv` commands, git, sqlite3 inspection, running the
   shell.
 - `data/signalforge.db` and `data/http_cache/` are regenerable; **`vault/` is
   not** — it is the product. Never `rm`, truncate, or mass-rewrite files under
-  `vault/` outside `report/writer.py`'s normal overwrite-today's-file behaviour
+  `vault/` outside `report/daily.py`'s normal overwrite-today's-file behaviour
   without explicit user instruction. (A guard hook enforces this.)
 
 ## Git

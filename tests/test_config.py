@@ -23,6 +23,7 @@ from pydantic import SecretStr
 from signalforge.config import (
     SETTINGS_FILENAME,
     ConfigError,
+    EmailChannelConfig,
     SettingsConfig,
     SourceDefaults,
     Thresholds,
@@ -856,3 +857,181 @@ def test_shipped_settings_yaml_parses(repo_config_dir: Path) -> None:
     # would break every digest's day boundary.
     settings = load_settings(repo_config_dir)
     assert settings.tzinfo is not None
+
+
+# --------------------------------------------------------------------------- #
+# delivery — the outbound push channel (DESIGN §13.2)
+# --------------------------------------------------------------------------- #
+
+DELIVERY_YAML = """
+timezone: Australia/Brisbane
+delivery:
+  email:
+    enabled: true
+    api_key_env: RESEND_API_KEY
+    from_address: SignalForge <digest@example.com>
+    to:
+      - reader@example.com
+"""
+
+
+def test_settings_without_a_delivery_block_delivers_nowhere() -> None:
+    # The historical shape. Delivery is additive: absent means the vault is the
+    # only destination, which must stay the default forever.
+    assert SettingsConfig().delivery.email is None
+
+
+def test_load_settings_reads_the_email_channel(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text(DELIVERY_YAML, encoding="utf-8")
+
+    email = load_settings(tmp_path).delivery.email
+
+    assert email is not None
+    assert email.enabled is True
+    assert email.api_key_env == "RESEND_API_KEY"
+    assert email.to == ["reader@example.com"]
+
+
+def test_email_channel_requires_an_explicit_enabled() -> None:
+    """An off-switch you reach by deleting the block is not an off-switch."""
+    with pytest.raises(ValueError, match="enabled"):
+        EmailChannelConfig(  # type: ignore[call-arg]
+            api_key_env="RESEND_API_KEY",
+            from_address="a@example.com",
+            to=["b@example.com"],
+        )
+
+
+def test_email_channel_rejects_a_pasted_api_key() -> None:
+    """The likely mistake: the key value where the env-var name belongs.
+
+    Shaped like a real Resend key — lowercase `re_` prefix, ~35 characters — because
+    that is what the validator discriminates on.
+    """
+    with pytest.raises(ValueError, match="NAME of an environment variable"):
+        EmailChannelConfig(
+            enabled=True,
+            api_key_env="re_1a2B3c4D_5e6F7g8H9i0J1k2L3m4N5o6P",
+            from_address="a@example.com",
+            to=["b@example.com"],
+        )
+
+
+def test_email_channel_accepts_an_env_var_name_that_merely_starts_like_a_key() -> None:
+    # `RE_DIGEST_KEY` is a legitimate name; only the `re_<body>` token shape is out.
+    assert (
+        EmailChannelConfig(
+            enabled=True,
+            api_key_env="RE_DIGEST_KEY",
+            from_address="a@example.com",
+            to=["b@example.com"],
+        ).api_key_env
+        == "RE_DIGEST_KEY"
+    )
+
+
+@pytest.mark.parametrize(
+    "address",
+    [
+        "not-an-address",
+        "@example.com",
+        "nobody@",
+        "nobody@localhost",
+        "nobody@.com",
+        "nobody@example..com",
+        # `parseaddr` repairs these by deleting interior whitespace, yielding an
+        # address the operator never wrote. Validating the repair and storing the
+        # original is exactly the refuse-don't-repair rule (DESIGN §13.1).
+        "nobody@example.com x",
+        "nobody @example.com",
+    ],
+)
+def test_email_channel_rejects_an_unparseable_address(address: str) -> None:
+    with pytest.raises(ValueError, match="email address"):
+        EmailChannelConfig(
+            enabled=True,
+            api_key_env="RESEND_API_KEY",
+            from_address=address,
+            to=["b@example.com"],
+        )
+
+
+@pytest.mark.parametrize("field", ["from_address", "to"])
+def test_email_channel_refuses_a_control_character_in_an_address(field: str) -> None:
+    """Header injection, refused rather than repaired (DESIGN §13.1).
+
+    These strings end up in message headers. A `\\r\\n` in one is not a formatting
+    quirk, it is a second header — and an address is an identity field, so
+    silently rewriting it would change who the mail goes to.
+    """
+    injected = "ok@example.com\r\nBcc: attacker@evil.example"
+    kwargs: dict[str, object] = {
+        "enabled": True,
+        "api_key_env": "RESEND_API_KEY",
+        "from_address": "a@example.com",
+        "to": ["b@example.com"],
+    }
+    kwargs[field] = injected if field == "from_address" else [injected]
+
+    with pytest.raises(ValueError, match="control character"):
+        EmailChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_email_channel_accepts_a_display_name_form() -> None:
+    """The containment check must not reject the form the example documents."""
+    channel = EmailChannelConfig(
+        enabled=True,
+        api_key_env="RESEND_API_KEY",
+        from_address="SignalForge <digest@example.com>",
+        to=["Reader <reader@example.com>"],
+    )
+    assert channel.from_address == "SignalForge <digest@example.com>"
+
+
+def test_email_channel_rejects_two_addresses_in_one_string() -> None:
+    """A comma-separated pair would be a smuggled second recipient."""
+    with pytest.raises(ValueError, match="email address"):
+        EmailChannelConfig(
+            enabled=True,
+            api_key_env="RESEND_API_KEY",
+            from_address="a@example.com",
+            to=["b@example.com, attacker@evil.example"],
+        )
+
+
+def test_email_channel_requires_at_least_one_recipient() -> None:
+    with pytest.raises(ValueError, match="to"):
+        EmailChannelConfig(
+            enabled=True,
+            api_key_env="RESEND_API_KEY",
+            from_address="a@example.com",
+            to=[],
+        )
+
+
+def test_email_channel_rejects_unknown_keys() -> None:
+    # `extra="forbid"` reaches the nested block too, so a typo'd delivery key is
+    # a startup error rather than a setting that silently does nothing.
+    with pytest.raises(ValueError, match="subject_prefix"):
+        EmailChannelConfig(  # type: ignore[call-arg]
+            enabled=True,
+            api_key_env="RESEND_API_KEY",
+            from_address="a@example.com",
+            to=["b@example.com"],
+            subject_prefix="[SF] ",
+        )
+
+
+def test_a_provider_key_is_rejected_rather_than_silently_ignored(tmp_path: Path) -> None:
+    """`provider:` was removed rather than kept as a field nothing reads.
+
+    `extra="forbid"` turns a stale line in someone's `settings.yaml` into a startup
+    error naming the key, which is the whole point of strict config — and it pins
+    that the field is gone deliberately, not by accident.
+    """
+    (tmp_path / SETTINGS_FILENAME).write_text(
+        DELIVERY_YAML + "    provider: resend\n", encoding="utf-8"
+    )
+
+    with pytest.raises(ConfigError, match="provider"):
+        load_settings(tmp_path)

@@ -2,13 +2,35 @@
 
 All notable changes to SignalForge are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). No versions are
-tagged yet — the project is in **Phase 0** (see [DESIGN §16](docs/DESIGN.md#16-roadmap)),
-so everything below sits under *Unreleased* until the Phase 0 acceptance gate
-is met.
+tagged yet — Phase 0's acceptance gate was met 2026-07-23 and the project is now
+in **Phase 1** (see [DESIGN §16](docs/DESIGN.md#16-roadmap)), whose gate is four
+consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
 
 ## [Unreleased]
 
 ### Added
+- **Email delivery of the daily digest** (`deliver/`, DESIGN §13.2). A read-only
+  mirror so the digest can be read away from the desk. The vault write stays
+  canonical and unconditional; the email is sent only after it succeeds, carries
+  no checkboxes (feedback still round-trips through vault markdown only), and a
+  dead provider is an error in `runs.errors` rather than a failed run. Two
+  idempotency guards: a `UNIQUE(channel, report_kind, target_date)` index on the
+  new `deliveries` table (migration 4), and a *stateless* freshness window, so a
+  deleted-and-rebuilt database cannot mail weeks of history. `digest` gains
+  `--no-send` / `--resend`; `signalforge deliver test` sends one sample without
+  touching the pipeline. Config lives in `settings.yaml` under `delivery:`; the
+  API key is named there, never written there. **Zero LLM cost, zero new
+  dependencies** — and shipped ahead of its phase, recorded as a deliberate
+  exception with its cost in DESIGN §13.2 rather than normalised.
+- **A third feedback rung, `exceptional`** (#8), above `useful` — aggregations
+  read "useful or better", so an item marked only `exceptional` still counts
+  toward the Phase 1 gate.
+- **Adaptive source curation** (#9, DESIGN §7.1): a weekly scout proposes feed
+  additions and retirements from per-source yield plus live web search, surfaces
+  them as tick-boxes at the foot of the daily digest, and applies approved changes
+  append-only to `sources.yaml` as an uncommitted diff. Nothing changes without a
+  tick; `proposals` table + `ux_proposals_kind_key` (migration 3) make a re-scout
+  a no-op and stop a rejected proposal ever coming back.
 - Phase 0 ingest loop: RSS, GitHub releases, and Hacker News into SQLite, with
   per-source failure isolation and conditional GET.
 - Batched Haiku triage + 3-dimension scoring (signal / relevance / novelty),

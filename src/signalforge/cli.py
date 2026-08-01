@@ -55,20 +55,24 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from datetime import date as Date
 from pathlib import Path
 from typing import Annotated, Any, Final
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from signalforge import feedback
 from signalforge.config import (
+    SETTINGS_FILENAME,
     ConfigError,
     CurationConfig,
     InterestsConfig,
     SettingsConfig,
     SourcesConfig,
+    get_secret,
     load_interests,
     load_settings,
     load_sources,
@@ -95,15 +99,31 @@ from signalforge.db import (
     start_run,
     upsert_item,
 )
+from signalforge.deliver import DeliveryOutcome, deliver_digest, send_test_message
 from signalforge.feedback import harvest_marks
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY
 from signalforge.ingest.hackernews import HN_SOURCE_ID
 from signalforge.models import Item, ProposalStatus
-from signalforge.report.daily import build_digest_context, digest_path, render_digest
+from signalforge.report.daily import (
+    DigestContext,
+    build_digest_context,
+    digest_path,
+    render_digest,
+)
 from signalforge.score import ScoreOutcome, score_unscored_items
 
-__all__ = ["app", "curate_app", "daily", "digest", "ingest", "mark", "score", "status"]
+__all__ = [
+    "app",
+    "curate_app",
+    "daily",
+    "deliver_app",
+    "digest",
+    "ingest",
+    "mark",
+    "score",
+    "status",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +439,14 @@ def _render_ingest_report(run: IngestRun, outcome: _PersistOutcome, *, dry_run: 
         errors_table.add_column("type")
         errors_table.add_column("message", overflow="fold")
         for record in all_errors:
-            errors_table.add_row(record["source_id"], record["error_type"], record["message"])
+            # `message` is world-authored — a server's response body reaches here —
+            # and rich reads `[...]` in a cell as markup, so an unescaped bracket
+            # raises `MarkupError` mid-report. Escaped at every render site.
+            errors_table.add_row(
+                escape(record["source_id"]),
+                escape(record["error_type"]),
+                escape(record["message"]),
+            )
         console.print(errors_table)
 
     if dry_run:
@@ -571,7 +598,11 @@ def _render_score_report(outcome: ScoreOutcome, *, dry_run: bool, pending: int =
         errors_table.add_column("type")
         errors_table.add_column("message", overflow="fold")
         for record in outcome.errors:
-            errors_table.add_row(record["source_id"], record["error_type"], record["message"])
+            errors_table.add_row(
+                escape(record["source_id"]),
+                escape(record["error_type"]),
+                escape(record["message"]),
+            )
         console.print(errors_table)
 
     console.print(
@@ -656,6 +687,72 @@ def score(
 # --------------------------------------------------------------------------- #
 
 
+def _deliver_and_report(
+    conn: sqlite3.Connection,
+    context: DigestContext,
+    *,
+    settings: SettingsConfig,
+    today: Date,
+    run_id: int | None,
+    resend: bool,
+) -> list[dict[str, str]]:
+    """Mirror the digest to configured channels, print what happened, return errors.
+
+    Never raises and never changes the run's status: the vault file is the product
+    and it is already written by the time this is called, so a dead mail provider
+    is a recorded error and a printed line, not a failed run (§7, NEVER rule 12).
+
+    Every outcome is printed, including refusals. A silent "no email today" is
+    indistinguishable from a broken pipeline.
+    """
+    try:
+        outcomes = deliver_digest(
+            conn, context, settings=settings, today=today, run_id=run_id, resend=resend
+        )
+        return _report_delivery_outcomes(outcomes)
+    except Exception as exc:  # pragma: no cover — deliver_digest catches its own
+        # A backstop, not dead code. `deliver_digest` turns a failed send into an
+        # outcome, but this net means a future channel that forgets to cannot take
+        # the run down with it. `BaseException` deliberately passes through, so
+        # Ctrl-C during delivery still marks the run failed — the same rule
+        # `ingest` and the render already follow.
+        logger.exception("delivery raised unexpectedly; the digest is already written")
+        return [_run_level_error(exc)]
+
+
+def _report_delivery_outcomes(outcomes: list[DeliveryOutcome]) -> list[dict[str, str]]:
+    """Print each outcome and return the ones that belong in `runs.errors`.
+
+    Every `reason` here is escaped before it reaches rich, because a provider
+    refusal carries the response body verbatim and rich reads `[...]` as markup.
+    An error body containing `[/v1]` raised `MarkupError` from inside the printing
+    loop, which escaped to `digest`'s handler and marked the run **failed** — a mail
+    provider's error text failing the digest, which is exactly what NEVER rules 12
+    and 19 forbid. The milder version silently ate the text.
+    """
+    errors: list[dict[str, str]] = []
+    for outcome in outcomes:
+        if outcome.error is not None:
+            errors.append(_run_level_error(outcome.error))
+        channel = escape(outcome.channel)
+        reason = escape(outcome.reason)
+        # Branch on `sent` first, not on `error`. There is one outcome that carries
+        # both — a message that reached the inbox but whose send-log row conflicted,
+        # meaning a duplicate went out — and telling the operator "not delivered"
+        # there would be the opposite of what happened.
+        if outcome.sent and outcome.error is not None:
+            err_console.print(f"[yellow]{channel} delivered, with a problem[/yellow]: {reason}")
+        elif outcome.sent:
+            provider = escape(outcome.provider_id) if outcome.provider_id else ""
+            suffix = f" (provider id {provider})" if provider else ""
+            console.print(f"[green]{channel} delivered[/green]: {reason}{suffix}")
+        elif outcome.error is not None:
+            err_console.print(f"[red]{channel} not delivered[/red]: {reason}")
+        else:
+            console.print(f"[yellow]{channel} skipped[/yellow]: {reason}")
+    return errors
+
+
 @app.command()
 def digest(
     config_dir: Annotated[
@@ -686,6 +783,27 @@ def digest(
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Render to stdout only: no file written, no validators."),
+    ] = False,
+    send: Annotated[
+        bool,
+        typer.Option(
+            "--send/--no-send",
+            help=(
+                "Mirror the digest to configured delivery channels (settings.yaml "
+                "`delivery:`). On by default when a channel is enabled; --dry-run "
+                "always suppresses it."
+            ),
+        ),
+    ] = True,
+    resend: Annotated[
+        bool,
+        typer.Option(
+            "--resend",
+            help=(
+                "Send again even if this date was already delivered. Does not "
+                "override the freshness window — an old digest is never mailed."
+            ),
+        ),
     ] = False,
 ) -> None:
     """Render the Daily Digest (DESIGN §13) from already-scored items.
@@ -725,6 +843,7 @@ def digest(
         run_id = start_run(conn, RUN_KIND_DIGEST, started_at=datetime.now(UTC))
         run_level_error: dict[str, str] | None = None
         harvest_error: dict[str, str] | None = None
+        delivery_errors: list[dict[str, str]] = []
         status_value = "failed"
         item_count = 0
 
@@ -772,6 +891,20 @@ def digest(
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(rendered, encoding="utf-8")
                 console.print(f"[green]digest written[/green]: {path} ({item_count} item(s)).")
+                # Only after the vault write succeeded. The vault is canonical
+                # (DESIGN §13.2); a channel is a mirror of a file that already
+                # exists, never a substitute for writing it. Suppressed on
+                # --dry-run for the same reason the harvest is: a preview must
+                # have no side effects the operator did not ask for.
+                if send:
+                    delivery_errors = _deliver_and_report(
+                        conn,
+                        context,
+                        settings=settings,
+                        today=datetime.now(tz).date(),
+                        run_id=run_id,
+                        resend=resend,
+                    )
             status_value = "ok"
         except BaseException as exc:
             # Includes KeyboardInterrupt, mirroring `ingest`'s no-silent-runs rule
@@ -791,8 +924,12 @@ def digest(
                 # error so both reach `runs.errors` (DESIGN §7). A harvest error
                 # with a clean render leaves `status` "ok" with a visible error
                 # count — the render (the product) succeeded, the side-channel
-                # didn't.
-                errors=[e for e in (harvest_error, run_level_error) if e is not None] or None,
+                # didn't. Delivery failures ride the same way, for the same
+                # reason: the digest is on disk either way.
+                errors=(
+                    [e for e in (harvest_error, run_level_error) if e is not None] + delivery_errors
+                )
+                or None,
             )
 
     if status_value == "failed":
@@ -1349,6 +1486,72 @@ def daily(
 
 
 # --------------------------------------------------------------------------- #
+# deliver (DESIGN §13.2 — the push channel)
+# --------------------------------------------------------------------------- #
+
+deliver_app = typer.Typer(
+    help="Outbound mirrors of a rendered report. The vault stays canonical.",
+    no_args_is_help=True,
+)
+app.add_typer(deliver_app, name="deliver")
+
+
+@deliver_app.command("test")
+def deliver_test(
+    config_dir: Annotated[
+        Path, typer.Option("--config-dir", help="Directory holding settings.yaml.")
+    ] = DEFAULT_CONFIG_DIR,
+) -> None:
+    """Send one sample message, to prove the channel works before trusting it.
+
+    Deliberately independent of the pipeline: no database, no items, no `runs` row
+    and no `deliveries` row. Setting up a mail provider means a key, a verified
+    sender domain and a recipient, and each of those fails in its own way — this
+    exists so those failures surface on demand rather than at 06:00 tomorrow.
+
+    The sample is a real render of a fabricated one-item digest, so what arrives is
+    what a real digest will look like.
+    """
+    settings = _load_settings_or_exit(config_dir)
+    channel = settings.delivery.email
+
+    # Two failure shapes, two exit codes. Misconfiguration (no channel, no key) is
+    # exit 2, matching every other config error here; a provider that refused a
+    # well-formed request is exit 1, because nothing about the config is wrong.
+    if channel is None or not channel.enabled:
+        err_console.print(
+            "[red]no delivery channel is enabled[/red]: add a `delivery.email` block "
+            f"to {config_dir / SETTINGS_FILENAME} (see settings.yaml.example)."
+        )
+        raise typer.Exit(code=2)
+    api_key = get_secret(channel.api_key_env)
+    if api_key is None:
+        err_console.print(
+            f"[red]{channel.api_key_env} is not set[/red] in the environment or .env."
+        )
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"sending to {escape(', '.join(channel.to))} from {escape(channel.from_address)} …"
+    )
+    outcome = send_test_message(channel, api_key, today=datetime.now(settings.tzinfo).date())
+
+    # Escaped for the same reason as `_report_delivery_outcomes`: `reason` carries
+    # the provider's response body, and rich reads `[...]` as markup.
+    if not outcome.sent:
+        err_console.print(
+            f"[red]{escape(outcome.channel)} test failed[/red]: {escape(outcome.reason)}"
+        )
+        raise typer.Exit(code=1)
+
+    provider = escape(outcome.provider_id) if outcome.provider_id else ""
+    suffix = f" (provider id {provider})" if provider else ""
+    console.print(
+        f"[green]{escape(outcome.channel)} test sent[/green]: {escape(outcome.reason)}{suffix}"
+    )
+
+
+# --------------------------------------------------------------------------- #
 # status
 # --------------------------------------------------------------------------- #
 
@@ -1471,9 +1674,9 @@ def _render_run_errors(kind: str, errors: list[dict[str, Any]]) -> None:
     table.add_column("message", overflow="fold")
     for record in errors:
         table.add_row(
-            str(record.get("source_id", "?")),
-            str(record.get("error_type", "?")),
-            str(record.get("message", "")),
+            escape(str(record.get("source_id", "?"))),
+            escape(str(record.get("error_type", "?"))),
+            escape(str(record.get("message", ""))),
         )
     console.print(table)
 

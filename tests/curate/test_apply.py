@@ -27,9 +27,28 @@ from signalforge import db
 from signalforge.config import load_sources
 from signalforge.curate.apply import apply_approved_proposals, apply_to_text
 from signalforge.models import ProposalKind, ProposalStatus, ProposalTier
+from tests.conftest import REPO_ROOT
 
 TODAY = Date(2026, 7, 30)
 APPLIED_AT = datetime(2026, 7, 30, 6, 0, tzinfo=UTC)
+
+# A feed and a repo that are genuinely in the shipped config *right now*, resolved
+# at import rather than hardcoded.
+#
+# These tests deliberately run against the real `config/sources.yaml` (see the
+# module docstring), which makes them the one suite an approved curation proposal
+# can break: `curate apply` retires feeds, and a hardcoded `deepmind` here turned
+# a successful retirement into four red tests that say nothing about the applier.
+# The property under test is "a retire edit preserves comments", not "this
+# particular feed exists", so the target is read from the file the test already
+# loads.
+_SHIPPED_SOURCES = load_sources(REPO_ROOT / "config")
+RETIRE_RSS_TARGET = _SHIPPED_SOURCES.rss[0].id
+RETIRE_GITHUB_TARGET = (
+    _SHIPPED_SOURCES.github.releases[0]
+    if _SHIPPED_SOURCES.github and _SHIPPED_SOURCES.github.releases
+    else "block/goose"
+)
 
 
 @pytest.fixture
@@ -90,8 +109,8 @@ ALL_EDIT_KINDS = [
         make_proposal(
             proposal_id=2,
             kind=ProposalKind.RETIRE_RSS,
-            dedup_key="deepmind",
-            payload={"id": "deepmind"},
+            dedup_key=RETIRE_RSS_TARGET,
+            payload={"id": RETIRE_RSS_TARGET},
         ),
         id="retire_rss",
     ),
@@ -105,7 +124,7 @@ ALL_EDIT_KINDS = [
         make_proposal(
             proposal_id=4,
             kind=ProposalKind.RETIRE_GITHUB_REPO,
-            dedup_key="block/goose",
+            dedup_key=RETIRE_GITHUB_TARGET,
             payload={},
         ),
         id="retire_github_repo",
@@ -363,7 +382,7 @@ def test_a_target_present_in_config_but_unlocatable_in_text_raises(
     text_without_the_entry = "\n".join(
         line
         for line in (repo_config_dir / "sources.yaml").read_text(encoding="utf-8").splitlines()
-        if "id: deepmind" not in line
+        if f"id: {RETIRE_RSS_TARGET}" not in line
     )
 
     with pytest.raises(ValueError, match="could not be located"):
@@ -372,8 +391,8 @@ def test_a_target_present_in_config_but_unlocatable_in_text_raises(
             make_proposal(
                 proposal_id=2,
                 kind=ProposalKind.RETIRE_RSS,
-                dedup_key="deepmind",
-                payload={"id": "deepmind"},
+                dedup_key=RETIRE_RSS_TARGET,
+                payload={"id": RETIRE_RSS_TARGET},
             ),
             today=TODAY,
             current=current,
