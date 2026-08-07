@@ -9,9 +9,12 @@ Phase 0 surface, and deliberately no more (NEVER rule 15):
   propose `sources.yaml` changes, review them in the digest, apply the approved.
   `run` is the only command in this CLI that spends money on being typed.
 * `podcast` — write the day's episode script and publish it to the podcast
-  channel, if configured (DESIGN §13.3).
-* `daily` — `curate apply` → `ingest` → `score` → `digest` → `podcast`, the cron
-  entry (DESIGN §14).
+  channel, if configured (DESIGN §13.3). Harvests vault marks first and ranks
+  the episode by them: `noise` out, then exceptional → useful → unmarked.
+* `daily` — `curate apply` → `ingest` → `score` → `digest` → `podcast`. Split
+  across two cron entries (DESIGN §14): `daily --no-podcast` in the evening,
+  `podcast --date <yesterday>` the next morning, with the gap as the operator's
+  window to mark the digest.
 * `status` — last-run health, per-source freshness, month-to-date token,
   web-search, and TTS spend (DESIGN §14).
 
@@ -93,6 +96,7 @@ from signalforge.curate.scout import (
 from signalforge.db import (
     connection,
     decide_proposal,
+    feedback_verdicts_for_items,
     finish_run,
     get_digest_items,
     get_item,
@@ -121,7 +125,7 @@ from signalforge.report.daily import (
     select_digest_items,
     utc_day_window,
 )
-from signalforge.report.podcast import script_path, write_script
+from signalforge.report.podcast import order_by_verdict, script_path, write_script
 from signalforge.score import ScoreOutcome, score_unscored_items
 from signalforge.synth.podcast import build_podcast_stable_prefix, build_script
 
@@ -1027,20 +1031,36 @@ def _select_podcast_items(
     tz: tzinfo,
     podcast_top_n: int,
 ) -> list[Item]:
-    """The top-`podcast_top_n` kept items for `target_date`, reusing the
-    digest's own ranking and crowding limits (DESIGN §13.3) — the same
-    `select_digest_items` call `build_digest_context` makes, just capped at a
-    different N. Items with no URL are dropped first, the same defensive
-    citability check `report.daily._to_line` applies, since an aired segment
-    with an unresolvable source is exactly what `report/podcast.py`'s
-    citation discipline (NEVER rule 7) would drop at render time anyway —
-    catching it here keeps it out of the top-N slot it would otherwise waste.
+    """The top-`podcast_top_n` kept items for `target_date`, preferring the
+    operator's marks over the model's score (DESIGN §13.3).
+
+    Three filters, in this order, and the order is the whole design:
+
+    1. **Citable.** Items with no URL are dropped first, the same defensive
+       check `report.daily._to_line` applies, since an aired segment with an
+       unresolvable source is exactly what `report/podcast.py`'s citation
+       discipline (NEVER rule 7) would drop at render time anyway — catching it
+       here keeps it out of a top-N slot it would otherwise waste.
+    2. **Marked.** `order_by_verdict` drops `noise` and re-tiers the rest
+       exceptional → useful → unmarked, preserving score order inside each tier.
+    3. **Crowded.** `select_digest_items` — the digest's own per-source and
+       per-repo limits, capped at `podcast_top_n` rather than `daily_max_items`,
+       a different Opus/TTS-priced knob (CLAUDE.md §6).
+
+    Tiering *before* crowding is deliberate: the caps then truncate the
+    operator's preferred order, so two `exceptional` items from one source still
+    beat an unmarked third from elsewhere only as far as `daily_max_per_source`
+    allows. Running it the other way would let the score ranking spend the
+    episode's slots before a single mark was consulted.
     """
     start, end = utc_day_window(target_date, tz)
     scored_items = get_digest_items(conn, start=start, end=end)
     citable = [scored for scored in scored_items if scored.item.url]
+    verdicts = feedback_verdicts_for_items(
+        conn, [scored.item.id for scored in citable if scored.item.id is not None]
+    )
     selected = select_digest_items(
-        citable,
+        order_by_verdict(citable, verdicts),
         max_items=podcast_top_n,
         max_per_source=interests.thresholds.daily_max_per_source,
         max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
@@ -1118,7 +1138,18 @@ def podcast(
     reuses `digest`'s own ranking and crowding limits, capped at
     `interests.yaml`'s `thresholds.podcast_top_n` rather than
     `daily_max_items` — a different, Opus-priced knob (CLAUDE.md §6, NEVER
-    rule 9's sibling for Phase 1 synthesis spend). Idempotent by construction
+    rule 9's sibling for Phase 1 synthesis spend).
+
+    **The operator's marks outrank the score.** Vault feedback is harvested
+    first (read-only, non-fatal), then `noise` items are dropped and the rest
+    tiered exceptional → useful → unmarked before the cap applies — see
+    `_select_podcast_items`. Unmarked is a tier, not an exclusion, so a day
+    nobody ticked anything still yields a normal score-ranked episode: marking
+    is upside, never a gate on the episode existing. This is why the default
+    schedule records the episode the morning *after* its digest (DESIGN §14) —
+    same day, and there is no window in which to have marked anything.
+
+    Idempotent by construction
     (CLAUDE.md §3): a vault script already on disk for `--date` is reused
     rather than regenerated (`--force-script` overrides), and `deliver_podcast`
     is itself a no-op on a date already delivered.
@@ -1145,6 +1176,7 @@ def podcast(
     with connection(db) as conn:
         run_id = start_run(conn, RUN_KIND_PODCAST, started_at=datetime.now(UTC))
         run_level_error: dict[str, str] | None = None
+        harvest_error: dict[str, str] | None = None
         deep_read_errors: list[dict[str, str]] = []
         delivery_errors: list[dict[str, str]] = []
         input_tokens = output_tokens = 0
@@ -1160,6 +1192,27 @@ def podcast(
                 )
                 status_value = "ok"
             else:
+                # Harvested here, not just in `digest`. The episode is built the
+                # morning *after* its digest was written (DESIGN §14), so the marks
+                # that decide this episode's running order were ticked since the
+                # last `digest` run and live only in the vault markdown until now —
+                # without this the podcast would rank against yesterday's marks and
+                # the whole reorder would be a day late. Non-fatal and vault-read-
+                # only, exactly as `digest` does it (NEVER rule 8): a broken harvest
+                # costs the marks, not the episode, and lands in `runs.errors` where
+                # `status` will surface it (CLAUDE.md §7). Re-harvesting an already
+                # -stored checkbox is a no-op, so running both is safe (DESIGN §11).
+                try:
+                    harvested = harvest_marks(conn, effective_vault_dir)
+                    if harvested.rows_recorded:
+                        console.print(
+                            f"[green]harvested feedback[/green]: {harvested.rows_recorded} new "
+                            f"mark(s) after scanning {harvested.files_scanned} vault file(s)."
+                        )
+                except Exception as exc:
+                    logger.exception("harvesting vault feedback failed; continuing to the episode")
+                    harvest_error = _run_level_error(exc)
+
                 items = _select_podcast_items(
                     conn,
                     interests=interests,
@@ -1260,6 +1313,7 @@ def podcast(
                 errors=(
                     [
                         *([run_level_error] if run_level_error is not None else []),
+                        *([harvest_error] if harvest_error is not None else []),
                         *deep_read_errors,
                         *delivery_errors,
                     ]
@@ -1757,8 +1811,25 @@ def daily(
     max_concurrency: Annotated[int, typer.Option("--max-concurrency", min=1)] = (
         DEFAULT_MAX_CONCURRENCY
     ),
+    with_podcast: Annotated[
+        bool,
+        typer.Option(
+            "--podcast/--no-podcast",
+            help="Record the episode as the last step. `--no-podcast` stops after "
+            "`digest`, for the split evening-digest / morning-podcast schedule.",
+        ),
+    ] = True,
 ) -> None:
-    """Run `curate apply`, `ingest`, `score`, `digest`, then `podcast` (DESIGN §14, cron 06:00).
+    """Run `curate apply`, `ingest`, `score`, `digest`, then `podcast` (DESIGN §14).
+
+    Split across two cron entries by default (DESIGN §14): `daily --no-podcast`
+    in the evening, `podcast --date <yesterday>` the next morning. The gap is
+    the point — it is the window in which the operator reads the digest and
+    ticks `noise`/`useful`/`exceptional`, and `podcast` harvests those marks and
+    ranks the episode by them (`_select_podcast_items`). Running the whole chain
+    in one shot (the default, `--podcast`) is still correct and is what a manual
+    catch-up run wants; it just records the episode against whatever marks
+    already existed, which on a same-day run is none.
 
     Each step keeps its own `runs` row and failure isolation — a step that
     comes back `partial`/`failed` does not stop the next one from running,
@@ -1780,10 +1851,10 @@ def daily(
     other step's — a broken applier costs the day's approvals, not the day's digest,
     and a `sources.yaml` that does not parse costs only the steps that read it.
 
-    `podcast` is the fifth and last step, isolated the same way: an unconfigured
-    channel or a dead R2/TTS provider costs the day's episode, not the digest that
-    already rendered before it ran (DESIGN §13.3's inherited invariant — a channel
-    failure never fails the run).
+    `podcast`, when it runs here at all, is the fifth and last step, isolated the
+    same way: an unconfigured channel or a dead R2/TTS provider costs the day's
+    episode, not the digest that already rendered before it ran (DESIGN §13.3's
+    inherited invariant — a channel failure never fails the run).
     """
     worst_exit = 0
 
@@ -1816,12 +1887,18 @@ def daily(
         ),
         lambda: score(config_dir=config_dir, db=db),
         lambda: digest(config_dir=config_dir, db=db, vault_dir=vault_dir),
-        lambda: podcast(
-            config_dir=config_dir,
-            db=db,
-            cache_dir=cache_dir,
-            vault_dir=vault_dir,
-            audio_dir=audio_dir,
+        *(
+            (
+                lambda: podcast(
+                    config_dir=config_dir,
+                    db=db,
+                    cache_dir=cache_dir,
+                    vault_dir=vault_dir,
+                    audio_dir=audio_dir,
+                ),
+            )
+            if with_podcast
+            else ()
         ),
     )
     for step in steps:

@@ -6,6 +6,15 @@ self-describing via an HTML comment marker, and the next pipeline run *harvests*
 the checked ones out of the vault markdown before it re-renders (overwrites)
 that file — "harvest-then-overwrite" keeps the writer idempotent (DESIGN §11).
 
+**Two commands call `harvest_marks`, not one.** `digest`, before it re-renders,
+and `podcast`, before it selects the episode's items (DESIGN §13.3, §14). The
+second is not redundant: on the split schedule the episode is recorded the
+morning *after* the digest that offered the checkboxes, so the marks that decide
+its running order were ticked since the last `digest` run and exist only in the
+vault markdown until something goes and reads them. The `UNIQUE(item_id,
+verdict)` index makes the overlap a no-op, so both harvesting is safe by
+construction rather than by scheduling luck.
+
 Boundaries this module holds:
 
 * **Read-only on the vault.** `harvest_marks` only globs and reads
@@ -28,6 +37,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -44,6 +54,7 @@ __all__ = [
     "Mark",
     "checkbox_marker",
     "harvest_marks",
+    "highest_rung",
     "parse_marks",
 ]
 
@@ -108,6 +119,28 @@ class HarvestResult:
     rows_recorded: int
     """Marks that produced a *new* `feedback` row. A re-harvested checkbox is a
     no-op (`db.record_feedback` returns False), so this is ≤ `marks_found`."""
+
+
+def highest_rung(verdicts: Iterable[str]) -> str | None:
+    """The strongest `LADDER` rung in `verdicts`, or None if it holds none.
+
+    The single reduction every aggregation over an item's marks goes through, so
+    "an item's verdict" means one thing everywhere (see `LADDER` — an item can
+    hold several rungs at once, and `verdict = 'useful'` is always the wrong
+    question).
+
+    **Off-ladder verdicts are dropped, not ranked.** `missed` is in `VERDICTS`
+    but deliberately absent from `LADDER`, so the obvious `max(verdicts,
+    key=LADDER.index)` raises `ValueError` the first time one appears. Filtering
+    first makes an item marked only `missed` read as unmarked here, which is
+    correct for every ranking caller: `missed` describes an item the digest
+    *didn't* show, so it says nothing about how the shown item should rank.
+    Callers that care about `missed` must ask for it separately.
+    """
+    on_ladder = [verdict for verdict in verdicts if verdict in LADDER]
+    if not on_ladder:
+        return None
+    return max(on_ladder, key=LADDER.index)
 
 
 def checkbox_marker(item_id: int, verdict: str) -> str:

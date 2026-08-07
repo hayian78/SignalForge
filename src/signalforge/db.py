@@ -47,6 +47,7 @@ __all__ = [
     "count_killed_items",
     "decide_proposal",
     "delivery_exists",
+    "feedback_verdicts_for_items",
     "feedback_verdicts_since",
     "finish_run",
     "get_digest_items",
@@ -1059,6 +1060,41 @@ def get_feedback(conn: sqlite3.Connection, item_id: int) -> list[sqlite3.Row]:
             (item_id,),
         ).fetchall()
     )
+
+
+def feedback_verdicts_for_items(
+    conn: sqlite3.Connection, item_ids: Sequence[int]
+) -> dict[int, tuple[str, ...]]:
+    """Every stored verdict for each of `item_ids`, keyed by item id.
+
+    Unreduced, for the same reason `feedback_verdicts_since` is: one item can
+    hold several rungs at once (`ux_feedback_item_verdict` stores each
+    separately), and collapsing them to the strongest is `feedback.highest_rung`'s
+    job — the ladder is defined once, in `feedback.LADDER`, and never re-encoded
+    in SQL.
+
+    An item with no marks is **absent** from the result rather than mapped to an
+    empty tuple, so "unmarked" is a missing key and callers cannot accidentally
+    treat it as a fourth verdict. Verdicts are sorted for determinism (CLAUDE.md
+    §3): the same rows always produce the same tuples.
+
+    One `IN` clause, one round trip. `item_ids` is a single day's kept items —
+    tens, bounded by the day's ingest — comfortably inside SQLite's parameter
+    limit. An empty sequence short-circuits rather than building `IN ()`, which
+    is a syntax error, not an empty match.
+    """
+    if not item_ids:
+        return {}
+    placeholders = ",".join("?" * len(item_ids))
+    rows = conn.execute(
+        f"SELECT item_id, verdict FROM feedback WHERE item_id IN ({placeholders}) "
+        "ORDER BY item_id, verdict",
+        tuple(item_ids),
+    ).fetchall()
+    verdicts: dict[int, list[str]] = {}
+    for row in rows:
+        verdicts.setdefault(int(row["item_id"]), []).append(row["verdict"])
+    return {item_id: tuple(values) for item_id, values in verdicts.items()}
 
 
 # --------------------------------------------------------------------------- #

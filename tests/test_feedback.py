@@ -26,6 +26,7 @@ from signalforge.feedback import (
     Mark,
     checkbox_marker,
     harvest_marks,
+    highest_rung,
     parse_marks,
 )
 from signalforge.report.daily import build_digest_context, render_digest
@@ -275,3 +276,38 @@ def test_harvest_marks_records_both_verdicts_on_one_item(
     second = harvest_marks(conn, vault)
     assert second.rows_recorded == 0
     assert len(get_feedback(conn, item_id)) == 2
+
+
+# --------------------------------------------------------------------------- #
+# highest_rung — the one reduction every aggregation goes through
+# --------------------------------------------------------------------------- #
+
+
+def test_highest_rung_of_no_marks_is_none() -> None:
+    assert highest_rung(()) is None
+
+
+@pytest.mark.parametrize("verdict", LADDER)
+def test_highest_rung_of_a_single_rung_is_that_rung(verdict: str) -> None:
+    assert highest_rung([verdict]) == verdict
+
+
+def test_highest_rung_picks_the_strongest_not_the_first() -> None:
+    """Order of the input must not matter — `UNIQUE(item_id, verdict)` stores
+    each mark separately and says nothing about which was ticked first."""
+    assert highest_rung(["noise", "exceptional", "useful"]) == "exceptional"
+    assert highest_rung(["exceptional", "noise"]) == "exceptional"
+
+
+def test_highest_rung_ignores_off_ladder_verdicts() -> None:
+    """`missed` is in `VERDICTS` but absent from `LADDER`; the naive
+    `max(..., key=LADDER.index)` would raise `ValueError` here."""
+    assert highest_rung(["missed"]) is None
+    assert highest_rung(["missed", "useful"]) == "useful"
+
+
+def test_highest_rung_covers_every_ladder_rung() -> None:
+    """Guards the reduction against a rung being added to `LADDER` without a
+    thought for how it aggregates — a new rung lands here first."""
+    assert highest_rung(LADDER) == LADDER[-1]
+    assert set(LADDER) <= set(VERDICTS)

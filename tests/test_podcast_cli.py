@@ -26,6 +26,7 @@ from typer.testing import CliRunner, Result
 from signalforge.cli import app
 from signalforge.db import connection
 from signalforge.deliver.tts import tts_spend_usd
+from signalforge.feedback import checkbox_marker
 from signalforge.llm import PodcastScript, PodcastScriptResult, TriageBatchResult, TriageResult
 
 runner = CliRunner()
@@ -721,3 +722,166 @@ def test_status_prices_recorded_tts_characters_at_the_configured_model(
     tts_line = result.output.split("TTS characters")[1].splitlines()[0]
     assert f"{chars:,}" in tts_line
     assert f"${expected_dollars:.2f}" in tts_line
+
+
+# --------------------------------------------------------------------------- #
+# the marks decide the running order (DESIGN §13.3, §14's split schedule)
+# --------------------------------------------------------------------------- #
+
+
+def _write_marked_digest(vault_dir: Path, *, item_id: int, verdict: str) -> Path:
+    """A minimal vault digest carrying one *checked* mark.
+
+    Deliberately hand-built from `checkbox_marker` rather than rendered by
+    `digest`: this asserts the podcast command harvests whatever the vault
+    actually says, and the marker's wire format is already round-trip tested in
+    `tests/test_feedback.py`.
+    """
+    daily = vault_dir / "daily"
+    daily.mkdir(parents=True, exist_ok=True)
+    path = daily / "2026-07-15.md"
+    marker = checkbox_marker(item_id, verdict).replace("- [ ]", "- [x]")
+    path.write_text(f"# Daily Digest\n\n- alpha post\n{marker}\n", encoding="utf-8")
+    return path
+
+
+def test_podcast_harvests_vault_marks_before_selecting(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The seam the split schedule depends on: a mark ticked after the digest ran
+    is still only in the vault markdown, so the podcast must harvest it itself or
+    rank against yesterday's marks (DESIGN §14)."""
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    _fake_run_podcast_script(monkeypatch)
+    _write_marked_digest(vault_dir, item_id=1, verdict="useful")
+
+    result = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", _scored_date(db_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    with connection(db_path) as conn:
+        verdicts = [row[0] for row in conn.execute("SELECT verdict FROM feedback")]
+    assert verdicts == ["useful"]
+
+
+def test_a_noise_mark_keeps_an_item_off_the_episode(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of the split schedule: the only kept item is marked
+    `noise`, so there is nothing left to record — no Opus call, no script, and a
+    clean `ok` run rather than a failure."""
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    script_calls = _fake_run_podcast_script(monkeypatch)
+    _write_marked_digest(vault_dir, item_id=1, verdict="noise")
+
+    result = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", _scored_date(db_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to record" in result.output
+    assert script_calls == []  # never billed an Opus call for an episode with no items
+    assert not (vault_dir / "podcast").exists()
+    with connection(db_path) as conn:
+        status = conn.execute("SELECT status FROM runs WHERE kind = 'podcast'").fetchone()[0]
+    assert status == "ok"
+
+
+def test_an_unmarked_day_still_records_a_normal_episode(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Marking is upside, never a gate: an empty vault must not stop the episode."""
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    _fake_run_podcast_script(monkeypatch)
+
+    result = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", _scored_date(db_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert len(list((vault_dir / "podcast").glob("*.md"))) == 1
+
+
+def test_daily_no_podcast_stops_after_the_digest(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The evening half of the split schedule (DESIGN §14): digest written, no
+    episode, no `podcast` run row — and no TTS or R2 call to mock, which is
+    itself the assertion that nothing tried to publish."""
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={
+                1: TriageResult(triage="keep", signal=5, relevance=5, novelty=4, reasoning="Good.")
+            },
+            input_tokens=1,
+            output_tokens=1,
+        ),
+    )
+    script_calls = _fake_run_podcast_script(monkeypatch)
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(FEED_URL).mock(
+            return_value=httpx.Response(200, text=FEED, headers={"etag": '"a-1"'})
+        )
+        result = _run(
+            "daily",
+            "--no-podcast",
+            "--config-dir",
+            str(config_dir),
+            "--db",
+            str(db_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--vault-dir",
+            str(vault_dir),
+            "--audio-dir",
+            str(audio_dir),
+        )
+
+    assert result.exit_code == 0, result.output
+    with connection(db_path) as conn:
+        kinds = [row[0] for row in conn.execute("SELECT kind FROM runs ORDER BY id")]
+    assert kinds == ["ingest", "score", "daily"]
+    assert script_calls == []
+    assert not (vault_dir / "podcast").exists()
+    assert list((vault_dir / "daily").glob("*.md"))  # the digest still landed

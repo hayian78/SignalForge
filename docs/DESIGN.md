@@ -543,9 +543,11 @@ Weekly, `signalforge curate run` runs four ordered stages:
 
 Pending proposals render as an approval block at the foot of the next Daily Digest, with the
 same GFM checkbox affordance the `feedback` marks use (§11): the operator ticks approve or
-reject while reading in Obsidian. The next morning's `daily` run harvests those ticks from
+reject while reading in Obsidian. The next `daily` run harvests those ticks from
 the vault markdown (read-only, before the render overwrites it) and applies the approved ones
-**before ingest**, so a feed approved yesterday is fetched this morning.
+**before ingest**, so a feed approved in one digest is fetched for the next. Since the split
+schedule (§14) that run is the same evening, not the next morning — approvals ticked during
+the day now land a cycle sooner.
 
 A pending proposal follows forward into every digest until it is decided, so it cannot scroll
 out of sight. Once decided it keeps rendering as a settled one-line note for
@@ -825,7 +827,7 @@ This file is injected (cached) into every scoring and synthesis prompt. It is th
 
 The `feedback` table (§5) is the sensor; this is the servo. Design constraint up front: **never per-mark reactive** — a single thumbs-down changes nothing except a stored row. Adaptation is batch, aggregated, capped, and *proposed rather than auto-applied*.
 
-**Capture (Phase 1).** `signalforge mark <id> useful|noise|exceptional|missed` (+ optional note). The first three form an **ordinal ladder** — `noise < useful < exceptional` — where `exceptional` means "not merely worth surfacing; worth remembering". An item may carry more than one rung (`UNIQUE(item_id, verdict)` stores each separately), so **an item's rating is its highest rung, and every aggregation must reduce to that** rather than testing `verdict = 'useful'` — otherwise the Phase 1 acceptance gate below deflates as marks migrate to the top rung. `missed` sits off the ladder — it describes an item the digest *didn't* show — and is CLI-only, because a rendered item was by definition surfaced; it is the highest-value verdict; the weekly brief footer lists near-miss items (scored just below threshold) to make it easy to give. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table.
+**Capture (Phase 1).** `signalforge mark <id> useful|noise|exceptional|missed` (+ optional note). The first three form an **ordinal ladder** — `noise < useful < exceptional` — where `exceptional` means "not merely worth surfacing; worth remembering". An item may carry more than one rung (`UNIQUE(item_id, verdict)` stores each separately), so **an item's rating is its highest rung, and every aggregation must reduce to that** rather than testing `verdict = 'useful'` — otherwise the Phase 1 acceptance gate below deflates as marks migrate to the top rung. `missed` sits off the ladder — it describes an item the digest *didn't* show — and is CLI-only, because a rendered item was by definition surfaced; it is the highest-value verdict; the weekly brief footer lists near-miss items (scored just below threshold) to make it easy to give. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table. **Two commands harvest, not one:** `digest` before it re-renders, and `podcast` before it selects (§13.3) — the marks that rank an episode are ticked *after* the digest that offered them, so the episode has to go and get them itself. Re-harvesting a stored checkbox is a no-op, so running both is safe.
 
 **Adaptation (Phase 2), monthly, alongside the monthly report:**
 
@@ -873,7 +875,7 @@ All reports land in the vault, git-committed, with frontmatter for Obsidian quer
 
 | Report | Cadence / trigger | Contents | Phase |
 |---|---|---|---|
-| **Daily Digest** | cron 06:00 | Top `daily_max_items` (default 15) kept items after crowding limits (below): title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items not shown. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
+| **Daily Digest** | cron 19:00 (§14) | Top `daily_max_items` (default 15) kept items after crowding limits (below): title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items not shown. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
 | **Weekly Intelligence Brief** | Sunday 07:00 | *The product.* Lead: "The 3 things that mattered." Then clustered top items with synthesis + citations, impact-engine verdicts per project (P3), trend deltas (P2), watchlist changes, cost/ops footer | 1 |
 | **Monthly Trend Report** | 1st of month | Rising/falling topics vs 3-month baseline, new entrants, cluster arcs, "boring but steady" section | 2 |
 | **Technology Radar** | Monthly, regenerated | Adopt/Trial/Assess/Hold per tool, derived from impact verdict history | 3 |
@@ -1036,6 +1038,35 @@ to justify: the digest's own top-N ranking, crowding limits, and citation discip
 `daily_max_items` already caps, and `report/podcast.py`'s vault script keeps NEVER
 rule 7's per-claim citation exactly as strict as the digest's.
 
+**Item selection: the operator's marks outrank the model's score.** The one place
+the podcast departs from the digest's pure score ranking, added 2026-08-08 after
+the operator's own report that a single dud item "wrecks the whole pod". Five
+slots do not forgive a bad pick the way fifteen digest lines do, so where a human
+has actually judged an item, that judgement wins. `cli._select_podcast_items`
+filters in a fixed order — **citable → marked → crowded**:
+
+1. Items with no URL drop first (NEVER rule 7 would drop them at render time
+   anyway; catching it here stops one wasting a top-N slot).
+2. `report.podcast.order_by_verdict` drops every `noise` item and re-tiers the
+   rest **exceptional → useful → unmarked**, preserving score order inside each
+   tier. An item holding two contradictory marks resolves to its highest rung
+   (`feedback.highest_rung`) and airs, rather than being killed by the weaker of
+   the two.
+3. `select_digest_items` then applies the per-source/per-repo crowding limits and
+   the `podcast_top_n` cap.
+
+Tiering **before** crowding is the load-bearing order: the caps truncate the
+operator's preferred order rather than spending the episode's slots before a
+single mark is consulted.
+
+**Unmarked is a tier, not an exclusion.** This is what keeps marking optional. A
+day nobody opens the digest still yields a normal, score-ranked episode — marks
+are upside, never a gate on the pipeline running. It is also why the alternative
+design (poll until every item is marked, then record) was rejected: "all items
+marked" is a condition that may simply never become true, so it needs a deadline
+fallback anyway, and a poller plus a deadline is strictly more machinery than one
+extra cron line for the same result (§14).
+
 **What it cost.** Stated in full, because a promotion that appears free is a
 promotion nobody will scrutinise next time:
 
@@ -1112,7 +1143,11 @@ earning its exception; it is dead weight carrying one anyway.
 
 ## 14. Scheduling & Operations
 
-- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest→podcast, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; `podcast` (§13.3) is the fifth and last step, isolated the same way — an unconfigured channel or a dead TTS/R2 provider costs the day's episode, never the digest that already rendered before it ran; the weekly scout runs before the brief so its proposals ride the next digest.
+- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily --no-podcast` (curate apply→ingest→score→digest, **19:00**), `signalforge podcast --date $(date -d yesterday +%F)` (**05:00**, §13.3), `signalforge curate run` (Fri 05:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this evening, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
+
+- **The digest and its episode are deliberately a night apart.** `daily` still knows how to run the whole chain in one shot (it is the default; `--no-podcast` is what splits it), and a manual catch-up run should. But the scheduled pair is split on purpose: the ten hours between the 19:00 digest and the 05:00 episode are the window in which the operator reads the digest and ticks `noise`/`useful`/`exceptional`, and `podcast` harvests those marks itself before selecting (§13.3). Run same-day, there is no window, and the reorder below has nothing to reorder by. The cost of the split is that the episode covers yesterday's date — comfortably inside `deliver.MAX_DELIVERY_AGE_DAYS`, and the reason that window is 1 day and not 0.
+
+  The **evening** half is the digest's, not an arbitrary shift: `get_digest_items` buckets by `scored_at`, and there is exactly one ingest+score pass per day, so moving the pass moves the whole bucket with it. Nothing falls between two days.
 
 The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$60/month at real measured cost (≈$2.00/run at the shipped 12 searches × 30 daily runs) — over this feature's own $13 budget and the whole pipeline's $30 alarm, on one mis-wired command. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
@@ -1154,7 +1189,7 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 - [x] Batched Haiku triage + 3-dimension scoring on titles + summaries only
 - [x] Daily digest → vault, with per-source / per-repo crowding limits
 - [x] Timezone-aware day boundary (UTC storage, configurable reader locale)
-- [x] Cron installed (06:00 daily via crontab; digests land in the configured `vault_dir`)
+- [x] Cron installed (via crontab; digests land in the configured `vault_dir`. Originally 06:00 daily; split 2026-08-08 into a 19:00 `daily --no-podcast` and an 05:00 `podcast` for the marking window — §14)
 - [x] Read 5 mornings straight and it saved time (operator confirmed 2026-07-23)
 - [x] Live double-run = zero duplicates (verified 2026-07-23: back-to-back `signalforge daily` — second run added 0 rows, spent 0 tokens, re-rendered the digest byte-identically)
 

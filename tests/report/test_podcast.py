@@ -12,12 +12,12 @@ than depending on `synth/podcast.py`'s (separately tested) LLM-facing path.
 from __future__ import annotations
 
 import sqlite3
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
 
-from signalforge.db import upsert_item
+from signalforge.db import DigestItem, upsert_item
 from signalforge.llm import PodcastScript, PodcastSegment, PodcastTurn
 from signalforge.report.podcast import (
     CoverageGap,
@@ -26,6 +26,7 @@ from signalforge.report.podcast import (
     ScriptTurn,
     SourceLink,
     build_script_context,
+    order_by_verdict,
     parse_script,
     render_script,
     script_path,
@@ -632,3 +633,115 @@ def test_a_hand_built_context_round_trips() -> None:
     rendered = render_script(context)
 
     assert parse_script(rendered) == context
+
+
+# --------------------------------------------------------------------------- #
+# order_by_verdict — the operator's marks outrank the model's score
+# --------------------------------------------------------------------------- #
+
+
+def _scored(item_id: int, *, source_id: str = "blog", title: str = "A story") -> DigestItem:
+    """A `DigestItem` with a known id. Scores are identical across every helper
+    call on purpose: `order_by_verdict` must never consult them, so a test that
+    passed because of a score difference would be testing the wrong thing. The
+    *incoming order* is the ranking, exactly as `get_digest_items` returns it."""
+    return DigestItem(
+        item=make_item(
+            id=item_id,
+            source_id=source_id,
+            external_id=f"guid-{item_id}",
+            url=f"https://example.com/{item_id}",
+            title=title,
+        ),
+        signal=4,
+        relevance=4,
+        novelty=4,
+        reasoning="A reason this item matters.",
+        model="claude-haiku-4-5",
+        rubric_version="v1",
+        scored_at=datetime(2026, 8, 7, 9, 0, tzinfo=UTC),
+    )
+
+
+def _ids(items: list[DigestItem]) -> list[int]:
+    return [item.item.id for item in items if item.item.id is not None]
+
+
+def test_order_by_verdict_leaves_an_unmarked_day_in_score_order() -> None:
+    """The property that makes marking optional: no marks, no reordering."""
+    items = [_scored(1), _scored(2), _scored(3)]
+
+    assert _ids(order_by_verdict(items, {})) == [1, 2, 3]
+
+
+def test_order_by_verdict_drops_noise() -> None:
+    items = [_scored(1), _scored(2), _scored(3)]
+
+    assert _ids(order_by_verdict(items, {2: ("noise",)})) == [1, 3]
+
+
+def test_order_by_verdict_promotes_exceptional_then_useful_over_unmarked() -> None:
+    """Bottom-ranked marks beat top-ranked silence, and the two rungs stay ordered."""
+    items = [_scored(1), _scored(2), _scored(3), _scored(4)]
+
+    ordered = order_by_verdict(items, {3: ("useful",), 4: ("exceptional",)})
+
+    assert _ids(ordered) == [4, 3, 1, 2]
+
+
+def test_order_by_verdict_keeps_score_order_within_a_tier() -> None:
+    """Stable sort: marks decide the tier, the incoming ranking decides the rest."""
+    items = [_scored(1), _scored(2), _scored(3), _scored(4)]
+
+    ordered = order_by_verdict(items, {1: ("useful",), 3: ("useful",)})
+
+    assert _ids(ordered) == [1, 3, 2, 4]
+
+
+def test_order_by_verdict_resolves_a_contradictory_mark_to_its_highest_rung() -> None:
+    """A mis-click, or a mind changed: `useful` wins and the item still airs,
+    rather than the weaker of two stored marks silently killing it."""
+    items = [_scored(1), _scored(2)]
+
+    ordered = order_by_verdict(items, {2: ("noise", "useful")})
+
+    assert _ids(ordered) == [2, 1]
+
+
+def test_order_by_verdict_treats_an_off_ladder_mark_as_unmarked() -> None:
+    """`missed` is in the vocabulary but off the ladder — it must not raise, and
+    it says nothing about how a *shown* item should rank."""
+    items = [_scored(1), _scored(2)]
+
+    ordered = order_by_verdict(items, {1: ("missed",)})
+
+    assert _ids(ordered) == [1, 2]
+
+
+def test_order_by_verdict_treats_an_item_with_no_id_as_unmarked() -> None:
+    """An unsaved item cannot be looked up; markedness must not decide citability."""
+    unsaved = DigestItem(
+        item=make_item(id=None, url="https://example.com/unsaved"),
+        signal=4,
+        relevance=4,
+        novelty=4,
+        reasoning="A reason this item matters.",
+        model="claude-haiku-4-5",
+        rubric_version="v1",
+        scored_at=datetime(2026, 8, 7, 9, 0, tzinfo=UTC),
+    )
+    items = [unsaved, _scored(2)]
+
+    ordered = order_by_verdict(items, {2: ("exceptional",)})
+
+    assert _ids(ordered) == [2]
+    assert ordered[1].item.id is None
+
+
+def test_order_by_verdict_is_pure() -> None:
+    """No mutation of the caller's list — `_select_podcast_items` reuses it."""
+    items = [_scored(1), _scored(2)]
+
+    order_by_verdict(items, {2: ("exceptional",)})
+
+    assert _ids(items) == [1, 2]

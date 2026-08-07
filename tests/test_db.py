@@ -25,6 +25,7 @@ from signalforge.db import (
     connection,
     decide_proposal,
     delivery_exists,
+    feedback_verdicts_for_items,
     feedback_verdicts_since,
     finish_run,
     get_feedback,
@@ -279,6 +280,55 @@ def test_record_feedback_for_a_nonexistent_item_raises(conn: sqlite3.Connection)
     # the harvester and the CLI both pre-check the item exists (CLAUDE.md §7).
     with pytest.raises(sqlite3.IntegrityError):
         record_feedback(conn, item_id=9999, verdict="useful", note=None, created_at=FEEDBACK_AT)
+
+
+def test_feedback_verdicts_for_items_returns_every_verdict_keyed_by_item(
+    conn: sqlite3.Connection,
+) -> None:
+    first, _ = upsert_item(conn, make_item(external_id="guid-1", url="https://example.com/1"))
+    second, _ = upsert_item(conn, make_item(external_id="guid-2", url="https://example.com/2"))
+    later = FEEDBACK_AT.replace(hour=FEEDBACK_AT.hour + 1)
+    record_feedback(conn, item_id=first, verdict="useful", note=None, created_at=FEEDBACK_AT)
+    record_feedback(conn, item_id=first, verdict="noise", note=None, created_at=later)
+    record_feedback(conn, item_id=second, verdict="exceptional", note=None, created_at=FEEDBACK_AT)
+
+    verdicts = feedback_verdicts_for_items(conn, [first, second])
+
+    # Unreduced: both of `first`'s rungs come back, for `feedback.highest_rung`
+    # to collapse. Verdicts are sorted, so the tuples are deterministic.
+    assert verdicts == {first: ("noise", "useful"), second: ("exceptional",)}
+
+
+def test_feedback_verdicts_for_items_omits_unmarked_items(conn: sqlite3.Connection) -> None:
+    """Unmarked is an *absent key*, never an empty tuple — so a caller cannot
+    mistake "no marks" for a fourth verdict."""
+    marked, _ = upsert_item(conn, make_item(external_id="guid-1", url="https://example.com/1"))
+    unmarked, _ = upsert_item(conn, make_item(external_id="guid-2", url="https://example.com/2"))
+    record_feedback(conn, item_id=marked, verdict="useful", note=None, created_at=FEEDBACK_AT)
+
+    verdicts = feedback_verdicts_for_items(conn, [marked, unmarked])
+
+    assert verdicts == {marked: ("useful",)}
+    assert unmarked not in verdicts
+
+
+def test_feedback_verdicts_for_items_ignores_ids_it_was_not_asked_about(
+    conn: sqlite3.Connection,
+) -> None:
+    wanted, _ = upsert_item(conn, make_item(external_id="guid-1", url="https://example.com/1"))
+    other, _ = upsert_item(conn, make_item(external_id="guid-2", url="https://example.com/2"))
+    record_feedback(conn, item_id=wanted, verdict="useful", note=None, created_at=FEEDBACK_AT)
+    record_feedback(conn, item_id=other, verdict="noise", note=None, created_at=FEEDBACK_AT)
+
+    assert feedback_verdicts_for_items(conn, [wanted]) == {wanted: ("useful",)}
+
+
+def test_feedback_verdicts_for_items_short_circuits_on_no_ids(conn: sqlite3.Connection) -> None:
+    """`IN ()` is a syntax error, not an empty match — the guard is load-bearing."""
+    item_id, _ = upsert_item(conn, make_item())
+    record_feedback(conn, item_id=item_id, verdict="useful", note=None, created_at=FEEDBACK_AT)
+
+    assert feedback_verdicts_for_items(conn, []) == {}
 
 
 def test_items_table_has_both_unique_constraints(conn: sqlite3.Connection) -> None:
