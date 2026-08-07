@@ -67,6 +67,7 @@ __all__ = [
     "reopen_proposal",
     "source_yield_stats",
     "start_run",
+    "update_item_content",
     "update_proposal_probe",
     "upsert_item",
 ]
@@ -248,11 +249,26 @@ _MIGRATION_0004_DELIVERIES = Migration(
     ),
 )
 
+_MIGRATION_0005_PODCAST = Migration(
+    version=5,
+    name="podcast_tts_spend",
+    statements=(
+        # Mirrors migration 3's `server_tool_requests` rationale: TTS bills per
+        # character, not per token, so the two `llm_*_tokens` columns cannot
+        # express it. Without this column the podcast channel's spend would be
+        # real and invisible — the failure NEVER rule 11 exists to prevent.
+        # `signalforge status` turns it into a dollar figure via
+        # `deliver.tts.tts_spend_usd` (DESIGN §8).
+        "ALTER TABLE runs ADD COLUMN tts_characters INTEGER DEFAULT 0",
+    ),
+)
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     _MIGRATION_0001_PHASE0,
     _MIGRATION_0002_FEEDBACK_DEDUP,
     _MIGRATION_0003_CURATION,
     _MIGRATION_0004_DELIVERIES,
+    _MIGRATION_0005_PODCAST,
 )
 """Ordered, append-only. Never edit an applied migration — add a new one."""
 
@@ -594,6 +610,29 @@ def get_item_by_canonical_url(conn: sqlite3.Connection, canonical_url: str) -> I
     return _row_to_item(row) if row is not None else None
 
 
+def update_item_content(conn: sqlite3.Connection, item_id: int, content: str) -> bool:
+    """Backfill `items.content` for one row — the deep-read write path (CLAUDE.md §6).
+
+    Conditioned on `content IS NULL`, which is the whole idempotency lever
+    (CLAUDE.md §3, NEVER rule 4): once genuine full text is stored here, this
+    can never overwrite it, so a re-run that reaches an already-filled item
+    performs zero writes. Returns whether a row was actually changed, so the
+    caller (`ingest/fullcontent.py`) can count real fetches without a second
+    query.
+
+    Deliberately narrower than `upsert_item`: the caller already holds the
+    item's id from an earlier read, so there is no identity to resolve, and
+    going through `_merge_item`'s full resolve-then-write path would need a
+    complete `Item` (including `title`, which that merge always overwrites)
+    for a change that touches exactly one column.
+    """
+    cursor = conn.execute(
+        "UPDATE items SET content = ? WHERE id = ? AND content IS NULL",
+        (content, item_id),
+    )
+    return cursor.rowcount > 0
+
+
 # --------------------------------------------------------------------------- #
 # scores — read side for report/daily.py
 #
@@ -760,6 +799,7 @@ def finish_run(
     llm_input_tokens: int = 0,
     llm_output_tokens: int = 0,
     server_tool_requests: int = 0,
+    tts_characters: int = 0,
     errors: Sequence[Mapping[str, object]] | None = None,
 ) -> None:
     """Close a `runs` row.
@@ -772,6 +812,11 @@ def finish_run(
     by the run. It defaults to 0 because every existing caller makes none; the
     curation scout is the only path that passes it. Token counts alone cannot
     express that spend — web search bills per call (DESIGN §8).
+
+    `tts_characters` counts characters sent to the TTS provider. It defaults to
+    0 because every existing caller makes none; the podcast channel is the only
+    path that passes it. TTS bills per character, which neither the token
+    columns nor `server_tool_requests` can express (DESIGN §8).
     """
     encoded = json.dumps(list(errors)) if errors else None
     conn.execute(
@@ -783,6 +828,7 @@ def finish_run(
             llm_input_tokens     = ?,
             llm_output_tokens    = ?,
             server_tool_requests = ?,
+            tts_characters       = ?,
             errors               = ?
         WHERE id = ?
         """,
@@ -793,6 +839,7 @@ def finish_run(
             llm_input_tokens,
             llm_output_tokens,
             server_tool_requests,
+            tts_characters,
             encoded,
             run_id,
         ),

@@ -70,3 +70,44 @@ timezone: UTC
 # `send_on:` list — Resend is the only endpoint and the daily digest is the only
 # report, so either would be a setting that cannot change anything. They arrive
 # with the second provider and the Weekly Brief respectively.
+#
+# --- Podcast (second recorded phase-gate exception, DESIGN §13.3) ---------
+# A daily two-presenter audio show, scripted by Opus from the day's top-N kept
+# items and published as a private RSS feed on Cloudflare R2. Entirely optional
+# and off unless `interests.yaml`'s `thresholds.podcast_top_n` is also set — the
+# item-count knob lives there, beside `daily_max_items`, not here.
+#
+# Every key below is required once the block exists: this channel spends real
+# TTS dollars beyond the LLM call, and a default buried in code is a spend
+# limit nobody can see (CLAUDE.md §10 rule 6).
+#
+# delivery:
+#   podcast:
+#     enabled: true
+#
+#     # OpenRouter TTS. The key goes in `.env` as OPENROUTER_API_KEY=sk-or-...;
+#     # pasting it here is rejected at load. `hexgrad/kokoro-82m` is the cheap,
+#     # per-character-priced default this stage's per-line synthesis fallback
+#     # (deliver/tts.py) was built and priced against — a single-request
+#     # multi-speaker model (e.g. a Gemini TTS variant) is a documented future
+#     # optimization, not something this channel calls yet. Re-check
+#     # openrouter.ai/hexgrad/kokoro-82m for current pricing before trusting
+#     # deliver.tts._PRICE_PER_MILLION_CHARS_USD's copy of it.
+#     tts_api_key_env: OPENROUTER_API_KEY
+#     tts_model: hexgrad/kokoro-82m
+#     voice_a: af_bella
+#     voice_b: am_adam
+#     presenter_a: Alex
+#     presenter_b: Sam
+#
+#     # Cloudflare R2 (S3-compatible). Keys go in `.env`, never here.
+#     r2_endpoint: https://<account-id>.r2.cloudflarestorage.com
+#     r2_bucket: signalforge-podcast
+#     r2_access_key_env: R2_ACCESS_KEY_ID
+#     r2_secret_key_env: R2_SECRET_ACCESS_KEY
+#
+#     # The unguessable-prefix URL a phone podcast app subscribes to.
+#     public_base_url: https://pub-xxxxxxxx.r2.dev/some-unguessable-prefix
+#
+#     retention_episodes: 30
+#     feed_title: SignalForge Daily

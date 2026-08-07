@@ -8,9 +8,12 @@ Phase 0 surface, and deliberately no more (NEVER rule 15):
 * `curate run|apply|list|decide|reopen` — adaptive source curation (DESIGN §7.1):
   propose `sources.yaml` changes, review them in the digest, apply the approved.
   `run` is the only command in this CLI that spends money on being typed.
-* `daily` — `curate apply` → `ingest` → `score` → `digest`, the cron entry (DESIGN §14).
-* `status` — last-run health, per-source freshness, month-to-date token and
-  web-search spend (DESIGN §14).
+* `podcast` — write the day's episode script and publish it to the podcast
+  channel, if configured (DESIGN §13.3).
+* `daily` — `curate apply` → `ingest` → `score` → `digest` → `podcast`, the cron
+  entry (DESIGN §14).
+* `status` — last-run health, per-source freshness, month-to-date token,
+  web-search, and TTS spend (DESIGN §14).
 
 LLM work stays behind the `score/` boundary: this module drives the pipeline but
 must never import `llm.py` directly (NEVER rule 1 — `anthropic` lives in `llm.py`).
@@ -54,7 +57,7 @@ import sys
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from datetime import date as Date
 from pathlib import Path
 from typing import Annotated, Any, Final
@@ -91,6 +94,7 @@ from signalforge.db import (
     connection,
     decide_proposal,
     finish_run,
+    get_digest_items,
     get_item,
     get_proposal,
     get_proposals,
@@ -100,9 +104,13 @@ from signalforge.db import (
     upsert_item,
 )
 from signalforge.deliver import DeliveryOutcome, deliver_digest, send_test_message
+from signalforge.deliver.podcast import deliver_podcast
+from signalforge.deliver.tts import tts_spend_usd
 from signalforge.feedback import harvest_marks
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
-from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY
+from signalforge.ingest.arxiv import ARXIV_SOURCE_ID
+from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY, HttpFetcher
+from signalforge.ingest.fullcontent import fetch_full_content
 from signalforge.ingest.hackernews import HN_SOURCE_ID
 from signalforge.models import Item, ProposalStatus
 from signalforge.report.daily import (
@@ -110,8 +118,12 @@ from signalforge.report.daily import (
     build_digest_context,
     digest_path,
     render_digest,
+    select_digest_items,
+    utc_day_window,
 )
+from signalforge.report.podcast import script_path, write_script
 from signalforge.score import ScoreOutcome, score_unscored_items
+from signalforge.synth.podcast import build_podcast_stable_prefix, build_script
 
 __all__ = [
     "app",
@@ -121,6 +133,7 @@ __all__ = [
     "digest",
     "ingest",
     "mark",
+    "podcast",
     "score",
     "status",
 ]
@@ -130,6 +143,10 @@ logger = logging.getLogger(__name__)
 DEFAULT_CONFIG_DIR: Final = Path("config")
 DEFAULT_DB_PATH: Final = Path("data/signalforge.db")
 DEFAULT_CACHE_DIR: Final = Path("data/http_cache")
+DEFAULT_AUDIO_DIR: Final = Path("data/audio")
+"""Where synthesized episode mp3s are cached locally — regenerable plumbing,
+not backed up (DESIGN §14), so it is a code default like `DEFAULT_DB_PATH`
+rather than a `settings.yaml` knob."""
 # The default vault location lives on `SettingsConfig.vault_dir` (config, not
 # code — CLAUDE.md §4), so both commands default the `--vault-dir` flag to None
 # and fall back to settings when it is not passed. No Python-side constant here.
@@ -139,6 +156,7 @@ RUN_KIND_SCORE: Final = "score"
 RUN_KIND_DIGEST: Final = "daily"
 RUN_KIND_CURATE: Final = "curate"
 RUN_KIND_CURATE_APPLY: Final = "curate-apply"
+RUN_KIND_PODCAST: Final = "podcast"
 """Matches the `runs.kind` vocabulary in DESIGN §5.
 
 `curate` and `curate-apply` are separate kinds on purpose: one makes a paid Opus
@@ -261,6 +279,8 @@ def _select_source(config: SourcesConfig, source_id: str) -> SourcesConfig:
         filtered.github.releases = [repo for repo in filtered.github.releases if repo == source_id]
     if filtered.hackernews is not None and source_id != HN_SOURCE_ID:
         filtered.hackernews = None
+    if filtered.arxiv is not None and source_id != ARXIV_SOURCE_ID:
+        filtered.arxiv = None
     return filtered
 
 
@@ -472,7 +492,9 @@ def ingest(
     ] = DEFAULT_CACHE_DIR,
     source: Annotated[
         str | None,
-        typer.Option("--source", help="Ingest only this source_id (feed id, repo slug, or 'hn')."),
+        typer.Option(
+            "--source", help="Ingest only this source_id (feed id, repo slug, 'hn', or 'arxiv')."
+        ),
     ] = None,
     dry_run: Annotated[
         bool,
@@ -930,6 +952,327 @@ def digest(
                     [e for e in (harvest_error, run_level_error) if e is not None] + delivery_errors
                 )
                 or None,
+            )
+
+    if status_value == "failed":
+        raise typer.Exit(code=1)
+
+
+# --------------------------------------------------------------------------- #
+# podcast (DESIGN §13.3 — the second recorded phase-gate exception)
+# --------------------------------------------------------------------------- #
+
+
+def _deliver_podcast_and_report(
+    conn: sqlite3.Connection,
+    *,
+    settings: SettingsConfig,
+    target_date: Date,
+    vault_dir: Path,
+    audio_dir: Path,
+    today: Date,
+    run_id: int | None,
+    resend: bool,
+) -> tuple[list[dict[str, str]], int]:
+    """Mirror the episode script to the podcast feed; print what happened.
+
+    Never raises (mirrors `_deliver_and_report`): the vault script is already
+    written by the time this is called, so a dead R2 or TTS provider is a
+    recorded error and a printed line, not a failed run (§7, NEVER rule 12,
+    NEVER rule 19). Returns `(errors, tts_characters)` so the caller can fold
+    both into `finish_run` regardless of which branch below produced them.
+    """
+    try:
+        outcome = deliver_podcast(
+            conn,
+            settings=settings,
+            target_date=target_date,
+            vault_dir=vault_dir,
+            audio_dir=audio_dir,
+            today=today,
+            run_id=run_id,
+            resend=resend,
+        )
+    except Exception as exc:  # pragma: no cover — deliver_podcast catches its own
+        # Same backstop `_deliver_and_report` keeps for `deliver_digest`: a
+        # future failure mode `deliver_podcast` forgets to catch must not be
+        # able to take the run down with it.
+        logger.exception("podcast delivery raised unexpectedly; the script is already written")
+        return [_run_level_error(exc)], 0
+
+    if outcome is None:
+        # Channel unconfigured or disabled — silent, matching `deliver_podcast`'s
+        # own "nothing to report" contract; there is no channel to name.
+        return [], 0
+
+    reason = escape(outcome.reason)
+    if outcome.sent:
+        provider = escape(outcome.provider_id) if outcome.provider_id else ""
+        suffix = f" (provider id {provider})" if provider else ""
+        console.print(f"[green]{outcome.channel} delivered[/green]: {reason}{suffix}")
+    elif outcome.error is not None:
+        err_console.print(f"[red]{outcome.channel} not delivered[/red]: {reason}")
+    else:
+        console.print(f"[yellow]{outcome.channel} skipped[/yellow]: {reason}")
+
+    errors = [_run_level_error(outcome.error)] if outcome.error is not None else []
+    return errors, outcome.tts_characters
+
+
+def _select_podcast_items(
+    conn: sqlite3.Connection,
+    *,
+    interests: InterestsConfig,
+    target_date: Date,
+    tz: tzinfo,
+    podcast_top_n: int,
+) -> list[Item]:
+    """The top-`podcast_top_n` kept items for `target_date`, reusing the
+    digest's own ranking and crowding limits (DESIGN §13.3) — the same
+    `select_digest_items` call `build_digest_context` makes, just capped at a
+    different N. Items with no URL are dropped first, the same defensive
+    citability check `report.daily._to_line` applies, since an aired segment
+    with an unresolvable source is exactly what `report/podcast.py`'s
+    citation discipline (NEVER rule 7) would drop at render time anyway —
+    catching it here keeps it out of the top-N slot it would otherwise waste.
+    """
+    start, end = utc_day_window(target_date, tz)
+    scored_items = get_digest_items(conn, start=start, end=end)
+    citable = [scored for scored in scored_items if scored.item.url]
+    selected = select_digest_items(
+        citable,
+        max_items=podcast_top_n,
+        max_per_source=interests.thresholds.daily_max_per_source,
+        max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
+    )
+    return [scored.item for scored in selected]
+
+
+async def _deep_read(
+    conn: sqlite3.Connection, items: list[Item], *, cache_dir: Path, timeout: float
+) -> list[dict[str, str]]:
+    async with HttpFetcher(cache_dir=cache_dir, timeout=timeout) as fetcher:
+        result = await fetch_full_content(fetcher, conn, items)
+    if result.errors:
+        console.print(
+            f"[dim]deep-read: {result.fetched} item(s) backfilled, "
+            f"{len(result.errors)} fetch/extract error(s) (items degrade to "
+            "title+summary).[/dim]"
+        )
+    # Recorded into `runs.errors`, not just logged (CLAUDE.md §7's monitoring
+    # channel): a paywalled or dead article must be as visible to `status` as
+    # any other source failure, even though the item itself still airs on
+    # title+summary alone rather than aborting the episode.
+    return [error.as_record() for error in result.errors]
+
+
+def _episode_date_label(target_date: Date) -> str:
+    return f"{target_date:%A}, {target_date.day} {target_date:%B} {target_date.year}"
+
+
+@app.command()
+def podcast(
+    config_dir: Annotated[
+        Path, typer.Option("--config-dir", help="Directory holding interests.yaml.")
+    ] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
+    cache_dir: Annotated[
+        Path, typer.Option("--cache-dir", help="Deep-read raw payload cache.")
+    ] = DEFAULT_CACHE_DIR,
+    vault_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--vault-dir", help="Vault root (scripts land in <vault>/podcast/). See `digest`."
+        ),
+    ] = None,
+    audio_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--audio-dir", help="Local mp3 cache root. Overrides the data/audio/ default."
+        ),
+    ] = None,
+    target_date: Annotated[
+        datetime | None,
+        typer.Option(
+            "--date",
+            formats=["%Y-%m-%d"],
+            help="Episode date, YYYY-MM-DD (default: today, operator timezone).",
+        ),
+    ] = None,
+    force_script: Annotated[
+        bool,
+        typer.Option(
+            "--force-script",
+            help="Regenerate the script even if today's vault file already exists "
+            "(a fresh, billed Opus call).",
+        ),
+    ] = False,
+    resend: Annotated[
+        bool,
+        typer.Option("--resend", help="Publish again even if this date was already delivered."),
+    ] = False,
+) -> None:
+    """Write the day's podcast script (Opus) and publish it (TTS + R2 feed).
+
+    The second recorded phase-gate exception (DESIGN §13.3). Item selection
+    reuses `digest`'s own ranking and crowding limits, capped at
+    `interests.yaml`'s `thresholds.podcast_top_n` rather than
+    `daily_max_items` — a different, Opus-priced knob (CLAUDE.md §6, NEVER
+    rule 9's sibling for Phase 1 synthesis spend). Idempotent by construction
+    (CLAUDE.md §3): a vault script already on disk for `--date` is reused
+    rather than regenerated (`--force-script` overrides), and `deliver_podcast`
+    is itself a no-op on a date already delivered.
+
+    Presenter names live in `settings.yaml`'s `delivery.podcast:` block, the
+    same block TTS/R2 read — so a script cannot be written at all until that
+    block exists, even with `enabled: false` (a "configured, not yet turned
+    on" state used to review Stage 3/4 scripts before Stage 5 could publish
+    them). Either `thresholds.podcast_top_n` unset or no `delivery.podcast:`
+    block means the channel is off: a clean "nothing to record" exit, same as
+    a day with no kept items.
+    """
+    interests = _load_interests_or_exit(config_dir)
+    settings = _load_settings_or_exit(config_dir)
+    sources = _load_sources_or_exit(config_dir)
+    tz = settings.tzinfo
+    effective_vault_dir = vault_dir if vault_dir is not None else settings.vault_dir
+    effective_audio_dir = audio_dir if audio_dir is not None else DEFAULT_AUDIO_DIR
+    resolved_date = target_date.date() if target_date is not None else datetime.now(tz).date()
+
+    podcast_top_n = interests.thresholds.podcast_top_n
+    channel_config = settings.delivery.podcast
+
+    with connection(db) as conn:
+        run_id = start_run(conn, RUN_KIND_PODCAST, started_at=datetime.now(UTC))
+        run_level_error: dict[str, str] | None = None
+        deep_read_errors: list[dict[str, str]] = []
+        delivery_errors: list[dict[str, str]] = []
+        input_tokens = output_tokens = 0
+        tts_characters = 0
+        item_count = 0
+        status_value = "failed"
+        try:
+            if podcast_top_n is None or channel_config is None:
+                console.print(
+                    "[yellow]podcast channel is off[/yellow]: needs both "
+                    "`interests.yaml` thresholds.podcast_top_n and a `settings.yaml` "
+                    "delivery.podcast: block. Nothing to record."
+                )
+                status_value = "ok"
+            else:
+                items = _select_podcast_items(
+                    conn,
+                    interests=interests,
+                    target_date=resolved_date,
+                    tz=tz,
+                    podcast_top_n=podcast_top_n,
+                )
+                if not items:
+                    console.print(
+                        f"[yellow]nothing to record[/yellow]: no kept items for "
+                        f"{resolved_date.isoformat()}."
+                    )
+                    status_value = "ok"
+                else:
+                    item_count = len(items)
+                    script_file = script_path(effective_vault_dir, date=resolved_date)
+                    if script_file.is_file() and not force_script:
+                        console.print(
+                            f"[dim]script already exists at {script_file}; skipping the "
+                            "Opus call (--force-script to regenerate).[/dim]"
+                        )
+                    else:
+                        deep_read_errors = asyncio.run(
+                            _deep_read(
+                                conn,
+                                items,
+                                cache_dir=cache_dir,
+                                timeout=sources.defaults.fetch_timeout,
+                            )
+                        )
+                        refreshed_items = [
+                            refreshed
+                            for item in items
+                            if item.id is not None
+                            and (refreshed := get_item(conn, item.id)) is not None
+                        ]
+                        stable_prefix = build_podcast_stable_prefix(interests)
+                        built = build_script(
+                            stable_prefix,
+                            date_label=_episode_date_label(resolved_date),
+                            presenter_a=channel_config.presenter_a,
+                            presenter_b=channel_config.presenter_b,
+                            items=refreshed_items,
+                        )
+                        input_tokens = built.input_tokens
+                        output_tokens = built.output_tokens
+                        if built.script is None:
+                            console.print(
+                                "[yellow]script call produced nothing usable[/yellow]; "
+                                "see the log for why."
+                            )
+                        else:
+                            written = write_script(
+                                conn,
+                                built,
+                                date=resolved_date,
+                                presenter_a=channel_config.presenter_a,
+                                presenter_b=channel_config.presenter_b,
+                                vault_dir=effective_vault_dir,
+                            )
+                            console.print(f"[green]script written[/green]: {written}")
+
+                    # Attempted regardless of whether the script above was fresh or
+                    # reused: `deliver_podcast` is its own idempotency boundary
+                    # (already-delivered dates, cached mp3s), the same posture
+                    # `_deliver_and_report` takes after `digest`'s vault write.
+                    delivery_errors, tts_characters = _deliver_podcast_and_report(
+                        conn,
+                        settings=settings,
+                        target_date=resolved_date,
+                        vault_dir=effective_vault_dir,
+                        audio_dir=effective_audio_dir,
+                        today=datetime.now(tz).date(),
+                        run_id=run_id,
+                        resend=resend,
+                    )
+                    status_value = "ok"
+        except BaseException as exc:
+            # Includes KeyboardInterrupt, mirroring every other command's
+            # no-silent-runs rule (CLAUDE.md §3): a crash mid-episode still
+            # closes its `runs` row. `build_script` itself never raises once
+            # its first call has been billed (see its docstring) — an
+            # `LlmError` reaching here means that first call failed before any
+            # response came back, so `input_tokens`/`output_tokens` staying 0
+            # is the honest figure, not a loss.
+            run_level_error = _run_level_error(exc)
+            raise
+        finally:
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                items_new=0,  # podcast writes no `items` rows.
+                llm_input_tokens=input_tokens,
+                llm_output_tokens=output_tokens,
+                tts_characters=tts_characters,
+                errors=(
+                    [
+                        *([run_level_error] if run_level_error is not None else []),
+                        *deep_read_errors,
+                        *delivery_errors,
+                    ]
+                    or None
+                ),
+            )
+        if status_value == "ok" and item_count:
+            tts_model = channel_config.tts_model if channel_config is not None else ""
+            dollars = tts_spend_usd(tts_characters, tts_model)
+            console.print(
+                f"[dim]{item_count} item(s) selected, "
+                f"{input_tokens:,} input / {output_tokens:,} output tokens, "
+                f"{tts_characters:,} tts character(s) (${dollars:.2f}).[/dim]"
             )
 
     if status_value == "failed":
@@ -1410,11 +1753,12 @@ def daily(
     db: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
     cache_dir: Annotated[Path, typer.Option("--cache-dir")] = DEFAULT_CACHE_DIR,
     vault_dir: Annotated[Path | None, typer.Option("--vault-dir")] = None,
+    audio_dir: Annotated[Path | None, typer.Option("--audio-dir")] = None,
     max_concurrency: Annotated[int, typer.Option("--max-concurrency", min=1)] = (
         DEFAULT_MAX_CONCURRENCY
     ),
 ) -> None:
-    """Run `curate apply`, `ingest`, `score`, then `digest` (DESIGN §14, cron 06:00).
+    """Run `curate apply`, `ingest`, `score`, `digest`, then `podcast` (DESIGN §14, cron 06:00).
 
     Each step keeps its own `runs` row and failure isolation — a step that
     comes back `partial`/`failed` does not stop the next one from running,
@@ -1424,7 +1768,8 @@ def daily(
     `digest`: `digest` always resolves `--date` itself, immediately after
     `score` returns, so a triage batch that happens to straddle UTC midnight
     still lands in the digest computed *after* it finished, not one decided
-    before it started.
+    before it started. `podcast` runs last and resolves its own date the same
+    way, from whatever `score` just committed.
 
     Exit code is the worst of the steps' (2 > 1 > 0), so a config error in any step
     is still visible to cron even though later steps still ran.
@@ -1434,6 +1779,11 @@ def daily(
     last night's digest be fetched this morning. Its failure is isolated like every
     other step's — a broken applier costs the day's approvals, not the day's digest,
     and a `sources.yaml` that does not parse costs only the steps that read it.
+
+    `podcast` is the fifth and last step, isolated the same way: an unconfigured
+    channel or a dead R2/TTS provider costs the day's episode, not the digest that
+    already rendered before it ran (DESIGN §13.3's inherited invariant — a channel
+    failure never fails the run).
     """
     worst_exit = 0
 
@@ -1466,6 +1816,13 @@ def daily(
         ),
         lambda: score(config_dir=config_dir, db=db),
         lambda: digest(config_dir=config_dir, db=db, vault_dir=vault_dir),
+        lambda: podcast(
+            config_dir=config_dir,
+            db=db,
+            cache_dir=cache_dir,
+            vault_dir=vault_dir,
+            audio_dir=audio_dir,
+        ),
     )
     for step in steps:
         try:
@@ -1794,8 +2151,8 @@ def _render_freshness(conn: sqlite3.Connection, config: SourcesConfig, *, now: d
         )
 
 
-def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
-    """Month-to-date spend: tokens, plus the web-search line tokens cannot express.
+def _render_token_spend(conn: sqlite3.Connection, *, now: datetime, tts_model: str | None) -> None:
+    """Month-to-date spend: tokens, plus the two lines tokens cannot express.
 
     DESIGN §8 makes spend the number this project lives or dies on ($30 is the
     alarm). A cost readout that only appears once there is cost to report is a
@@ -1807,6 +2164,7 @@ def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
         SELECT COALESCE(SUM(llm_input_tokens), 0)     AS input_tokens,
                COALESCE(SUM(llm_output_tokens), 0)    AS output_tokens,
                COALESCE(SUM(server_tool_requests), 0) AS searches,
+               COALESCE(SUM(tts_characters), 0)       AS tts_characters,
                COUNT(*)                               AS run_count
         FROM runs
         WHERE started_at >= ?
@@ -1827,6 +2185,14 @@ def _render_token_spend(conn: sqlite3.Connection, *, now: datetime) -> None:
     # nobody has looked at when it mattered.
     searches = int(row["searches"])
     table.add_row("web searches", f"{searches:,} (${search_spend_usd(searches):.2f})")
+    # TTS bills per character, priced at the currently configured podcast model —
+    # `runs.tts_characters` alone cannot say what a past run's episode actually cost
+    # if the model has since changed, but pricing zero characters costs nothing to be
+    # wrong about, and `tts_spend_usd` only ever needs a model when there is spend to
+    # price (see `podcast`'s own guard for the same reasoning).
+    chars = int(row["tts_characters"])
+    dollars = tts_spend_usd(chars, tts_model or "") if chars else 0.0
+    table.add_row("TTS characters (podcast)", f"{chars:,} (${dollars:.2f})")
     console.print(table)
 
 
@@ -1837,10 +2203,12 @@ def status(
     ] = DEFAULT_CONFIG_DIR,
     db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
 ) -> None:
-    """Show last-run health, per-source freshness, and month-to-date token spend."""
+    """Show last-run health, per-source freshness, and month-to-date token/TTS spend."""
     config = _load_sources_or_exit(config_dir)
+    settings = _load_settings_or_exit(config_dir)
+    tts_model = settings.delivery.podcast.tts_model if settings.delivery.podcast else None
     now = datetime.now(UTC)
     with connection(db) as conn:
         _render_last_runs(conn, now=now)
         _render_freshness(conn, config, now=now)
-        _render_token_spend(conn, now=now)
+        _render_token_spend(conn, now=now, tts_model=tts_model)

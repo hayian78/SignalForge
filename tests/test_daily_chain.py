@@ -239,7 +239,7 @@ def test_daily_command_runs_all_three_steps_in_one_invocation(
     assert result.exit_code == 0
     with connection(db_path) as conn:
         kinds = [row[0] for row in conn.execute("SELECT kind FROM runs ORDER BY id")]
-    assert kinds == ["ingest", "score", "daily"]
+    assert kinds == ["ingest", "score", "daily", "podcast"]
 
     today_digests = list((vault_dir / "daily").glob("*.md"))
     assert len(today_digests) == 1

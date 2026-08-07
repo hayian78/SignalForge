@@ -42,6 +42,7 @@ from signalforge.db import (
     reopen_proposal,
     source_yield_stats,
     start_run,
+    update_item_content,
     update_proposal_probe,
     upsert_item,
 )
@@ -145,12 +146,12 @@ def test_migrations_are_append_only_and_ordered() -> None:
     assert versions[0] == 1
 
 
-def test_schema_version_is_four_after_the_deliveries_migration() -> None:
-    # Migration 4 (report deliveries) is the last one; SCHEMA_VERSION derives
-    # from it. If this drops, a fresh DB stops getting the deliveries table and
-    # every send looks like a first send.
-    assert SCHEMA_VERSION == 4
-    assert MIGRATIONS[-1].version == 4
+def test_schema_version_is_five_after_the_podcast_migration() -> None:
+    # Migration 5 (podcast TTS spend) is the last one; SCHEMA_VERSION derives
+    # from it. If this drops, a fresh DB stops getting `tts_characters` and
+    # every podcast run's spend goes unrecorded.
+    assert SCHEMA_VERSION == 5
+    assert MIGRATIONS[-1].version == 5
 
 
 def test_migrating_a_populated_v2_database_backfills_server_tool_requests(
@@ -673,6 +674,24 @@ def test_get_item_by_canonical_url_returns_none_when_absent(conn: sqlite3.Connec
     assert get_item_by_canonical_url(conn, "https://example.com/nope") is None
 
 
+def test_update_item_content_writes_once_and_never_overwrites(conn: sqlite3.Connection) -> None:
+    # The deep-read write path (CLAUDE.md §6): once genuine full text is
+    # stored, this can never overwrite it (CLAUDE.md §3, NEVER rule 4).
+    item_id, _ = upsert_item(conn, make_item())
+
+    first = update_item_content(conn, item_id, "real full text")
+    second = update_item_content(conn, item_id, "a different extraction, should be ignored")
+
+    assert (first, second) == (True, False)
+    row = get_item(conn, item_id)
+    assert row is not None
+    assert row.content == "real full text"
+
+
+def test_update_item_content_returns_false_for_an_unknown_id(conn: sqlite3.Connection) -> None:
+    assert update_item_content(conn, 999_999, "text") is False
+
+
 def test_stored_datetimes_are_iso_8601_text(conn: sqlite3.Connection) -> None:
     # DESIGN §5 stores datetimes as ISO 8601 TEXT so they sort lexicographically.
     upsert_item(conn, make_item())
@@ -791,6 +810,32 @@ def test_finish_run_defaults_server_tool_requests_to_zero(conn: sqlite3.Connecti
     finish_run(conn, run_id, status="ok", finished_at=datetime(2026, 7, 26, 6, 1, tzinfo=UTC))
     row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
     assert row["server_tool_requests"] == 0
+
+
+def test_finish_run_records_tts_characters(conn: sqlite3.Connection) -> None:
+    # TTS bills per character, not per token, so this count is a cost line in
+    # its own right (DESIGN §8). Spend that isn't recorded can't be capped.
+    run_id = start_run(conn, "podcast", started_at=datetime(2026, 8, 7, 6, 0, tzinfo=UTC))
+    finish_run(
+        conn,
+        run_id,
+        status="ok",
+        finished_at=datetime(2026, 8, 7, 6, 4, tzinfo=UTC),
+        llm_input_tokens=25_000,
+        llm_output_tokens=2_200,
+        tts_characters=9_100,
+    )
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["tts_characters"] == 9_100
+
+
+def test_finish_run_defaults_tts_characters_to_zero(conn: sqlite3.Connection) -> None:
+    # Every pre-existing caller makes no TTS calls, so the column must read 0
+    # rather than NULL for them — `status` sums it.
+    run_id = start_run(conn, "ingest", started_at=datetime(2026, 8, 7, 6, 0, tzinfo=UTC))
+    finish_run(conn, run_id, status="ok", finished_at=datetime(2026, 8, 7, 6, 1, tzinfo=UTC))
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    assert row["tts_characters"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -1811,7 +1856,9 @@ def test_migrating_a_populated_v3_database_adds_deliveries(db_path: Path) -> Non
         migrate(conn)
 
         assert "deliveries" in _table_names(conn)
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 4
+        # migrate() runs every pending migration, not just the next one, so a v3
+        # database lands on the current SCHEMA_VERSION (migration 5 included).
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
         # The pre-existing rows are untouched: migration 4 only adds beside them.
         assert dump_table(conn, "proposals") == before
         # The pre-existing row survived, and the new table can reference it.
@@ -1825,6 +1872,43 @@ def test_migrating_a_populated_v3_database_adds_deliveries(db_path: Path) -> Non
             provider_id="msg_1",
             sent_at=SENT_AT,
         )
+    finally:
+        conn.close()
+
+
+def test_migrating_a_populated_v4_database_backfills_tts_characters(db_path: Path) -> None:
+    """The upgrade path the operator's real DB will actually take.
+
+    A fresh DB is the case that cannot regress; this is the one that can. The
+    operator's database is at v4 with a real `runs` row already in it, and
+    migration 5 must add `tts_characters` beside it without disturbing it —
+    the same shape as the v2->v3 `server_tool_requests` backfill test.
+    """
+    conn = connect(db_path)
+    try:
+        for migration in MIGRATIONS[:4]:
+            for statement in migration.statements:
+                conn.execute(statement)
+        conn.execute("PRAGMA user_version = 4")
+        # Raw v4-shaped INSERT: today's `finish_run` writes `tts_characters`,
+        # which this database does not have yet.
+        cursor = conn.execute(
+            """
+            INSERT INTO runs (kind, started_at, finished_at, status, items_new,
+                              llm_input_tokens, llm_output_tokens, server_tool_requests)
+            VALUES ('digest', '2026-08-01T06:00:00+00:00', '2026-08-01T06:02:00+00:00',
+                    'ok', 12, 30000, 2000, 0)
+            """
+        )
+        run_id = int(cursor.lastrowid or 0)
+
+        assert migrate(conn) == SCHEMA_VERSION
+
+        row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        assert row["tts_characters"] == 0
+        total = conn.execute("SELECT SUM(tts_characters) AS n FROM runs").fetchone()["n"]
+        assert total == 0  # a NULL here would break the status spend line
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 5
     finally:
         conn.close()
 

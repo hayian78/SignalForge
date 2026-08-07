@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>{{ feed.title }}</title>
+    <link>{{ feed.public_base_url }}</link>
+    <description>A private, daily two-presenter audio digest from SignalForge.</description>
+    <language>en-us</language>
+    <itunes:author>SignalForge</itunes:author>
+    <itunes:explicit>false</itunes:explicit>
+{% for episode in feed.episodes %}
+    <item>
+      <title>{{ episode.title }}</title>
+      <description>{{ episode.description }}</description>
+      <pubDate>{{ episode.pub_date_rfc822 }}</pubDate>
+      <guid isPermaLink="false">{{ episode.guid }}</guid>
+      <enclosure url="{{ episode.audio_url }}" length="{{ episode.audio_bytes }}" type="audio/mpeg" />
+    </item>
+{% endfor %}
+  </channel>
+</rss>

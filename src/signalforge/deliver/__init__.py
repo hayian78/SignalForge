@@ -3,25 +3,29 @@
 Module boundary (CLAUDE.md §2). `deliver/` is the one module that sends a report
 somewhere other than the vault. It:
 
-* takes an already-built `report.daily.DigestContext` and an already-rendered
-  body — it never queries for items itself, so there is exactly one definition of
-  what a digest contains;
+* takes an already-built context and an already-rendered body — it never queries
+  for items itself, so there is exactly one definition of what a report contains;
 * makes HTTP calls, which is why it is a sibling of `report/` and not part of it:
   `report/`'s charter is "only reads the DB and writes markdown", and the same
   reasoning keeps `feedback.py` outside it;
-* never imports `llm.py`. Nothing here costs a token.
+* never touches the `anthropic` SDK and never calls an LLM itself. Nothing here
+  costs an LLM token — `podcast.py` and `tts.py` (DESIGN §13.3) both transitively
+  import `llm.py`, via `report.podcast`'s payload types (`ScriptTurn` and friends),
+  the same "owns the payload shape, not the SDK call" reasoning `report/__init__.py`
+  gives for its own transitive import. The podcast channel spends real money of a
+  different kind instead: TTS dollars, recorded to `runs.tts_characters`
+  (`deliver/tts.py`), not the token columns.
 
 **The vault stays canonical.** DESIGN §13.2 fixes this and it is not negotiable: a
 channel is a mirror of a report that has already been written to disk, never a
 substitute for writing it. Two things follow, and both are load-bearing:
 
 * Delivery runs *after* the vault write succeeds, and a channel failure is
-  recorded to `runs.errors` rather than failing the run (§7). The digest is the
+  recorded to `runs.errors` rather than failing the run (§7). The report is the
   product; the mirror is a side channel.
 * Nothing here is an input surface. Marks and curation ticks are harvested from
-  `<vault>/daily/*.md` only (DESIGN §13.1), so an emailed digest carries no
-  checkboxes — it carries a count of the decisions waiting in the vault, which is
-  the nudge that keeps the loop closed when the phone becomes the read surface.
+  `<vault>/daily/*.md` only (DESIGN §13.1); `vault/podcast/*.md` is not globbed
+  either, so a rendered episode carries no checkboxes and cannot forge one.
 """
 
 from __future__ import annotations

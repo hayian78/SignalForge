@@ -398,7 +398,7 @@ async def test_probe_feed_does_not_follow_a_redirect(fetcher: HttpFetcher) -> No
     """The redirect-based half of the SSRF fix: no hop is ever fetched.
 
     A candidate feed's host came from the scout, and
-    `curate/scout.py::_is_disallowed_fetch_host` only checked the URL as proposed
+    `ingest.base.is_disallowed_fetch_host` only checked the URL as proposed
     — a public, allowed hostname that 302s to a private one would otherwise reach
     exactly the destination that check exists to stop. The redirect target is
     mocked to a *success* response — if the fix only masked the failure without

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd">
+  <channel>
+    <title>SignalForge Daily</title>
+    <link>https://pub-example.r2.dev/prefix</link>
+    <description>A private, daily two-presenter audio digest from SignalForge.</description>
+    <language>en-us</language>
+    <itunes:author>SignalForge</itunes:author>
+    <itunes:explicit>false</itunes:explicit>
+    <item>
+      <title>SignalForge Daily — 2026-08-07</title>
+      <description>3 stories from SignalForge&#39;s daily digest.</description>
+      <pubDate>Fri, 07 Aug 2026 06:00:00 -0000</pubDate>
+      <guid isPermaLink="false">2026-08-07</guid>
+      <enclosure url="https://pub-example.r2.dev/prefix/signalforge-2026-08-07.mp3" length="123456" type="audio/mpeg" />
+    </item>
+    <item>
+      <title>SignalForge Daily — 2026-08-06</title>
+      <description>5 stories from SignalForge&#39;s daily digest.</description>
+      <pubDate>Thu, 06 Aug 2026 06:00:00 -0000</pubDate>
+      <guid isPermaLink="false">2026-08-06</guid>
+      <enclosure url="https://pub-example.r2.dev/prefix/signalforge-2026-08-06.mp3" length="98765" type="audio/mpeg" />
+    </item>
+  </channel>
+</rss>

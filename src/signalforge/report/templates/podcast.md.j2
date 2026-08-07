@@ -1,0 +1,44 @@
+---
+kind: podcast-script
+date: {{ context.date.isoformat() }}
+script_version: {{ context.script_version }}
+model: {{ context.model }}
+item_count: {{ context.item_count }}
+---
+
+# Podcast — {{ context.date.isoformat() }}
+
+{% if context.segments %}
+{% for segment in context.segments %}
+## {{ segment.label }}{{ teased_note if segment.teased else "" }}
+
+{% for turn in segment.turns %}
+**{{ turn.speaker }}:** {{ turn.text }}
+{% endfor %}
+{% if segment.sources %}
+
+**Sources:**
+{% for source in segment.sources %}
+- [{{ escape_title(source.title) }}]({{ source.url }}) <!-- sf:item={{ source.item_id }} -->
+{% endfor %}
+{% endif %}
+
+{% endfor %}
+{% else %}
+No episode today — nothing cleared the podcast script with a valid citation. Check
+`signalforge status` if this is unexpected.
+
+{% endif %}
+{% if context.coverage_gaps %}
+## Coverage gaps
+
+*{{ context.coverage_gaps | length }} item(s) not covered:*
+
+{% for gap in context.coverage_gaps %}
+{% if gap.url is not none %}
+- [{{ escape_title(gap.title) }}]({{ gap.url }}) — {{ reason_labels[gap.reason] }} <!-- sf:item={{ gap.item_id }} reason={{ gap.reason }} -->
+{% else %}
+- item {{ gap.item_id }} — {{ reason_labels[gap.reason] }} <!-- sf:item={{ gap.item_id }} reason={{ gap.reason }} -->
+{% endif %}
+{% endfor %}
+{% endif %}

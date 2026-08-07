@@ -37,17 +37,22 @@ full refetch of every source.
 
 A validator is a promise that we will never need the response again, so it is
 only made durable once the caller confirms the items reached the database — see
-`ValidatorStore` and `IngestRun.commit_validators`. `ingest/` stays free of
-`db.py` (CLAUDE.md §2): the fetcher stages, the CLI confirms.
+`ValidatorStore` and `IngestRun.commit_validators`. This module and
+`ingest/__init__.py` stay free of `db.py` while *discovering* items: the
+fetcher stages, the CLI confirms. (`ingest/fullcontent.py` is the one
+exception, importing `db.py` directly — see its docstring for why that is
+still §2-clean rather than a boundary violation.)
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import ipaddress
 import json
 import logging
 import re
+import socket
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -77,6 +82,7 @@ __all__ = [
     "Ingestor",
     "ValidatorStore",
     "filter_by_age",
+    "is_disallowed_fetch_host",
     "parse_retry_after",
     "run_ingestors",
     "truncate_summary",
@@ -173,6 +179,101 @@ def filter_by_age(
             },
         )
     return kept
+
+
+_DISALLOWED_FETCH_SUFFIXES: Final = (".localhost", ".local", ".internal")
+"""Hostname suffixes that never name a public feed or article, checked
+case-insensitively."""
+
+_CGNAT_RANGE: Final = ipaddress.ip_network("100.64.0.0/10")
+"""RFC 6598 shared address space, used internally by several cloud providers.
+
+`ipaddress.IPv4Address.is_private`/`.is_reserved` do not cover this range
+(checked against 3.12: neither is `True` for an address in it), so it needs
+an explicit check alongside them."""
+
+
+def _ipv4_literal(hostname: str) -> ipaddress.IPv4Address | None:
+    """An IPv4 address `hostname` names, in any form a resolver would accept.
+
+    `ipaddress.ip_address` only parses strict dotted-quad notation and raises
+    on the legacy forms glibc's resolver (and `socket.inet_aton`) still treat
+    as literals — `127.1`, `0x7f000001`, `2130706433`, and `0177.0.0.1` all
+    resolve to `127.0.0.1` with no DNS lookup at all. Falling back to "not an
+    IP literal, a hostname DNS will resolve" for any of those would let every
+    one of them past `is_disallowed_fetch_host` for a target the fetch never
+    actually looks up by name.
+    """
+    try:
+        return ipaddress.IPv4Address(hostname)
+    except ValueError:
+        pass
+    try:
+        packed = socket.inet_aton(hostname)
+    except OSError:
+        return None
+    return ipaddress.IPv4Address(packed)
+
+
+def is_disallowed_fetch_host(hostname: str) -> bool:
+    """Whether `hostname` names a destination a fetch of a non-operator URL
+    must never reach.
+
+    Shared by every caller that fetches a URL chosen by something other than
+    the operator's own hand-edited `sources.yaml` (CLAUDE.md §7): originally
+    `curate/scout.py`, checking a candidate feed URL a web-search-steered
+    model proposed, before its first probe; also `ingest/fullcontent.py`,
+    checking a feed entry's own `item.url` before its deep-read fetch — a
+    feed publisher, not the operator, controls that string. Both call sites
+    check once, before the fetch, and both pass `follow_redirects=False` to
+    `HttpFetcher.get` so a public, allowed host that 302s to a private one
+    cannot walk around this check on the second hop.
+
+    Every URL this check has never had to cover is one `HttpFetcher` was
+    given straight from `sources.yaml` — an operator's own hand-edited
+    config, not the reconnaissance-oracle threat this exists for: a
+    web-search result or a scraped article that steers a fetch at a cloud
+    metadata endpoint or an internal service, with the result rendered back
+    into a digest or spoken in a podcast script.
+
+    An allowlist of "safe" hosts is not possible here — a legitimate feed or
+    article can be hosted anywhere — so this is a blocklist of the ranges
+    that are never a public one. Two things it does not cover, for different
+    reasons:
+
+    * **A redirect** to a private address is not this function's job — every
+      caller passes `follow_redirects=False`, so there is no second hop for
+      this check to see.
+    * **DNS rebinding** — a public hostname that resolves to a private
+      address only at the moment of the fetch, after passing this check —
+      has no defense here. Closing it needs the check to run against the
+      resolved connection, not the proposed URL, which this single-user
+      pipeline's threat model does not currently justify building.
+    """
+    # A trailing "." is the DNS root label — glibc's resolver (and `httpx`,
+    # through it) treats `127.0.0.1.` and `localhost.` identically to the
+    # form without the dot, with no lookup for the IP-literal case. Stripped
+    # once, up front, so every check below sees the same string the resolver
+    # would actually act on.
+    folded = hostname.casefold().rstrip(".")
+    if folded == "localhost" or folded.endswith(_DISALLOWED_FETCH_SUFFIXES):
+        return True
+    try:
+        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(folded)
+    except ValueError:
+        literal = _ipv4_literal(folded)
+        if literal is None:
+            return False  # Not an IP literal in any form — a hostname DNS resolves.
+        address = literal
+    return (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_reserved
+        or address.is_multicast
+        or address.is_unspecified
+        or (isinstance(address, ipaddress.IPv4Address) and address in _CGNAT_RANGE)
+    )
 
 
 class FetchError(Exception):

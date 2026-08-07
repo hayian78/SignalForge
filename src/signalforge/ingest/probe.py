@@ -46,9 +46,9 @@ behind for a `source_id` that does not exist.
 
 ### `probe_feed` does not follow redirects
 
-`curate/scout.py::_is_disallowed_fetch_host` checks a candidate feed URL's host
-once, before the first fetch — the host the scout proposed, not necessarily the
-one the fetch would end up talking to. A public, allowed hostname that 302s to a
+`ingest.base.is_disallowed_fetch_host` checks a candidate feed URL's host once,
+before the first fetch — the host the scout proposed, not necessarily the one
+the fetch would end up talking to. A public, allowed hostname that 302s to a
 private one would otherwise reach exactly the destination that check exists to
 stop. `probe_repo` keeps the default (`follow_redirects=True`): its request always
 targets `GITHUB_API_ROOT` regardless of what the candidate slug names, so there is
@@ -230,10 +230,10 @@ async def probe_feed(
     stamp = now or datetime.now(UTC)
     try:
         # `follow_redirects=False`: this URL's host came from the scout, not the
-        # operator, and `curate/scout.py::_is_disallowed_fetch_host` only checked
-        # the URL as proposed. A redirect is exactly how that check would
-        # otherwise be walked around — a public, allowed hostname that 302s to an
-        # internal address. Reported as a failed probe rather than followed.
+        # operator, and `is_disallowed_fetch_host` only checked the URL as
+        # proposed. A redirect is exactly how that check would otherwise be
+        # walked around — a public, allowed hostname that 302s to an internal
+        # address. Reported as a failed probe rather than followed.
         response = await fetcher.get(
             url, source_id=PROBE_SOURCE_ID, conditional=False, follow_redirects=False
         )

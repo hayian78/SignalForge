@@ -41,10 +41,8 @@ surfaces in the next digest.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import re
-import socket
 import sqlite3
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -62,6 +60,7 @@ from signalforge.curate.prompts import (
     build_scout_user_prompt,
     proposal_payload,
 )
+from signalforge.ingest.base import is_disallowed_fetch_host
 from signalforge.ingest.probe import SourceProbe
 from signalforge.models import (
     ProposalKind,
@@ -221,90 +220,19 @@ exactly the kind of drift that produced the arithmetic bugs this project's cost
 constants had to stop restating."""
 
 
-_DISALLOWED_FETCH_SUFFIXES: Final = (".localhost", ".local", ".internal")
-"""Hostname suffixes that never name a public feed, checked case-insensitively."""
+_is_disallowed_fetch_host = is_disallowed_fetch_host
+"""`ingest.base.is_disallowed_fetch_host`, under the name every call site
+here already uses. Checked for every URL this module will actually *fetch* —
+`_normalize_add_rss`'s candidate feed URL before its first probe, and
+`_reprobe_locator`'s stored URL before every later re-check. Evidence
+citations and retirement targets are read by a human, never fetched, so they
+have nothing this check protects.
 
-_CGNAT_RANGE: Final = ipaddress.ip_network("100.64.0.0/10")
-"""RFC 6598 shared address space, used internally by several cloud providers.
-
-`ipaddress.IPv4Address.is_private`/`.is_reserved` do not cover this range (checked
-against 3.12: neither is `True` for an address in it), so it needs an explicit
-check alongside them."""
-
-
-def _ipv4_literal(hostname: str) -> ipaddress.IPv4Address | None:
-    """An IPv4 address `hostname` names, in any form a resolver would accept.
-
-    `ipaddress.ip_address` only parses strict dotted-quad notation and raises on
-    the legacy forms glibc's resolver (and `socket.inet_aton`) still treat as
-    literals — `127.1`, `0x7f000001`, `2130706433`, and `0177.0.0.1` all resolve to
-    `127.0.0.1` with no DNS lookup at all. Falling back to "not an IP literal, a
-    hostname DNS will resolve" for any of those would let every one of them past
-    `_is_disallowed_fetch_host` for a target the fetch never actually looks up by
-    name.
-    """
-    try:
-        return ipaddress.IPv4Address(hostname)
-    except ValueError:
-        pass
-    try:
-        packed = socket.inet_aton(hostname)
-    except OSError:
-        return None
-    return ipaddress.IPv4Address(packed)
-
-
-def _is_disallowed_fetch_host(hostname: str) -> bool:
-    """Whether `hostname` names a destination the probe must never reach.
-
-    Checked for every URL the run will actually *fetch* — `_normalize_add_rss`'s
-    candidate feed URL before its first probe, and `_reprobe_locator`'s stored URL
-    before every later re-check. Evidence citations and retirement targets are
-    read by a human, never fetched, so they have nothing this check protects.
-
-    Every other URL `HttpFetcher` has ever been given came from the operator's own
-    hand-edited `sources.yaml` (CLAUDE.md §7). This is the first fetch whose
-    destination host is chosen by web-search output — a model steered by
-    adversarial content it encountered while searching could otherwise point a
-    probe at a cloud metadata endpoint or an internal service and have the result
-    rendered back into the digest as a reconnaissance oracle.
-
-    An allowlist of "safe" hosts is not possible here — a legitimate feed can be
-    hosted anywhere — so this is a blocklist of the ranges that are never a public
-    RSS feed. Two things it does not cover, for different reasons:
-
-    * **A redirect** to a private address is not this function's job — the probe
-      fetch itself refuses to follow one at all (`ingest/probe.py`), so there is no
-      second hop for this check to see.
-    * **DNS rebinding** — a public hostname that resolves to a private address only
-      at the moment of the fetch, after passing this check — has no defense here.
-      Closing it needs the check to run against the resolved connection, not the
-      proposed URL, which this single-operator pipeline's threat model does not
-      currently justify building.
-    """
-    # A trailing "." is the DNS root label — glibc's resolver (and `httpx`, through
-    # it) treats `127.0.0.1.` and `localhost.` identically to the form without the
-    # dot, with no lookup for the IP-literal case. Stripped once, up front, so
-    # every check below sees the same string the resolver would actually act on.
-    folded = hostname.casefold().rstrip(".")
-    if folded == "localhost" or folded.endswith(_DISALLOWED_FETCH_SUFFIXES):
-        return True
-    try:
-        address: ipaddress.IPv4Address | ipaddress.IPv6Address = ipaddress.ip_address(folded)
-    except ValueError:
-        literal = _ipv4_literal(folded)
-        if literal is None:
-            return False  # Not an IP literal in any form — a hostname DNS resolves.
-        address = literal
-    return (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_reserved
-        or address.is_multicast
-        or address.is_unspecified
-        or (isinstance(address, ipaddress.IPv4Address) and address in _CGNAT_RANGE)
-    )
+Moved to `ingest/base.py` once `ingest/fullcontent.py` needed the identical
+check for a second untrusted-URL source — a feed entry's own `item.url`,
+chosen by the publisher, not the operator — and a second copy of this
+blocklist was exactly the kind of drift this project's cost constants
+already learned not to risk."""
 
 
 def _slugify(value: str) -> str:

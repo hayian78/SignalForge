@@ -13,6 +13,7 @@ data/signalforge.db
 data/signalforge.db-*
 data/http_cache/
 data/cron.log
+data/audio/
 
 # Python
 __pycache__/

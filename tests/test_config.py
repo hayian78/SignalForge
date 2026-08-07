@@ -24,13 +24,16 @@ from signalforge.config import (
     SETTINGS_FILENAME,
     ConfigError,
     EmailChannelConfig,
+    PodcastChannelConfig,
     SettingsConfig,
     SourceDefaults,
+    TaxonomyLeaf,
     Thresholds,
     get_secret,
     load_interests,
     load_settings,
     load_sources,
+    load_taxonomy,
 )
 
 # --------------------------------------------------------------------------- #
@@ -123,6 +126,29 @@ def write_sources(config_dir: Path, yaml_text: str) -> Path:
 def write_interests(config_dir: Path, yaml_text: str) -> Path:
     config_dir.mkdir(parents=True, exist_ok=True)
     path = config_dir / "interests.yaml"
+    path.write_text(yaml_text, encoding="utf-8")
+    return path
+
+
+DESIGN_TAXONOMY_YAML = textwrap.dedent("""
+    agents:
+      planning:   {keywords: [planning, orchestration, multi-agent, subagent]}
+      memory:     {keywords: [agent memory, episodic, memory store]}
+    models:
+      inference:      {keywords: [vllm, throughput, kv cache, speculative, batching]}
+      fine-tuning:    {keywords: [fine-tun, rlhf, dpo, sft]}
+""")
+
+MINIMAL_TAXONOMY_YAML = textwrap.dedent("""
+    agents:
+      planning:
+        keywords: [planning]
+""")
+
+
+def write_taxonomy(config_dir: Path, yaml_text: str) -> Path:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    path = config_dir / "taxonomy.yaml"
     path.write_text(yaml_text, encoding="utf-8")
     return path
 
@@ -393,6 +419,84 @@ def test_interests_optional_blocks_default_to_empty(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# taxonomy.yaml (DESIGN §10)
+# --------------------------------------------------------------------------- #
+
+
+def test_design_section_10_taxonomy_yaml_parses(tmp_path: Path) -> None:
+    write_taxonomy(tmp_path, DESIGN_TAXONOMY_YAML)
+    config = load_taxonomy(tmp_path)
+
+    assert set(config.root) == {"agents", "models"}
+    assert config.root["agents"]["planning"].keywords == [
+        "planning",
+        "orchestration",
+        "multi-agent",
+        "subagent",
+    ]
+    assert config.root["models"]["fine-tuning"].keywords == ["fine-tun", "rlhf", "dpo", "sft"]
+
+
+def test_typod_key_in_a_taxonomy_leaf_raises_config_error_naming_the_key(tmp_path: Path) -> None:
+    write_taxonomy(tmp_path, "agents:\n  planning:\n    keywrods: [planning]\n")
+    with pytest.raises(ConfigError, match="keywrods"):
+        load_taxonomy(tmp_path)
+
+
+def test_leaf_with_no_keywords_is_rejected(tmp_path: Path) -> None:
+    # A leaf nothing matches on is a topic the tagger can never assign — the
+    # keyword list is the leaf's entire reason to exist.
+    write_taxonomy(tmp_path, "agents:\n  planning:\n    keywords: []\n")
+    with pytest.raises(ConfigError, match="keywords"):
+        load_taxonomy(tmp_path)
+
+
+def test_blank_keyword_is_rejected(tmp_path: Path) -> None:
+    write_taxonomy(tmp_path, 'agents:\n  planning:\n    keywords: ["  "]\n')
+    with pytest.raises(ConfigError, match="blank"):
+        load_taxonomy(tmp_path)
+
+
+def test_group_with_no_leaves_is_rejected(tmp_path: Path) -> None:
+    write_taxonomy(tmp_path, "agents: {}\n")
+    with pytest.raises(ConfigError, match="agents"):
+        load_taxonomy(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "yaml_text",
+    [
+        "agents.core:\n  planning:\n    keywords: [planning]\n",
+        "agents:\n  plan.ning:\n    keywords: [planning]\n",
+        "Agents:\n  planning:\n    keywords: [planning]\n",
+        "agents:\n  ' planning':\n    keywords: [planning]\n",
+        "-agents:\n  planning:\n    keywords: [planning]\n",
+    ],
+    ids=[
+        "dotted-group",
+        "dotted-leaf",
+        "uppercase-group",
+        "leading-space-leaf",
+        "leading-hyphen-group",
+    ],
+)
+def test_malformed_group_or_leaf_name_is_rejected(tmp_path: Path, yaml_text: str) -> None:
+    # interests.yaml's priority_topics writes `group.leaf` (industry.strategy) and
+    # test_config.py checks the two files against each other by building that same
+    # string — a dot, stray case, or whitespace in a name would make that join
+    # produce a taxonomy key no priority_topics entry can ever match.
+    write_taxonomy(tmp_path, yaml_text)
+    with pytest.raises(ConfigError, match="must match"):
+        load_taxonomy(tmp_path)
+
+
+def test_minimal_taxonomy_yaml_parses(tmp_path: Path) -> None:
+    write_taxonomy(tmp_path, MINIMAL_TAXONOMY_YAML)
+    config = load_taxonomy(tmp_path)
+    assert config.root == {"agents": {"planning": TaxonomyLeaf(keywords=["planning"])}}
+
+
+# --------------------------------------------------------------------------- #
 # curation block (DESIGN §7.1)
 # --------------------------------------------------------------------------- #
 
@@ -586,10 +690,39 @@ def test_shipped_sources_yaml_configures_curation(repo_config_dir: Path) -> None
     )
 
 
+def test_shipped_taxonomy_yaml_parses(repo_config_dir: Path) -> None:
+    config = load_taxonomy(repo_config_dir)
+
+    assert config.root, (
+        "taxonomy.yaml ships empty — the tagger it's staged for has nothing to match"
+    )
+    for group, leaves in config.root.items():
+        assert leaves, f"group {group!r} has no leaf topics"
+        for leaf_name, leaf in leaves.items():
+            assert leaf.keywords, f"{group}.{leaf_name} has no keywords"
+
+
+def test_every_shipped_priority_topic_has_a_taxonomy_leaf(repo_config_dir: Path) -> None:
+    # interests.yaml's priority_topics writes these as `group.leaf` (see its own
+    # comment) — assert the pair can't silently drift apart: a curation-driven
+    # rename of a priority topic, or a typo in either file, must fail loudly
+    # here rather than leave a priority topic with nothing to tag it.
+    taxonomy = load_taxonomy(repo_config_dir)
+    interests = load_interests(repo_config_dir)
+
+    flattened = {f"{group}.{leaf}" for group, leaves in taxonomy.root.items() for leaf in leaves}
+    for priority_topic in interests.priority_topics:
+        assert priority_topic in flattened, (
+            f"{priority_topic!r} is a priority topic with no matching taxonomy.yaml leaf — "
+            "add it there, or correct the topic name"
+        )
+
+
 def test_shipped_configs_load_together(repo_config_dir: Path) -> None:
     # The pair a run actually needs, loaded the way a run loads them.
     assert load_sources(repo_config_dir) is not None
     assert load_interests(repo_config_dir) is not None
+    assert load_taxonomy(repo_config_dir) is not None
 
 
 # --------------------------------------------------------------------------- #
@@ -773,6 +906,31 @@ def test_crowding_limits_are_optional(knob: str) -> None:
         "daily_max_items": 15,
     }
     assert getattr(Thresholds(**values), knob) is None
+
+
+def test_podcast_top_n_defaults_to_none_which_means_the_channel_is_off() -> None:
+    # An existing interests.yaml with no podcast_top_n stays valid and the
+    # podcast channel stays off, not on with an invented item count.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
+    assert Thresholds(**values).podcast_top_n is None
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_podcast_top_n_rejects_meaningless_values(bad: int) -> None:
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+        "podcast_top_n": bad,
+    }
+    with pytest.raises(ValueError, match="podcast_top_n"):
+        Thresholds(**values)
 
 
 # --------------------------------------------------------------------------- #
@@ -1035,3 +1193,229 @@ def test_a_provider_key_is_rejected_rather_than_silently_ignored(tmp_path: Path)
 
     with pytest.raises(ConfigError, match="provider"):
         load_settings(tmp_path)
+
+
+# --------------------------------------------------------------------------- #
+# delivery.podcast — the second recorded phase-gate exception (DESIGN §13.3)
+# --------------------------------------------------------------------------- #
+
+PODCAST_YAML = """
+timezone: Australia/Brisbane
+delivery:
+  podcast:
+    enabled: true
+    tts_api_key_env: OPENROUTER_API_KEY
+    tts_model: google/gemini-flash-tts
+    voice_a: Kore
+    voice_b: Puck
+    presenter_a: Alex
+    presenter_b: Sam
+    r2_endpoint: https://abc123.r2.cloudflarestorage.com
+    r2_bucket: signalforge-podcast
+    r2_access_key_env: R2_ACCESS_KEY_ID
+    r2_secret_key_env: R2_SECRET_ACCESS_KEY
+    public_base_url: https://pub-abc123.r2.dev/unguessable-prefix
+    retention_episodes: 30
+    feed_title: SignalForge Daily
+"""
+
+
+def _podcast_kwargs(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "enabled": True,
+        "tts_api_key_env": "OPENROUTER_API_KEY",
+        "tts_model": "google/gemini-flash-tts",
+        "voice_a": "Kore",
+        "voice_b": "Puck",
+        "presenter_a": "Alex",
+        "presenter_b": "Sam",
+        "r2_endpoint": "https://abc123.r2.cloudflarestorage.com",
+        "r2_bucket": "signalforge-podcast",
+        "r2_access_key_env": "R2_ACCESS_KEY_ID",
+        "r2_secret_key_env": "R2_SECRET_ACCESS_KEY",
+        "public_base_url": "https://pub-abc123.r2.dev/unguessable-prefix",
+        "retention_episodes": 30,
+        "feed_title": "SignalForge Daily",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_settings_without_a_podcast_block_publishes_nothing() -> None:
+    # The historical shape, same reasoning as the email channel: absent means
+    # the channel is off, and that must stay the default forever.
+    assert SettingsConfig().delivery.podcast is None
+
+
+def test_load_settings_reads_the_podcast_channel(tmp_path: Path) -> None:
+    (tmp_path / SETTINGS_FILENAME).write_text(PODCAST_YAML, encoding="utf-8")
+
+    podcast = load_settings(tmp_path).delivery.podcast
+
+    assert podcast is not None
+    assert podcast.enabled is True
+    assert podcast.tts_api_key_env == "OPENROUTER_API_KEY"
+    assert podcast.presenter_a == "Alex"
+    assert podcast.presenter_b == "Sam"
+    assert podcast.retention_episodes == 30
+
+
+def test_podcast_channel_requires_an_explicit_enabled() -> None:
+    """An off-switch you reach by deleting the block is not an off-switch."""
+    kwargs = _podcast_kwargs()
+    del kwargs["enabled"]
+    with pytest.raises(ValueError, match="enabled"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_podcast_channel_rejects_a_pasted_api_key() -> None:
+    """The likely mistake: the key value where the env-var name belongs.
+
+    Shaped like a real OpenRouter key — lowercase `sk-or-` prefix, well past
+    the length floor — because that is what the validator discriminates on.
+    """
+    kwargs = _podcast_kwargs(tts_api_key_env="sk-or-v1-1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p")
+    with pytest.raises(ValueError, match="NAME of an environment variable"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_podcast_channel_accepts_an_env_var_name_that_merely_starts_like_a_key() -> None:
+    # A name starting `sk` but not the literal `sk-or-<body>` token shape is fine.
+    kwargs = _podcast_kwargs(tts_api_key_env="SKOR_DIGEST_KEY")
+    channel = PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+    assert channel.tts_api_key_env == "SKOR_DIGEST_KEY"
+
+
+@pytest.mark.parametrize("field", ["r2_access_key_env", "r2_secret_key_env"])
+def test_podcast_channel_rejects_a_pasted_r2_access_key_id(field: str) -> None:
+    """A code-reviewer pass caught that `tts_api_key_env`'s identifier-shape
+    check alone would not catch this: a real R2 access key ID has no
+    distinctive prefix, and Cloudflare's own examples show it lowercase —
+    which the SHOUTING_SNAKE_CASE requirement rejects."""
+    kwargs = _podcast_kwargs(**{field: "f1f3dfe2c1a94b3d8f2e6a7b9c0d1e2f"})
+    with pytest.raises(ValueError, match="NAME of an environment variable"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["r2_access_key_env", "r2_secret_key_env"])
+def test_podcast_channel_rejects_a_pasted_r2_secret_key(field: str) -> None:
+    """A real R2 secret key is base64-shaped and fails the identifier check
+    outright, independent of the case requirement."""
+    kwargs = _podcast_kwargs(**{field: "aB3/dE6+fG9=hI2jK5lM8nO1pQ4rS7tU0vW3xY6z"})
+    with pytest.raises(ValueError, match="NAME of an environment variable"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("field", ["r2_access_key_env", "r2_secret_key_env"])
+def test_podcast_channel_rejects_a_lowercase_env_var_name(field: str) -> None:
+    """SHOUTING_SNAKE_CASE is required, not merely alnum-with-underscores —
+    a lowercase name is a real gap the identifier-shape check alone leaves
+    open for these two fields (see the docstring on the validator)."""
+    kwargs = _podcast_kwargs(**{field: "r2_access_key_id"})
+    with pytest.raises(ValueError, match="SHOUTING_SNAKE_CASE"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_podcast_channel_rejects_a_public_base_url_with_no_scheme() -> None:
+    """`deliver.podcast._r2_prefix` derives the R2 object key prefix from
+    this URL's path alone — a schemeless value puts the whole string in
+    `.path` instead, silently building a nonsense prefix rather than
+    raising anywhere near the mistake."""
+    kwargs = _podcast_kwargs(public_base_url="pub-abc123.r2.dev/unguessable-prefix")
+    with pytest.raises(ValueError, match="full http"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_podcast_channel_rejects_a_public_base_url_with_a_query_string() -> None:
+    """A `?query` would be silently dropped by every URL this channel builds
+    from `public_base_url`, which is exactly the kind of typo that should
+    fail loudly at config load instead of 404ing on a phone later."""
+    kwargs = _podcast_kwargs(public_base_url="https://pub-abc123.r2.dev/prefix?x=1")
+    with pytest.raises(ValueError, match="query"):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+def test_podcast_channel_accepts_a_public_base_url_with_no_path() -> None:
+    """Serving the feed from the bucket root (no unguessable prefix) is a
+    legitimate, if less private, configuration choice — not a shape error."""
+    kwargs = _podcast_kwargs(public_base_url="https://pub-abc123.r2.dev")
+    channel = PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+    assert channel.public_base_url == "https://pub-abc123.r2.dev"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "tts_api_key_env",
+        "tts_model",
+        "voice_a",
+        "voice_b",
+        "presenter_a",
+        "presenter_b",
+        "r2_endpoint",
+        "r2_bucket",
+        "r2_access_key_env",
+        "r2_secret_key_env",
+        "public_base_url",
+        "feed_title",
+    ],
+)
+def test_podcast_channel_requires_every_string_field(field: str) -> None:
+    # This channel spends real TTS dollars beyond the LLM call, so every knob is
+    # required rather than defaulted (CLAUDE.md §10 rule 6) — a default buried in
+    # code is a spend limit nobody can see.
+    kwargs = _podcast_kwargs()
+    del kwargs[field]
+    with pytest.raises(ValueError, match=field):
+        PodcastChannelConfig(**kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("value", [0, 91])
+def test_podcast_channel_retention_episodes_is_bounded(value: int) -> None:
+    with pytest.raises(ValueError, match="retention_episodes"):
+        PodcastChannelConfig(**_podcast_kwargs(retention_episodes=value))  # type: ignore[arg-type]
+
+
+def test_podcast_channel_rejects_unknown_keys() -> None:
+    # `extra="forbid"` reaches the nested block too, so a typo'd delivery key is
+    # a startup error rather than a setting that silently does nothing.
+    with pytest.raises(ValueError, match="episode_prefix"):
+        PodcastChannelConfig(**_podcast_kwargs(episode_prefix="daily-"))  # type: ignore[arg-type]
+
+
+COMBINED_DELIVERY_YAML = """
+timezone: Australia/Brisbane
+delivery:
+  email:
+    enabled: true
+    api_key_env: RESEND_API_KEY
+    from_address: SignalForge <digest@example.com>
+    to:
+      - reader@example.com
+  podcast:
+    enabled: true
+    tts_api_key_env: OPENROUTER_API_KEY
+    tts_model: google/gemini-flash-tts
+    voice_a: Kore
+    voice_b: Puck
+    presenter_a: Alex
+    presenter_b: Sam
+    r2_endpoint: https://abc123.r2.cloudflarestorage.com
+    r2_bucket: signalforge-podcast
+    r2_access_key_env: R2_ACCESS_KEY_ID
+    r2_secret_key_env: R2_SECRET_ACCESS_KEY
+    public_base_url: https://pub-abc123.r2.dev/unguessable-prefix
+    retention_episodes: 30
+    feed_title: SignalForge Daily
+"""
+
+
+def test_email_and_podcast_channels_coexist(tmp_path: Path) -> None:
+    # Delivery is a list of channels, not a single slot — enabling the podcast
+    # must not disturb an already-configured email channel.
+    (tmp_path / SETTINGS_FILENAME).write_text(COMBINED_DELIVERY_YAML, encoding="utf-8")
+
+    delivery = load_settings(tmp_path).delivery
+
+    assert delivery.email is not None
+    assert delivery.podcast is not None

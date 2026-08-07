@@ -40,10 +40,10 @@ is met. When in doubt, build less.
 
 Strict responsibilities — DESIGN §4. Violations are architectural regressions:
 
-- `ingest/` **never calls an LLM** and never imports `llm.py`.
-- `score/` and `synth/` **never make HTTP calls to sources** — they operate on stored items only.
+- `ingest/` **never calls an LLM** and never imports `llm.py`. Includes `ingest/fullcontent.py`'s deep-read fetch — extracting full article text (`trafilatura`) is deterministic, not judgment.
+- `score/` and `synth/` **never make HTTP calls to sources** — they operate on stored items only. `synth/podcast.py` is `llm.py`'s only podcast-script entry point and makes no HTTP call of its own.
 - `report/` only reads the DB and writes markdown to the vault. It makes **no HTTP calls**.
-- `deliver/` mirrors an **already-written** report to an outbound channel: outbound only, never an input surface. See DESIGN §13.2.
+- `deliver/` mirrors an **already-written** report to an outbound channel: outbound only, never an input surface. See DESIGN §13.2. `deliver/tts.py` and `deliver/storage.py` are the podcast channel's own outbound speakers — TTS synthesis and R2 upload (DESIGN §13.3) — same posture as `deliver/email.py`'s mail API call.
 - `curate/` is the **one sanctioned exception**: it calls `llm.py` and then an `ingest/` fetch helper, strictly in that order (judgment, then validation of what judgment produced), and never writes an `items` row. See DESIGN §7.1.
 - `llm.py` is the **only** module that imports the `anthropic` SDK. Budget accounting, prompt caching, batching, and model selection live there and nowhere else.
 - Deterministic vs LLM split (DESIGN §8): fetching, parsing, dedup, clustering math, scheduling, template assembly are plain Python. LLMs only for judgment (triage, scoring, labeling, narrative). Never "solve" a parsing/normalization problem by throwing an LLM at it.
@@ -76,7 +76,8 @@ DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
 - Triage/scoring: `claude-haiku-4-5`, **Batches API**, structured outputs, batched ~25 items/request, on **titles + summaries only**. Full content is fetched lazily for top-N survivors only — never feed full content to triage.
 - Synthesis/impact: `claude-opus-4-8`, prompt-cached stable prefix (rubric + interests + taxonomy), items after the breakpoint. ❌ No timestamps, run IDs, or other volatile data in the cached prefix.
 - Every call goes through `llm.py`, which records tokens into `runs`.
-- Any diff touching `llm.py`, prompts, model choice, or batching gets an `llm-cost-guard` review before merge (see agent file).
+- Podcast TTS is a dollar spend outside `llm.py`'s token accounting: every character sent to `deliver/tts.py` is recorded to `runs.tts_characters` (DESIGN §13.3), and `signalforge status` prices it at the configured model.
+- Any diff touching `llm.py`, prompts, model choice, batching, or `deliver/tts.py`'s price table/ceiling gets an `llm-cost-guard` review before merge (see agent file).
 
 ## 7. Failure isolation
 
@@ -116,8 +117,10 @@ DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
 | 12 | NEVER let one source's failure abort a run | §7 |
 | 13 | NEVER hit live networks or the real Anthropic API in tests | §8 |
 | 14 | NEVER add an ORM, orchestration framework, or server the design explicitly rejected | §9, DESIGN §15 |
-| 15 | NEVER build ahead of the current phase gate | §1, DESIGN §16; one recorded exception: DESIGN §13.2 |
+| 15 | NEVER build ahead of the current phase gate | §1, DESIGN §16; two recorded exceptions: DESIGN §13.2, §13.3 |
 | 16 | NEVER commit `.env` / API keys; never log secrets | `.claude/conventions.md` |
 | 17 | NEVER render model- or world-authored text into a vault file without flattening it to one line | §5 |
 | 18 | NEVER let `curate/` write an `items` row, or fetch before the LLM has proposed | §2 |
 | 19 | NEVER deliver a report before its vault write succeeded, and never let a channel fail the run or become an input surface | §5, DESIGN §13.2 |
+| 20 | NEVER synthesize audio for a script not already written to the vault | DESIGN §13.3 |
+| 21 | NEVER make a TTS call that bypasses `runs.tts_characters` accounting | §6 |

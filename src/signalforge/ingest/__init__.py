@@ -4,16 +4,21 @@ The public entry point is `ingest_all`: give it a validated `SourcesConfig` and
 it returns every item Phase 0's sources yielded plus a structured error record
 for each source that failed. It does not touch the database — persisting items
 (`db.upsert_item`) and closing the run (`db.finish_run(errors=...)`) is the
-CLI's job, which keeps this package free of DB state and trivially testable.
+CLI's job, which keeps this module free of DB state and trivially testable.
 
-Because persistence happens outside this package, the returned `IngestRun`
+Because persistence happens outside this module, the returned `IngestRun`
 carries conditional-GET validators that are **staged, not durable**. The caller
 calls `run.commit_validators()` once its writes have succeeded; until then the
 next run refetches rather than 304s. This is what keeps ingestion at-least-once
-across a crash without `ingest/` ever importing `db.py` (CLAUDE.md §2).
+across a crash without `ingest_all` ever importing `db.py` — a discovery-time
+convention this package holds itself to, not something CLAUDE.md §2 states
+(that rule only forbids an LLM import). `ingest/fullcontent.py` is a sibling
+module with a different job — backfilling a column on rows already committed —
+and imports `db.py` directly; see its docstring.
 
-Phase 0 sources only: RSS, GitHub releases, Hacker News. arXiv and awesome-list
-diffing are Phase 1; YouTube and newsletters are Phase 3 (NEVER rule 15).
+Sources: RSS, GitHub releases, Hacker News (Phase 0), arXiv (Phase 1). Awesome-
+list diffing is still Phase 1 but unimplemented; YouTube and newsletters are
+Phase 3 (NEVER rule 15).
 
 Nothing here imports `llm.py` or calls an LLM (CLAUDE.md §2).
 """
@@ -25,6 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 from signalforge.config import SourcesConfig, get_secret
+from signalforge.ingest.arxiv import ArxivIngestor, build_arxiv_ingestors
 from signalforge.ingest.base import (
     DEFAULT_MAX_CONCURRENCY,
     FetchError,
@@ -43,6 +49,7 @@ from signalforge.ingest.hackernews import HackerNewsIngestor, build_hackernews_i
 from signalforge.ingest.rss import RssIngestor, build_rss_ingestors, parse_feed
 
 __all__ = [
+    "ArxivIngestor",
     "FetchError",
     "FetchResponse",
     "GithubReleasesIngestor",
@@ -85,6 +92,7 @@ def build_ingestors(config: SourcesConfig) -> list[Ingestor]:
         ingestors.extend(build_github_ingestors(config, token))
 
     ingestors.extend(build_hackernews_ingestors(config))
+    ingestors.extend(build_arxiv_ingestors(config))
     return ingestors
 
 

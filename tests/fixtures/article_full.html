@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Agents that ship: what changed in production AI this week</title>
+<meta name="author" content="Jordan Rivers">
+<meta name="date" content="2026-08-05">
+</head>
+<body>
+<header><nav>Home | Archive | About</nav></header>
+<article>
+<h1>Agents that ship: what changed in production AI this week</h1>
+<p class="byline">By Jordan Rivers — August 5, 2026</p>
+<p>Three teams shipped agent-driven pipelines to production this week, and the pattern across all three was the same: narrow scope, deterministic guardrails, and a human approving anything that spends money.</p>
+<p>The first, a logistics startup, wired an agent to reroute shipments when a carrier misses an SLA. It never touches billing directly — it drafts a reroute plan and a human clicks approve. That one guardrail is why the team trusts it enough to run unattended overnight.</p>
+<p>The second team took the opposite lesson from a near-miss: an agent that drafted refund emails once produced a plausible-sounding apology for an order that did not exist. The fix was not a smarter prompt. It was a database lookup the agent could not bypass.</p>
+<p>The third case is the most boring and the most instructive: an internal tool that classifies support tickets. No news there, except that it has run unattended for four months without a single incident, because the scope is narrow enough that nobody had to think hard about failure modes.</p>
+<p>None of this is about bigger models. It is about smaller blast radii.</p>
+<section class="comments">
+<p>First commenter: this matches what we saw internally too.</p>
+<p>Second commenter: would love a follow-up on the refund-email failure mode.</p>
+</section>
+</article>
+<footer>Copyright 2026</footer>
+</body>
+</html>

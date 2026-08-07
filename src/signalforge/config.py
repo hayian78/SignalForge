@@ -14,14 +14,24 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Final
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    SecretStr,
+    ValidationError,
+    field_validator,
+)
 
 from signalforge.models import has_control_characters
 
@@ -37,15 +47,19 @@ __all__ = [
     "HackerNewsConfig",
     "IgnoreRules",
     "InterestsConfig",
+    "PodcastChannelConfig",
     "RssSource",
     "SettingsConfig",
     "SourceDefaults",
     "SourcesConfig",
+    "TaxonomyConfig",
+    "TaxonomyLeaf",
     "Thresholds",
     "get_secret",
     "load_interests",
     "load_settings",
     "load_sources",
+    "load_taxonomy",
 ]
 
 logger = logging.getLogger(__name__)
@@ -53,6 +67,7 @@ logger = logging.getLogger(__name__)
 SOURCES_FILENAME: Final = "sources.yaml"
 INTERESTS_FILENAME: Final = "interests.yaml"
 SETTINGS_FILENAME: Final = "settings.yaml"
+TAXONOMY_FILENAME: Final = "taxonomy.yaml"
 
 
 class ConfigError(Exception):
@@ -157,7 +172,7 @@ class GithubConfig(_StrictModel):
 
 
 class ArxivConfig(_StrictModel):
-    """The `arxiv:` block (Phase 1 — modeled here, ingested later)."""
+    """The `arxiv:` block, read by `ingest/arxiv.py` (Phase 1, live 2026-08-07)."""
 
     categories: list[str] = Field(default_factory=list)
     require_keywords: list[str] = Field(default_factory=list)
@@ -310,6 +325,21 @@ class Thresholds(_StrictModel):
         ),
     )
 
+    podcast_top_n: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Podcast channel item cap: the top-N ranked kept items (reusing the digest's "
+            "own ranking and crowding limits) become script source material for "
+            "`synth/podcast.py`. Deliberately independent of `daily_max_items` — the "
+            "digest's read-length knob and the podcast's Opus-cost knob are different "
+            "concerns that happen to share a ranking. Phase 1 synthesis spend must stay "
+            "bounded by this top-N, not by how many items triage keeps, or a keep-rate "
+            "improvement silently becomes a cost multiplier. None disables the podcast "
+            "channel."
+        ),
+    )
+
 
 class InterestsConfig(_StrictModel):
     """Root model for `interests.yaml` — the single definition of "relevant to me".
@@ -324,6 +354,101 @@ class InterestsConfig(_StrictModel):
     architecture_philosophy: str = ""
     ignore: IgnoreRules = Field(default_factory=IgnoreRules)
     thresholds: Thresholds
+
+
+# --------------------------------------------------------------------------- #
+# taxonomy.yaml (DESIGN §10)
+#
+# Modeled and validated here; not yet read by any tagger. The same staging
+# posture `ArxivConfig` carried until `ingest/arxiv.py` shipped (NEVER rule
+# 15) — `score/taxonomy.py`'s keyword tagger and its Haiku-triage fallback are
+# a separate, larger unit of work with an open question this config alone
+# does not answer (where a tagged item's topic(s) get persisted — DESIGN §5's
+# schema has no `item_topics` table yet). `signalforge` does not read this
+# file today; editing it has no runtime effect until that lands.
+# --------------------------------------------------------------------------- #
+
+
+_TAXONOMY_NAME_RE: Final = re.compile(r"[a-z0-9][a-z0-9-]*")
+"""A taxonomy group or leaf name: lowercase, digits, hyphens, no leading hyphen.
+Matches the `group.leaf` shape `priority_topics` writes (e.g. `industry.strategy`)
+and the naming convention every other `sources.yaml`/`interests.yaml` key already
+follows (`daily_max_per_source`-style snake_case aside — those are Python field
+names, not user-composed identifiers like these)."""
+
+
+class TaxonomyLeaf(_StrictModel):
+    """One topic leaf: its match keywords for the deterministic first-pass tagger."""
+
+    keywords: list[str] = Field(min_length=1)
+
+    @field_validator("keywords")
+    @classmethod
+    def _no_blank_keywords(cls, value: list[str]) -> list[str]:
+        for keyword in value:
+            if not keyword.strip():
+                raise ValueError("a taxonomy keyword cannot be blank")
+        return value
+
+
+class TaxonomyConfig(RootModel[dict[str, dict[str, TaxonomyLeaf]]]):
+    """Root model for `taxonomy.yaml` — a two-level topic tree (DESIGN §10).
+
+    Top-level keys are group names (`agents`, `frontier`, ...); each maps to a
+    dict of leaf names to their match keywords. A `RootModel` over a plain dict
+    rather than named attributes, because — unlike `SourcesConfig`'s fixed
+    blocks (`rss`, `github`, ...) — groups and leaves here are themselves the
+    config; there is no closed vocabulary to name as Python attributes.
+
+    Access the tree via `.root["agents"]["planning"].keywords` — NOT by
+    iterating the model directly. `RootModel` is still a `BaseModel`
+    underneath, so `list(config)`/`for k in config` yields its *pydantic
+    fields* (`[("root", {...})]`), not the group names, and `config["agents"]`
+    raises `TypeError` rather than delegating to the dict. Both are easy
+    mistakes for whatever consumes this next (the future `score/taxonomy.py`
+    tagger) to make once, the first time it tries to loop over topics.
+    """
+
+    @field_validator("root")
+    @classmethod
+    def _no_empty_groups(
+        cls, value: dict[str, dict[str, TaxonomyLeaf]]
+    ) -> dict[str, dict[str, TaxonomyLeaf]]:
+        for group, leaves in value.items():
+            if not leaves:
+                raise ValueError(f"taxonomy group {group!r} has no leaf topics")
+        return value
+
+    @field_validator("root")
+    @classmethod
+    def _valid_names(
+        cls, value: dict[str, dict[str, TaxonomyLeaf]]
+    ) -> dict[str, dict[str, TaxonomyLeaf]]:
+        """Group and leaf names must be lowercase `[a-z0-9-]`, starting alphanumeric.
+
+        `interests.yaml`'s `priority_topics` already writes topics as
+        `group.leaf` (`industry.strategy`), and `test_config.py` checks the two
+        files against each other by building that same string — see this
+        file's own comment. A dot inside a name would make that join ambiguous;
+        stray case or whitespace (` Agents `/`Agents`) would pass this model
+        silently but never match a `priority_topics` entry again, the exact
+        failure this rejects instead of a phantom, un-matchable taxonomy key.
+        `str_strip_whitespace` doesn't help here — it only trims field
+        *values*, never dict *keys*, and `RootModel` skips `_StrictModel`
+        entirely (there is no fixed field to strip).
+        """
+        for group, leaves in value.items():
+            if not _TAXONOMY_NAME_RE.fullmatch(group):
+                raise ValueError(
+                    f"taxonomy group name {group!r} must match {_TAXONOMY_NAME_RE.pattern!r}"
+                )
+            for leaf in leaves:
+                if not _TAXONOMY_NAME_RE.fullmatch(leaf):
+                    raise ValueError(
+                        f"taxonomy leaf name {leaf!r} in group {group!r} "
+                        f"must match {_TAXONOMY_NAME_RE.pattern!r}"
+                    )
+        return value
 
 
 # --------------------------------------------------------------------------- #
@@ -439,15 +564,146 @@ class EmailChannelConfig(_StrictModel):
         return value
 
 
+PODCAST_PRESENTER_NAME_MAX_LENGTH: Final = 100
+"""Shared bound for `PodcastChannelConfig.presenter_a`/`presenter_b` —
+named rather than an inline `Field(max_length=100)` literal so
+`llm.py`'s podcast worst-case cost test can price against the same number
+this model enforces, instead of a smaller hardcoded stand-in drifting from
+it (the exact "cap enforced in one place, priced in another" pattern an
+`llm-cost-guard` review has now caught four separate times on this
+feature)."""
+
+
+class PodcastChannelConfig(_StrictModel):
+    """The `delivery.podcast:` block — the second recorded phase-gate exception
+    (DESIGN §13.3): a daily two-presenter audio show scripted by `synth/podcast.py`
+    and published as a private RSS feed.
+
+    Unlike email, this channel spends real money beyond the LLM call — TTS dollars,
+    recorded to `runs.tts_characters` — so every knob here is required rather than
+    defaulted (CLAUDE.md §10 rule 6): a default buried in code is a spend limit
+    nobody can see.
+    """
+
+    enabled: bool
+    """Required rather than defaulted, same reasoning as `EmailChannelConfig.enabled`."""
+
+    tts_api_key_env: str = Field(min_length=1)
+    """Name of the env var holding the OpenRouter API key — never the key itself."""
+
+    tts_model: str = Field(min_length=1)
+    """OpenRouter TTS model id (e.g. a Gemini Flash TTS or Kokoro-82M variant)."""
+
+    voice_a: str = Field(min_length=1)
+    voice_b: str = Field(min_length=1)
+    """Provider voice ids for the two presenters."""
+
+    presenter_a: str = Field(min_length=1, max_length=PODCAST_PRESENTER_NAME_MAX_LENGTH)
+    presenter_b: str = Field(min_length=1, max_length=PODCAST_PRESENTER_NAME_MAX_LENGTH)
+    """Display names rendered as dialogue speaker labels in the vault script.
+    Bounded like every other string on the podcast prompt path (`llm.py`'s
+    `PODCAST_MAX_ITEM_*_BYTES` family) — these two also reach
+    `run_podcast_script`'s prompt and its cost worst-case."""
+
+    r2_endpoint: str = Field(min_length=1)
+    r2_bucket: str = Field(min_length=1)
+    """Cloudflare R2 S3-compatible endpoint and bucket the feed and audio publish to."""
+
+    r2_access_key_env: str = Field(min_length=1)
+    r2_secret_key_env: str = Field(min_length=1)
+    """Names of the env vars holding the R2 access/secret keys — never the keys
+    themselves (CLAUDE.md §10 rule 16)."""
+
+    public_base_url: str = Field(min_length=1)
+    """Base URL the feed and audio are served from — the unguessable-prefix URL a
+    podcast app subscribes to (DESIGN §13.3). `deliver/podcast.py` derives the
+    real R2 object key prefix from this URL's path (`_r2_prefix`), so a
+    malformed value here silently breaks the bucket layout rather than raising
+    — see `_validate_public_base_url` for why the shape is checked at load."""
+
+    retention_episodes: int = Field(ge=1, le=90)
+    """How many episodes stay live in the feed and on R2; older ones are pruned."""
+
+    feed_title: str = Field(min_length=1)
+    """The RSS `<title>` shown in podcast apps."""
+
+    @field_validator("tts_api_key_env")
+    @classmethod
+    def _reject_inline_secret(cls, value: str) -> str:
+        """`tts_api_key_env` must name an env var, not carry the key.
+
+        The likely mistake is pasting a live `sk-or-...` key into YAML. Unlike
+        `EmailChannelConfig.api_key_env`'s `re_` guard, no length/prefix check is
+        needed here: a real OpenRouter key contains hyphens (`sk-or-v1-...`), so
+        the identifier-shape check alone already rejects it — the same guard
+        `GithubConfig.token_env` uses for its non-prefixed fields.
+        """
+        if not value.replace("_", "").isalnum():
+            raise ValueError(
+                "tts_api_key_env must be the NAME of an environment variable "
+                "(e.g. OPENROUTER_API_KEY), never a key value"
+            )
+        return value
+
+    @field_validator("r2_access_key_env", "r2_secret_key_env")
+    @classmethod
+    def _reject_inline_r2_secret(cls, value: str) -> str:
+        """These must name env vars, not carry the keys. The identifier-shape
+        check alone (`tts_api_key_env`'s guard) is not enough here: unlike an
+        OpenRouter key, an R2 access key ID is plain alnum with no
+        distinctive prefix or punctuation, so it would sail through
+        unchanged. Adding "the value must be SHOUTING_SNAKE_CASE" closes
+        that: a real R2 access key ID (lowercase hex) fails on case, and a
+        real R2 secret (base64-shaped — `+`, `/`, `=`) fails the identifier
+        check outright. Not foolproof — this is a guard against the likely
+        mistake, the same posture every sibling validator here takes, not a
+        secret-detection engine.
+        """
+        if not value.replace("_", "").isalnum() or value != value.upper():
+            raise ValueError(
+                "must be the NAME of an environment variable "
+                "(e.g. R2_ACCESS_KEY_ID), in SHOUTING_SNAKE_CASE, never a key value"
+            )
+        return value
+
+    @field_validator("public_base_url")
+    @classmethod
+    def _validate_public_base_url(cls, value: str) -> str:
+        """Must be a real `http(s)://host/...` URL with no query or fragment.
+
+        `deliver.podcast._r2_prefix` derives the actual R2 object key prefix
+        from this URL's *path* alone (`urlsplit(value).path`) — a value with
+        no scheme puts the whole string in `.path` instead (objects land
+        under a nonsense prefix built from the hostname), and a `?query` or
+        `#fragment` would silently be ignored by every URL this module
+        builds rather than flagged as the typo it almost certainly is. Both
+        failure modes are invisible until an operator's phone 404s on every
+        episode — caught here, at load, instead (the same
+        invisible-misconfiguration posture `_StrictModel` exists for).
+        """
+        parts = urlsplit(value)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            raise ValueError(
+                f"public_base_url must be a full http(s):// URL with a host, got {value!r}"
+            )
+        if parts.query or parts.fragment:
+            raise ValueError(
+                f"public_base_url must not carry a ?query or #fragment, got {value!r} "
+                "— every object key this channel writes is derived from the path alone"
+            )
+        return value
+
+
 class DeliveryConfig(_StrictModel):
     """The `delivery:` block — where a rendered report is mirrored to, beyond the vault.
 
-    One channel today. A second (Telegram, per DESIGN §13.2) is a new field here and a
-    new module in `deliver/`, not a plugin registry: at this scale the explicit list
-    is shorter than the machinery that would avoid it.
+    Each channel is a new field here and a new module in `deliver/`, not a plugin
+    registry: at this scale the explicit list is shorter than the machinery that
+    would avoid it.
     """
 
     email: EmailChannelConfig | None = None
+    podcast: PodcastChannelConfig | None = None
 
 
 class SettingsConfig(_StrictModel):
@@ -628,6 +884,30 @@ def load_interests(config_dir: Path) -> InterestsConfig:
     except ValidationError as exc:
         raise ConfigError(_format_validation_error(path, exc)) from exc
     logger.debug("loaded interests config", extra={"path": str(path)})
+    return config
+
+
+def load_taxonomy(config_dir: Path) -> TaxonomyConfig:
+    """Load and validate `<config_dir>/taxonomy.yaml`.
+
+    Raises `ConfigError` with a per-field explanation on invalid config. Not
+    yet called by any runtime path (see the module comment above
+    `TaxonomyConfig`) — unlike `load_sources`/`load_interests`, nothing in
+    `cli.py` calls this on every run, so a typo here is only caught by the
+    test suite today, not at the command line. This loader exists so
+    `tests/test_config.py` can validate the shipped file ahead of the tagger
+    that will actually call it.
+    """
+    path = config_dir / TAXONOMY_FILENAME
+    data = _load_yaml_mapping(path)
+    try:
+        config = TaxonomyConfig.model_validate(data)
+    except ValidationError as exc:
+        raise ConfigError(_format_validation_error(path, exc)) from exc
+    logger.debug(
+        "loaded taxonomy config",
+        extra={"path": str(path), "group_count": len(config.root)},
+    )
     return config
 
 

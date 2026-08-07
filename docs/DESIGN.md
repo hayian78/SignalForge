@@ -144,7 +144,7 @@ signalforge/
 │       └── trading-platform.md
 ├── src/signalforge/
 │   ├── __init__.py
-│   ├── cli.py                  # typer app: ingest | score | digest | daily | mark | curate | deliver | status
+│   ├── cli.py                  # typer app: ingest | score | digest | podcast | daily | mark | curate | deliver | status
 │   ├── config.py               # pydantic models for the YAML configs
 │   ├── models.py               # Item, Score, Cluster, Insight (pydantic)
 │   ├── db.py                   # SQLite connection, migrations, queries
@@ -155,6 +155,7 @@ signalforge/
 │   │   ├── arxiv.py            # category + keyword queries
 │   │   ├── hackernews.py       # Algolia API, front page + keyword search
 │   │   ├── probe.py            # feed/repo health facts for curation (§7.1); writes no items
+│   │   ├── fullcontent.py      # deep-read: full article text for the podcast's top-N (§13.3)
 │   │   └── youtube.py          # Phase 3: yt-dlp auto-transcripts
 │   ├── curate/                 # Phase 1: adaptive source curation (§7.1)
 │   │   ├── gather.py           # per-source yield + outbound attention (DB reads only)
@@ -173,20 +174,26 @@ signalforge/
 │   │   ├── rubrics.py          # scoring prompts as versioned constants
 │   │   └── scorer.py           # 3-dimension scoring with reasoning
 │   ├── synth/
+│   │   ├── podcast.py          # daily two-presenter script, via llm.py only (§13.3)
 │   │   ├── trends.py           # Phase 2
 │   │   ├── synthesis.py        # Phase 2: cross-source narrative
 │   │   └── impact.py           # Phase 3: Architecture Impact Engine
 │   ├── report/
-│   │   ├── templates/          # jinja2: daily.md.j2, weekly.md.j2, monthly.md.j2
-│   │   └── writer.py           # fills templates, commits vault to git
+│   │   ├── templates/          # jinja2: daily.md.j2, podcast.md.j2, weekly.md.j2, monthly.md.j2
+│   │   ├── daily.py            # fills the daily digest template
+│   │   └── podcast.py          # fills/parses the podcast script template (§13.3)
 │   ├── deliver/                # §13.2: outbound mirrors of an already-written report
-│   │   ├── templates/          # jinja2: email_daily.html.j2, email_daily.txt.j2
-│   │   └── email.py            # renders + POSTs to a mail provider API
+│   │   ├── templates/          # jinja2: email_daily.html.j2, email_daily.txt.j2, podcast_feed.xml.j2
+│   │   ├── email.py            # renders + POSTs to a mail provider API
+│   │   ├── tts.py              # podcast: OpenRouter TTS synthesis + spend accounting (§13.3)
+│   │   ├── storage.py          # podcast: hand-rolled SigV4 PUT/DELETE/LIST against R2 (§13.3)
+│   │   └── podcast.py          # podcast: synthesize, upload, rebuild feed.xml, prune (§13.3)
 │   ├── feedback.py             # harvests item marks back out of vault markdown (§11)
 │   ├── llm.py                  # single Anthropic client wrapper (caching, batching, budget)
 │   └── mcp_server.py           # Phase 3: expose vault + DB to Claude Code
 ├── vault/                      # Obsidian vault — THE PRODUCT (own git repo or subdir)
 │   ├── daily/2026-07-16.md
+│   ├── podcast/2026-08-07.md   # episode script, source of truth for TTS (§13.3)
 │   ├── weekly/2026-W29.md
 │   ├── monthly/2026-07.md
 │   ├── insights/               # Phase 3: atomic notes
@@ -194,7 +201,8 @@ signalforge/
 │   └── radar/                  # technology-radar.md, research-radar.md
 ├── data/
 │   ├── signalforge.db          # SQLite (gitignored)
-│   └── http_cache/             # raw responses (gitignored, pruned at 90 days)
+│   ├── http_cache/             # raw responses (gitignored, pruned at 90 days)
+│   └── audio/                  # local mp3 cache, gitignored, NOT backed up (§13.3)
 └── tests/
 ```
 
@@ -295,7 +303,7 @@ CREATE TABLE impact_assessments (
 -- Operations
 CREATE TABLE runs (
     id          INTEGER PRIMARY KEY,
-    kind        TEXT NOT NULL,               -- ingest | score | curate | curate-apply | daily | weekly | monthly
+    kind        TEXT NOT NULL,               -- ingest | score | curate | curate-apply | daily | podcast | weekly | monthly
     started_at  TEXT NOT NULL,
     finished_at TEXT,
     status      TEXT,                        -- ok | partial | failed
@@ -303,6 +311,7 @@ CREATE TABLE runs (
     llm_input_tokens  INTEGER DEFAULT 0,
     llm_output_tokens INTEGER DEFAULT 0,
     server_tool_requests INTEGER DEFAULT 0,  -- billed per call, not per token (web search) — §7.1
+    tts_characters INTEGER DEFAULT 0,        -- podcast TTS spend, priced by deliver/tts.py (§13.3)
     errors      TEXT                         -- JSON list of per-source failures
 );
 CREATE TABLE feedback (                      -- human-in-the-loop signal for tuning
@@ -340,8 +349,8 @@ CREATE UNIQUE INDEX ux_proposals_kind_key ON proposals (kind, dedup_key);
 CREATE TABLE deliveries (                    -- one row per report handed to an outbound channel (§13.2)
     id          INTEGER PRIMARY KEY,
     run_id      INTEGER REFERENCES runs(id),
-    channel     TEXT NOT NULL,               -- email (one channel today)
-    report_kind TEXT NOT NULL,               -- daily
+    channel     TEXT NOT NULL,               -- email | podcast
+    report_kind TEXT NOT NULL,               -- daily | podcast
     target_date TEXT NOT NULL,               -- the report's date, not the send time
     body_hash   TEXT NOT NULL,               -- sha256 of what went out; audit trail only, never
                                              -- part of the key — a re-render is the same report
@@ -398,7 +407,7 @@ Relationships are Obsidian wikilinks — free graph view, no graph database to m
 | GitHub releases (aider, langgraph, mcp, ollama, vllm, litellm, claude-code, dspy, pydantic-ai, …) | REST `/releases`, `/tags` fallback | 0 | Auth token → 5k req/hr; release notes are the summary |
 | Hacker News | Algolia API: front page ≥ N points + keyword queries | 0 | Free, no auth; comments fetched only for top items |
 | Engineering newsletters (Latent Space, etc.) | RSS where published | 1 | Most have feeds; email fallback in Phase 3 |
-| arXiv (cs.AI/CL/LG/SE + keyword filters: agents, context, retrieval, inference, evaluation, compression, fine-tuning) | arXiv API (Atom) | 1 | Politeness delay 3s; abstracts only at triage |
+| arXiv (cs.AI/CL/LG/SE + keyword filters: agents, context, retrieval, inference, evaluation, compression, fine-tuning) | arXiv API (Atom), `ingest/arxiv.py`, **live 2026-08-07** | 1 | Categories + keywords fold into one `search_query` per run, so the 3s politeness guidance is satisfied by never issuing a second request rather than by a coded delay; abstracts only at triage |
 | Awesome lists (agent engineering, MCP, LLM, vector DBs, CLI tools) | Shallow `git clone` + diff of README between runs | 1 | New entries = new items; a diff, not a scrape |
 | CHANGELOG.md on watched repos that don't cut GitHub releases | Same shallow-clone + diff mechanism as awesome lists | 2 | The Releases API misses repos that only append changelogs; doc repos (MCP spec, Anthropic docs) could ride the same mechanism if felt need appears |
 | GitHub trending / star velocity | Search API `created:>date sort:stars` + star-count deltas on watched repos | 2 | Official API only — the trending page has none |
@@ -704,14 +713,18 @@ Two notes for anyone extending this:
 | Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
 | Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4.5k at full evidence) plus search results, measured at ~22-30k tokens per search on the first two real runs; output capped by `SCOUT_MAX_TOKENS`; ships at 12 searches |
+| Podcast episode script (§13.3) | `claude-opus-5` | At most two requests per episode — the first attempt, and one "shorter" retry (`synth/podcast.py::build_script`) if it ran long; prompt-cached stable prefix (show-format brief + interests/taxonomy, `build_podcast_stable_prefix`), the day's top-`podcast_top_n` items (titles, summaries, and full deep-read content — unlike triage, NEVER rule 9's sibling exemption) after the breakpoint | 1 call/day (2 on a long-running episode); item count capped by `PODCAST_MAX_ITEMS`, output by `PODCAST_MAX_TOKENS`/`PODCAST_RETRY_MAX_TOKENS` |
+| Podcast TTS synthesis (§13.3) | OpenRouter (not Anthropic — `deliver/tts.py`, outside `llm.py`) | Per-line coalesce-and-concat: consecutive same-speaker turns join, each chunk synthesized separately, `ffmpeg -f concat` joins the mp3s. Billed per character, not per token — `runs.tts_characters`, not `runs.llm_*_tokens` | 1 episode/day; total dialogue capped at `TTS_MAX_CHARS` (14,000 chars) |
 
 Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
 
-**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (12 searches × ~28k in/search, the average of the three real runs measured so far ≈ $1.69 + ~7.6k out ≈ $0.19 + 12 searches ≈ $0.12) ≈ **$8.65**. **Itemized total ≈ $15.65/month**, against a **$5–10 target** and a **$30 alarm**.
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (12 searches × ~28k in/search, the average of the three real runs measured so far ≈ $1.69 + ~7.6k out ≈ $0.19 + 12 searches ≈ $0.12) ≈ **$8.65**; podcast script ≈ 30 × (~15k in / ~3k out on `claude-opus-5`) ≈ **$4.50**; podcast TTS ≈ 30 episodes × ~8k spoken characters (a nine-to-twelve-minute show) on the shipped `hexgrad/kokoro-82m` rate ($0.62/1M chars) ≈ **$0.15**. **Itemized total ≈ $20.30/month**, against a **$5–10 target** and a **$30 alarm**.
 
 Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
-Two things that estimate is not. It is not measured: the only measured figures to date are **≈ $0.40/month actual** on triage (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku) and **three real scout runs** on 2026-07-30/31 (~$1.20 at 6 searches, ~$1.20 at 6 again, ~$1.02 at 7), because everything else prices a component that does not exist yet or has run too few times to average. And the band is no longer mid-range: the scout alone, raised deliberately to 12 searches after the operator judged the extra research depth worth it, now accounts for over half the itemized total and has pushed the **whole pipeline past its own $5–10 target on paper** — still nowhere near the $30 alarm, but the next new LLM consumer, or a scout re-tune in the other direction, needs the band revisited rather than absorbed.
+Two things that estimate is not. It is not measured: the only measured figures to date are **≈ $0.40/month actual** on triage (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku) and **three real scout runs** on 2026-07-30/31 (~$1.20 at 6 searches, ~$1.20 at 6 again, ~$1.02 at 7), because everything else prices a component that does not exist yet or has run too few times to average — the podcast script and TTS lines above are estimates in the same unmeasured category, priced against the shipped config's `podcast_top_n`/`hexgrad/kokoro-82m` defaults rather than an observed month of episodes. And the band is no longer mid-range: the scout alone, raised deliberately to 12 searches after the operator judged the extra research depth worth it, already accounted for over half the itemized total before the podcast landed, and the podcast's own two lines have pushed the **whole pipeline further past its own $5–10 target on paper** — still under the $30 alarm on these realistic volumes, but the next new LLM or TTS consumer, or a scout re-tune in the other direction, needs the band revisited rather than absorbed.
+
+**The $30 alarm now covers TTS characters, not just LLM tokens.** `signalforge status`'s month-to-date readout prices `runs.tts_characters` alongside `runs.llm_*_tokens` (Stage 6, DESIGN §13.3) — the TTS line above is not invisible to the alarm the way the search-tool dollar figure still is (next paragraph). Separately from the realistic estimate above, the **worst-case hard ceilings** for the podcast's two new spend categories are `llm.PODCAST_MONTHLY_CEILING_USD` = **$23.00** and `deliver.tts.TTS_MONTHLY_CEILING_USD` ≈ **$43.40** — summing to **$66.40**, well past $30 on their own. That sum is not a forecast: each ceiling is a hard cap priced at the most expensive plausible per-unit rate a config change could reach (every item field at its byte cap, a switch to the priciest listed TTS model) and enforced by code, the same discipline `SCOUT_MONTHLY_CEILING_USD` uses (§7.1). Recorded here rather than silently narrowed to fit under $30 by shrinking the show — see `PODCAST_MONTHLY_CEILING_USD`'s own docstring, which named this paragraph as its resolution.
 
 **Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
 
@@ -744,7 +757,7 @@ Weekly-brief inclusion: `signal ≥ 3 AND relevance ≥ 3 AND (signal + relevanc
 
 ## 10. Topic Taxonomy
 
-Data, not code — `taxonomy.yaml`, two levels deep, each topic carrying match keywords for the deterministic first-pass tagger:
+Data, not code — `taxonomy.yaml`, two levels deep, each topic carrying match keywords for the deterministic first-pass tagger. The example below is illustrative of the eventual full shape (and predates the 2026-07-24 executive-briefing rebalance — an engineering/inference-infra tree, from when that was the profile's main lens):
 
 ```yaml
 agents:
@@ -779,7 +792,9 @@ tooling:
   cli: {keywords: [cli, terminal, tui]}
 ```
 
-Tagging: lowercase keyword match first (free, covers ~80%); unmatched items get topics assigned in the same Haiku triage call (marginal cost ~zero). New leaf topics are a YAML edit; the tagger warns on taxonomy keys that haven't matched anything in 60 days.
+**What actually shipped (2026-08-07)** is deliberately smaller: `config/taxonomy.yaml`, validated by `TaxonomyConfig` in `config.py`, carries only the six `group.leaf` pairs `interests.yaml`'s `priority_topics` already names (`industry.strategy`, `frontier.capabilities`, `enterprise.adoption`, `agents.autonomy`, `policy.regulation`, `ai.research-direction`) — every keyword traceable to operator-authored config, nothing invented wholesale. Growing the tree past those six is an operator edit, the same posture `sources.yaml` and `interests.yaml` already have (CLAUDE.md §4) — not a redesign task for whoever builds the tagger. The config layer is staged ahead of the tagger itself (NEVER rule 15): `score/taxonomy.py` (keyword match first, Haiku-triage fallback for unmatched items) is not built, and DESIGN §5's schema has no `item_topics` table yet to store a tagged item's topic(s) — that storage question is still open.
+
+Tagging (once built): lowercase keyword match first (free, covers ~80%); unmatched items get topics assigned in the same Haiku triage call (marginal cost ~zero). New leaf topics are a YAML edit; the tagger warns on taxonomy keys that haven't matched anything in 60 days.
 
 ---
 
@@ -969,7 +984,7 @@ server, and the felt gap was reading, not deciding.
    last **ingest** run and skips run-level records (`source_id == "*"`), so it does
    *not* carry delivery errors. `status` is the only place a broken channel shows
    up today — surfacing it in the digest would be a code change, not a doc one.
-4. **One send per report, ever** (idempotency, §3). Two guards, deliberately
+4. **One send per report, ever** (idempotency, principle 6). Two guards, deliberately
    redundant: a `UNIQUE(channel, report_kind, target_date)` index on `deliveries`,
    and a *stateless* freshness window (`deliver.MAX_DELIVERY_AGE_DAYS`, in code
    rather than `settings.yaml` deliberately: §4 governs knobs the operator tunes,
@@ -986,21 +1001,124 @@ disagree with the file about what the day contained. Config lives in
 `settings.yaml` under `delivery:` — machine-local, gitignored, and the API key is
 named there, never written there (NEVER 16).
 
-One channel exists (`email`, via a hosted API). A second is a new module and a new
-config block, not a plugin registry: at this scale the explicit list is shorter
-than the machinery that would avoid it.
+One channel exists (`email`, via a hosted API). A second, the podcast (§13.3), is a
+new module and a new config block, not a plugin registry: at this scale the explicit
+list is shorter than the machinery that would avoid it.
+
+---
+
+### 13.3 Podcast channel — the second recorded exception
+
+**Status: shipped 2026-08-07**, across the seven stages of
+`docs/plans/podcast-channel.md`. This section is that plan's Stage 7: the full
+§13.2-shaped write-up, replacing the interim stub an earlier stage recorded so that
+the eight source files citing "DESIGN §13.3" as their authorization (`config.py`,
+`llm.py`, `synth/podcast.py`, `report/podcast.py`, `deliver/podcast.py`,
+`deliver/tts.py`, `deliver/storage.py`, `ingest/fullcontent.py`) were never
+pointing at a section recorded nowhere.
+
+**What was decided, and by whom.** Operator decision, 2026-08-07 (recorded in
+`docs/plans/podcast-channel.md`'s "Decisions already made"): §13.2's own tripwire —
+"no third §18 item ships before four consecutive Sunday briefs exist" — is knowingly
+tripped a second time. A daily two-presenter audio show, scripted by `claude-opus-5`
+from the day's top-`podcast_top_n` kept items and published as a private RSS feed on
+Cloudflare R2, builds in Phase 1, under a second recorded exception, rather than
+waiting for the Phase 1 gate DESIGN §16 defines.
+
+**Why a third §18 item shipped anyway.** The identical argument §13.2 used, applied
+a second time: the digest and its email mirror had become good enough that "reading
+it" was solved, and the felt gap moved to a moment there is no reading surface for
+at all — driving, walking, the gym. That is still the test §17 risk 1 sets (a
+felt gap in a report already being used daily), not a new justification invented to
+clear the bar. What made it *build-now* rather than *wait-for-Phase-1* cheap enough
+to justify: the digest's own top-N ranking, crowding limits, and citation discipline
+(§6) all reuse directly — `podcast_top_n` is a second cap on the same ranked list
+`daily_max_items` already caps, and `report/podcast.py`'s vault script keeps NEVER
+rule 7's per-claim citation exactly as strict as the digest's.
+
+**What it cost.** Stated in full, because a promotion that appears free is a
+promotion nobody will scrutinise next time:
+
+- **A gate that yields to one argument three times (§7.1, §13.2, now §13.3) is not
+  a gate an operator is respecting; it is a gate being routed around with
+  documentation.** The tripwire below is deliberately harder than either of its
+  predecessors' for exactly this reason.
+- **Phase 1's actual deliverable is still at zero lines.** The Weekly Intelligence
+  Brief remains unbuilt while a third major subsystem lands around it.
+- **Two new runtime dependencies**, both load-bearing rather than incidental:
+  `trafilatura` (deep-read extraction, `ingest/fullcontent.py`) and an `ffmpeg`
+  binary on `PATH` (the per-line synthesis fallback's mp3 concat step,
+  `deliver/tts.py`) — the second is an install-time prerequisite this pipeline had
+  never had before, checked at delivery time and refused as a config error, never a
+  failed run, if absent.
+- **A new spend category outside `llm.py`'s token accounting.** TTS bills per
+  character, not per token, and needed its own ledger column
+  (`runs.tts_characters`) and its own price table (`deliver/tts.py`, precedent:
+  `curate/scout.py::search_spend_usd`) rather than fitting the existing one — see
+  §8's cost table and its honest note on what this does to the $30 alarm.
+
+**The invariants a channel must hold — inherited from §13.2, unchanged:**
+
+1. **The vault stays canonical.** `report/podcast.py::write_script` writes the
+   episode markdown before `deliver/podcast.py::deliver_podcast` ever runs;
+   `deliver_podcast` is read-only with respect to the vault and refuses to
+   synthesize a date whose script does not already exist on disk (CLAUDE.md NEVER
+   rule 20).
+2. **A channel is not an input surface.** The feed is read-only RSS/XML; nothing
+   about a podcast app subscribing to it can write back into SignalForge. Unlike
+   email's digest mirror, there is no partial exception to name here — a feed has
+   no checkbox equivalent at all.
+3. **A channel failure is never a failed run** (§7, CLAUDE.md NEVER rule 19).
+   `deliver_podcast` never raises; a dead TTS provider or a dead R2 endpoint is an
+   outcome recorded to `runs.errors` and surfaced by `signalforge status`, with the
+   episode script already safely on disk either way.
+4. **One publish per date, ever** (idempotency, principle 6) — the same two-guard shape
+   §13.2 uses: a `UNIQUE(channel, report_kind, target_date)` index on `deliveries`,
+   plus the same stateless freshness window. A third idempotency lever this
+   channel adds on top: a cached local mp3 (`data/audio/`) skips re-synthesis
+   without needing the send-log guard to have fired yet, and `retention_episodes`
+   prunes R2 and the local cache from the vault's own set of scripts — never from
+   which mp3s happen to exist locally, since `data/audio/` is explicitly **not**
+   backed up (§14) and a wiped cache must never look like "these episodes no longer
+   exist" to the pruner.
+
+**Shape.** `deliver/podcast.py` is `deliver/`'s second channel, alongside
+`deliver/email.py`, with two extra modules of its own: `deliver/tts.py` (OpenRouter
+TTS, per-line coalesce-and-concat synthesis since multi-speaker passthrough is
+unverified) and `deliver/storage.py` (~80 lines of hand-rolled AWS SigV4 over
+`httpx`, since R2 is S3-compatible and pulling in `boto3` for three verbs would be
+the dependency CLAUDE.md §9 already rejects). `synth/podcast.py` is the one new
+`llm.py` call site, script-only, cache-controlled the same way weekly synthesis is
+(§8). `ingest/fullcontent.py` is the one new HTTP-fetching module outside
+`ingest/`'s original five ingestors, and it is deliberately *not* one: it fetches no
+new items, only backfills `items.content` for a slice a caller already selected
+(CLAUDE.md §2's "never calls an LLM" holds; deterministic extraction, not judgment).
+
+**The hardened tripwire.** No third recorded phase-gate exception — period — before
+the Phase 1 gate (§16) is met. §7.1 and §13.2 each cleared the bar on "a felt gap in
+a report already being read daily"; §13.3 cleared it on the same argument a second
+time. A fourth would not be clearing a bar, it would be demonstrating the bar does
+not exist. Additionally, and specific to this channel rather than inherited: **if
+the podcast goes unlistened for 14 consecutive days, disable
+`delivery.podcast.enabled` and record why in this section.** This is deliberately
+an operator self-check, not a code-enforced one: a `deliveries` row records that an
+episode *published*, not that anyone played it, and R2 access logs are out of scope
+for a single-user tool — there is no honest automated signal for "unlistened" to
+check against, so this tripwire relies on the operator noticing, the same way the
+felt-gap test in §17 risk 1 does. A show nobody is listening to is not a channel
+earning its exception; it is dead weight carrying one anyway.
 
 ---
 
 ## 14. Scheduling & Operations
 
-- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; the weekly scout runs before the brief so its proposals ride the next digest.
+- **cron (or systemd timers) on WSL/Linux** — no scheduler daemon, no Airflow. Entries: `signalforge daily` (curate apply→ingest→score→digest→podcast, 06:00), `signalforge curate run` (Sun 06:30), `signalforge weekly` (Sun 07:00), `signalforge monthly` (1st, 08:00). `curate apply` leads the daily chain so a source approved yesterday is fetched this morning, and is skipped entirely when `sources.yaml` has no `curation:` block; `podcast` (§13.3) is the fifth and last step, isolated the same way — an unconfigured channel or a dead TTS/R2 provider costs the day's episode, never the digest that already rendered before it ran; the weekly scout runs before the brief so its proposals ride the next digest.
 
 The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$60/month at real measured cost (≈$2.00/run at the shipped 12 searches × 30 daily runs) — over this feature's own $13 budget and the whole pipeline's $30 alarm, on one mis-wired command. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
-- `signalforge status` prints last-run health, per-source freshness, and month-to-date token spend.
+- `signalforge status` prints last-run health, per-source freshness, and month-to-date token + TTS character spend (§13.3, priced at the configured podcast TTS model).
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.
-- Backups: the vault is git (push to a private remote); `signalforge.db` gets a nightly `sqlite3 .backup` copy; both configs are in the repo.
+- Backups: the vault is git (push to a private remote); `signalforge.db` gets a nightly `sqlite3 .backup` copy; both configs are in the repo. `data/audio/` (the podcast's local mp3 cache, §13.3) is deliberately **not** backed up — R2 already holds the durable copy, and the pruning logic never treats a missing local file as evidence an episode should be deleted remotely.
 - **Out-of-repo vault (`settings.yaml` `vault_dir`).** The output directory is configurable (e.g. a `/mnt/c` Windows Obsidian vault read from a WSL pipeline). When `vault_dir` points outside the repo, the vault has its own git story: the Phase 1 auto-commit in `report/writer.py` must target *that* directory's repo (or no-op cleanly when it isn't a repo), and the backup line above rides on the vault's actual location, not this repo. Decide this when `writer.py` is specced — it does not exist yet.
 
 ---
@@ -1045,9 +1163,11 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 
 ### Phase 1 — MVP: the weekly question (4–6 more weekends)
 **Status — not started** (gated on Phase 0's acceptance).
-`sources.yaml` / `interests.yaml` / `taxonomy.yaml`; arXiv + awesome-list diffing; 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).
+`sources.yaml` / `interests.yaml` / `taxonomy.yaml` (**config staged 2026-08-07** — validated, `score/taxonomy.py` tagger still pending, §10); arXiv (`ingest/arxiv.py`, **shipped 2026-08-07**) + awesome-list diffing (still pending); 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).
 **Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated **`useful` or better** — an item's rating is its highest rung on the §11 ladder, so an item marked only `exceptional` counts toward this gate.
 **Curation gate (§7.1):** four consecutive weekly scout runs in which at least one proposal was approved and applied, and no applied change had to be reverted by hand. Curation is scheduled here rather than in Phase 2 — where the rest of the feedback servo lives (§11) — because the source list going stale is a felt gap in a digest already being read daily, which is the test risk 1 sets. It degrades gracefully on thin `feedback` data by falling back to keep/kill ratios, so it does not depend on Phase 2's mark volume.
+
+**Two components shipped here out of phase order, under recorded exceptions rather than silently:** the email delivery channel (§13.2, shipped 2026-08-01) and the podcast channel (§13.3, shipped 2026-08-07). Neither is Phase 1's actual gate — the Weekly Intelligence Brief above is — and §13.3 records the hardened tripwire against a third.
 
 ### Phase 2 — Intelligence layer (months 3–5) → *V2*
 **Status — not started.**

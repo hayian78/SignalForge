@@ -22,6 +22,7 @@ earlier ones being *used* — not merely built.
 - [x] Cron installed (06:00 daily `signalforge daily`)
 - [x] Adaptive source curation: weekly scout, digest-based approval
 - [x] Daily digest mirrored to email, read-only (DESIGN §13.2 — shipped ahead of its phase, deliberately)
+- [x] Daily two-presenter podcast, scripted from the day's top items and published as a private RSS feed (DESIGN §13.3 — a second, harder recorded exception)
 
 **Remaining for the Phase 1 gate**
 - [ ] Weekly Intelligence Brief — *the product*, not yet built
@@ -52,6 +53,8 @@ Secrets live in `.env` (never committed):
 
 - `ANTHROPIC_API_KEY` — triage and synthesis
 - `GITHUB_TOKEN` — raises the GitHub API limit to 5k req/hr
+- `OPENROUTER_API_KEY` — podcast TTS (only if `delivery.podcast` is configured)
+- `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` — podcast feed/audio storage (same)
 
 Machine-local settings live in `config/settings.yaml` (also gitignored; the
 committed `config/settings.yaml.example` is the template): your `timezone`, and
@@ -64,8 +67,9 @@ a WSL pipeline targeting a Windows vault at `/mnt/c/Users/<you>/Obsidian/...`.
 uv run signalforge ingest    # fetch from all configured sources into SQLite
 uv run signalforge score     # batched Haiku triage + scoring of unscored items
 uv run signalforge digest    # render today's Daily Digest into <vault_dir>/daily/
-uv run signalforge daily     # ingest -> score -> digest, in one call (cron 06:00)
-uv run signalforge status    # last-run health, per-source freshness, token spend
+uv run signalforge podcast   # write today's episode script and publish it, if configured
+uv run signalforge daily     # curate apply -> ingest -> score -> digest -> podcast (cron 06:00)
+uv run signalforge status    # last-run health, per-source freshness, token + TTS spend
 
 uv run signalforge deliver test   # send one sample email, to prove the channel works
 ```
@@ -91,6 +95,42 @@ Email is the one channel today. It is **read-only** by design:
 
 Costs nothing in tokens: no LLM call is involved.
 
+## Listening to it
+
+A second, optional channel: a daily two-presenter audio show, scripted by Opus from
+the day's top items and published as a private RSS feed on Cloudflare R2 (DESIGN
+§13.3 — a second recorded exception, and a harder one than email's; see that section
+before enabling this). Off by default — nothing below is required to use SignalForge.
+
+**Prerequisites**, beyond the `.env` keys above:
+
+- **`ffmpeg` on `PATH`.** The per-line synthesis fallback stitches each spoken turn
+  into one mp3 with `ffmpeg -f concat`. `apt install ffmpeg` / `brew install ffmpeg`.
+  Checked before any TTS spend — a missing binary is a config error, not a failed run.
+- **A Cloudflare R2 bucket**, public-read at an *unguessable* path (that path is the
+  feed's only access control — do not use a short or guessable prefix). Create a
+  bucket, an R2 API token scoped to it (access key + secret key), and enable public
+  access at a `pub-*.r2.dev` URL or a custom domain.
+- **An OpenRouter account** for TTS. `hexgrad/kokoro-82m` is the cheap, per-character
+  model this channel's synthesis fallback was built and priced against.
+
+**Enable it** by uncommenting `delivery.podcast:` in `config/settings.yaml` (see
+`settings.yaml.example` for every field) and setting `interests.yaml`'s
+`thresholds.podcast_top_n` — both are required together; either being unset is a
+clean no-op, not an error.
+
+**Subscribe on your phone**: run `signalforge podcast` (or wait for the next 06:00
+`daily`), then open your R2 public URL + `/feed.xml` (e.g.
+`https://pub-xxxxxxxx.r2.dev/some-unguessable-prefix/feed.xml`) in any podcast app's
+"add by URL" / "add a show by RSS feed" option — Apple Podcasts, Pocket Casts, and
+Overcast all support this on iOS; most Android podcast apps do too.
+
+Same read-only invariants as email: the vault script is written first and always,
+the feed cannot write back into SignalForge, and a dead TTS/R2 provider is a
+recorded error, never a failed run. Unlike email, this one does spend real money —
+`signalforge status` prices `runs.tts_characters` at your configured TTS model, and
+DESIGN §8 tracks the honest paper total against the $30 alarm.
+
 ## Configuration
 
 Sources, interests, and thresholds are **data, not code** — adding a blog is a YAML edit, never a
@@ -100,6 +140,7 @@ Python change.
 |---|---|
 | `config/sources.yaml` | What to ingest |
 | `config/interests.yaml` | Priorities, ignores, learning goals, scoring thresholds |
+| `config/taxonomy.yaml` | Topic tree for the keyword tagger — *staged, no runtime effect yet* (DESIGN §10) |
 | `config/settings.yaml` | Machine-local: timezone, vault output path, delivery channels (gitignored; see `.example`) |
 
 Tuning relevance means editing `interests.yaml` and marking items useful/noise — never editing

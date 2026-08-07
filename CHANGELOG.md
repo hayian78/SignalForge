@@ -9,6 +9,35 @@ consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
 ## [Unreleased]
 
 ### Added
+- **`taxonomy.yaml`** (DESIGN §10, Phase 1). The two-level topic tree —
+  a group (`industry`, `frontier`, ...) containing leaves, each carrying its
+  match keywords — validated by the new `TaxonomyConfig` in `config.py`.
+  Modeled and validated only, same staging posture `arxiv:` carried before its
+  ingestor shipped (NEVER rule 15): `score/taxonomy.py`'s keyword tagger and
+  Haiku-triage fallback are a separate, larger unit of work with an open
+  schema question (DESIGN §5 has no `item_topics` table yet), so editing this
+  file has no runtime effect today. Deliberately minimal — exactly the six
+  `group.leaf` pairs `interests.yaml`'s `priority_topics` already names
+  (`industry.strategy`, `frontier.capabilities`, `enterprise.adoption`,
+  `agents.autonomy`, `policy.regulation`, `ai.research-direction`), every
+  keyword traceable to operator-authored config rather than invented
+  wholesale; a shipped-config test asserts the two files can't silently drift
+  apart. Growing the tree past those six is an operator edit, the same
+  posture `sources.yaml`/`interests.yaml` already have.
+- **arXiv ingestion** (`ingest/arxiv.py`, DESIGN §7, Phase 1). `arxiv.categories`
+  and `arxiv.require_keywords` fold into one `search_query` per run — a single
+  arXiv Atom API request, no politeness delay needed because there is never a
+  second request to space out. Reuses `feedparser` (the same Atom parser
+  `ingest/rss.py` already uses) rather than a bespoke XML client. Titles and
+  abstracts only, never full paper text (NEVER rule 9); the version suffix on
+  an entry id is stripped before it becomes `external_id`, so a metadata-only
+  revision upserts onto the same row instead of duplicating it. A malformed
+  query is a `200 OK` with a synthetic `api/errors#...` entry, not an HTTP
+  error — handled the same way as any other unparseable entry, so a typo'd
+  keyword degrades to zero items rather than a loud failure (`--dry-run` is
+  the way to notice). Closes the last gap `ProposalKind.is_staged` was tracking:
+  arXiv keyword proposals from adaptive source curation are no longer tagged
+  `(staged)` in the digest, because applying one now has a real effect.
 - **Email delivery of the daily digest** (`deliver/`, DESIGN §13.2). A read-only
   mirror so the digest can be read away from the desk. The vault write stays
   canonical and unconditional; the email is sent only after it succeeds, carries

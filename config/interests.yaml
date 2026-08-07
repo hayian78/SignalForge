@@ -11,9 +11,10 @@
 # adoption, and AI policy. Engineering/tooling is now a minor lane (the
 # operator still builds SignalForge day to day), not the main lens.
 
-# Free `group.leaf` labels. taxonomy.yaml doesn't exist yet and isn't
-# validated against this list — these are readable labels, not keys looked
-# up elsewhere.
+# `group.leaf` labels. Each of these six must exist as a group.leaf pair in
+# taxonomy.yaml — a shipped-config test (test_config.py) enforces it, so the
+# two files cannot silently drift apart. taxonomy.yaml is itself still staged
+# (validated, but not yet read by any tagger — see its own header).
 priority_topics:
   - industry.strategy
   - frontier.capabilities
@@ -79,6 +80,7 @@ thresholds:
   weekly_min_relevance: 3
   weekly_min_total: 10
   daily_max_items: 15
+  podcast_top_n: 5
 
   # At most N items from any one source may take digest slots.
   daily_max_per_source: 2
