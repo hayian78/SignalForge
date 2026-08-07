@@ -117,7 +117,8 @@ github:
     # majors surface via HN and the thought-leadership RSS sources above anyway.
     - OpenHands/OpenHands
     - continuedev/continue
-    - block/goose
+    # 2026-08-08 curate #10: All 4 items were kept by the pipeline but you marked 3 of them noise — the only source in the window where your own marks contradict the triage that badly. It also duplicates coverage you already get…
+    # - block/goose
     - modelcontextprotocol/specification
   # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
   awesome_lists:

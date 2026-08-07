@@ -63,6 +63,7 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date as Date
 from pathlib import Path
@@ -71,7 +72,8 @@ from typing import TYPE_CHECKING, Final, Literal, cast
 import jinja2
 import yaml
 
-from signalforge.db import get_item
+from signalforge.db import DigestItem, get_item
+from signalforge.feedback import highest_rung
 from signalforge.models import flatten_to_single_line, is_safe_url
 from signalforge.synth.podcast import BuiltScript
 
@@ -85,6 +87,7 @@ __all__ = [
     "ScriptTurn",
     "SourceLink",
     "build_script_context",
+    "order_by_verdict",
     "parse_script",
     "render_script",
     "script_path",
@@ -119,6 +122,68 @@ module's docstring). A title that happens to already contain this exact
 six-character sequence unescapes as a stray `]` — a cosmetic, vanishingly
 unlikely collision, not a security issue, since it only ever affects
 display text, never the separately-validated `url`."""
+
+
+# --------------------------------------------------------------------------- #
+# item selection — the operator's marks outrank the model's score
+# --------------------------------------------------------------------------- #
+
+_VERDICT_TIER: Final[dict[str | None, int]] = {
+    "exceptional": 0,
+    "useful": 1,
+    None: 2,
+}
+"""Tier order for `order_by_verdict`, strongest first; `None` is "unmarked".
+
+`noise` is deliberately **absent** rather than given a bottom number. A `noise`
+item is excluded, not demoted, and encoding it as a tier would be one careless
+edit away from sorting it back into an episode — the very failure this whole
+ordering exists to prevent. Its absence means a future edit that stops filtering
+`noise` raises `KeyError` on the next run instead of quietly airing it."""
+
+
+def order_by_verdict(
+    scored_items: Sequence[DigestItem],
+    verdicts: Mapping[int, Sequence[str]],
+) -> list[DigestItem]:
+    """`scored_items` re-ranked by the operator's marks: exceptional, useful, unmarked.
+
+    The podcast's one departure from the digest's pure score ranking (DESIGN
+    §13.3). A five-slot episode is ruined by one dud in a way a fifteen-line
+    digest is not, so where the operator has actually judged an item, that
+    judgement outranks the model's score:
+
+    * `noise` is **dropped** — an explicit "not this one" is the whole point.
+    * `exceptional` leads, then `useful`, then everything **unmarked**.
+    * Within a tier the incoming order is preserved, so score still decides —
+      `sorted` is stable and this function never re-sorts inside a tier.
+
+    Unmarked items are a tier, not an exclusion: a day the operator never opens
+    the digest still yields a normal, score-ranked episode. That is the property
+    that lets marking be optional rather than a gate on the pipeline running.
+
+    `verdicts` maps item id to that item's stored verdicts, unreduced
+    (`db.feedback_verdicts_for_items`); each item is collapsed to its strongest
+    rung by `feedback.highest_rung`, so an item marked both `noise` and `useful`
+    — a mis-click, or a mind changed — resolves to `useful` and airs, rather than
+    being silently killed by the weaker of two contradictory marks. An item with
+    no id cannot be looked up and is treated as unmarked rather than dropped;
+    citability, not markedness, is what decides whether an item can air, and
+    `cli._select_podcast_items` has already applied that filter.
+
+    Pure: no DB, no config, no I/O. Crowding limits and the top-N cap are applied
+    *after* this by `report.daily.select_digest_items`, so they truncate the
+    operator's preferred order rather than the model's.
+    """
+    tiered: list[tuple[int, DigestItem]] = []
+    for scored in scored_items:
+        item_id = scored.item.id
+        marks = verdicts.get(item_id, ()) if item_id is not None else ()
+        rung = highest_rung(marks)
+        if rung == "noise":
+            continue
+        tiered.append((_VERDICT_TIER[rung], scored))
+    return [scored for _tier, scored in sorted(tiered, key=lambda pair: pair[0])]
 
 
 @dataclass(frozen=True, slots=True)

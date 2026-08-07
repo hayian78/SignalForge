@@ -102,7 +102,28 @@ _PRICE_PER_MILLION_CHARS_USD: Final[dict[str, float]] = {
     "minimax/speech-2.8-turbo": 60.00,
     "minimax/speech-2.8-hd": 100.00,
     "fish-audio/s2.1-pro-free:free": 0.00,
+    # Empirically measured, not catalog-sourced (absent from OpenRouter's
+    # `/api/v1/models`, same as every other model in this table — see the
+    # module docstring): 2026-08-07, a 78-turn/12,073-char real episode
+    # synthesis cost $0.7854 in `/api/v1/credits` usage delta, i.e. a clean
+    # per-character rate — this revision is NOT the token-priced one the
+    # comment above warns about. Requires `response_format: "pcm"`, unlike
+    # every other model here (`400` on `"mp3"`) — see `_PCM_MODELS`.
+    "google/gemini-3.1-flash-tts-preview": 65.05,
 }
+
+_PCM_MODELS: Final[frozenset[str]] = frozenset({"google/gemini-3.1-flash-tts-preview"})
+"""Models whose `/audio/speech` endpoint rejects `response_format: "mp3"`
+(`400`) and only serves raw `pcm` — confirmed against
+`google/gemini-3.1-flash-tts-preview` 2026-08-07. Every other model in
+`_PRICE_PER_MILLION_CHARS_USD` is assumed mp3-capable until proven otherwise;
+this is an opt-in set, not a default, so a new model added to the price
+table without an entry here still gets the mp3 path most providers support."""
+
+_PCM_SAMPLE_RATE_HZ: Final = 24_000
+"""Gemini's `pcm` response is signed 16-bit little-endian mono at this rate —
+confirmed empirically 2026-08-07 (ffprobe on a real synthesized episode
+matched this exactly). Only meaningful for models in `_PCM_MODELS`."""
 
 _UNKNOWN_MODEL_FALLBACK_USD_PER_MILLION_CHARS: Final = max(_PRICE_PER_MILLION_CHARS_USD.values())
 """The most expensive *known* per-character rate in the table above,
@@ -291,16 +312,16 @@ def _wait_honoring_retry_after(state: RetryCallState) -> float:
 
 
 def _synthesize_chunk_once(
-    client: httpx.Client, *, chunk: _Chunk, model: str, api_key: SecretStr
+    client: httpx.Client, *, chunk: _Chunk, model: str, response_format: str, api_key: SecretStr
 ) -> bytes:
-    """One POST, one chunk. Returns raw mp3 bytes."""
+    """One POST, one chunk. Returns raw audio bytes in `response_format`."""
     response = client.post(
         _TTS_ENDPOINT,
         json={
             "model": model,
             "input": chunk.text,
             "voice": chunk.voice,
-            "response_format": "mp3",
+            "response_format": response_format,
         },
         headers={
             "Authorization": f"Bearer {api_key.get_secret_value()}",
@@ -323,6 +344,7 @@ def _synthesize_chunk(
     *,
     chunk: _Chunk,
     model: str,
+    response_format: str,
     api_key: SecretStr,
     sleep: Callable[[int | float], None],
 ) -> bytes:
@@ -335,7 +357,13 @@ def _synthesize_chunk(
             reraise=True,
         ):
             with attempt:
-                return _synthesize_chunk_once(client, chunk=chunk, model=model, api_key=api_key)
+                return _synthesize_chunk_once(
+                    client,
+                    chunk=chunk,
+                    model=model,
+                    response_format=response_format,
+                    api_key=api_key,
+                )
     except (_RetryableStatus, httpx.TransportError) as exc:
         replayed = isinstance(exc, (_RetryableStatus, *_REPLAYABLE_TRANSPORT_ERRORS))
         detail = f"after {_MAX_ATTEMPTS} attempts" if replayed else "without retrying"
@@ -400,6 +428,54 @@ def _concat_mp3(chunks: Sequence[bytes]) -> bytes:
         return output_path.read_bytes()
 
 
+def _concat_pcm(chunks: Sequence[bytes]) -> bytes:
+    """Assemble raw `pcm` chunks into one mp3 episode file.
+
+    Unlike `_concat_mp3`, this cannot stream-copy: raw PCM has no frame
+    headers for `ffmpeg -f concat` to demux, but it is exactly what it says —
+    contiguous signed-16-bit samples — so plain byte concatenation is already
+    a correct join, and a single `ffmpeg` encode turns the joined stream into
+    the mp3 this pipeline stores and uploads everywhere else.
+    """
+    joined = b"".join(chunks)
+    with tempfile.TemporaryDirectory(prefix="signalforge-tts-") as tmpdir:
+        tmp = Path(tmpdir)
+        pcm_path = tmp / "episode.pcm"
+        pcm_path.write_bytes(joined)
+        output_path = tmp / "episode.mp3"
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "s16le",
+                    "-ar",
+                    str(_PCM_SAMPLE_RATE_HZ),
+                    "-ac",
+                    "1",
+                    "-i",
+                    str(pcm_path),
+                    "-codec:a",
+                    "libmp3lame",
+                    "-q:a",
+                    "4",
+                    str(output_path),
+                ],
+                cwd=tmp,
+                capture_output=True,
+                check=True,
+                timeout=120,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise SynthesisError(
+                f"ffmpeg pcm encode failed (exit {exc.returncode}): {exc.stderr[-500:]!r}"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise SynthesisError("ffmpeg pcm encode timed out") from exc
+        return output_path.read_bytes()
+
+
 def synthesize_episode(
     turns: Sequence[ScriptTurn],
     *,
@@ -446,13 +522,19 @@ def synthesize_episode(
     if total_chars == 0:
         raise SynthesisError("episode has no dialogue to synthesize")
 
+    response_format = "pcm" if config.tts_model in _PCM_MODELS else "mp3"
     audio_chunks: list[bytes] = []
     characters_sent = 0
     with httpx.Client(timeout=_TIMEOUT_SECONDS) as client:
         for chunk in chunks:
             try:
                 audio = _synthesize_chunk(
-                    client, chunk=chunk, model=config.tts_model, api_key=api_key, sleep=sleep
+                    client,
+                    chunk=chunk,
+                    model=config.tts_model,
+                    response_format=response_format,
+                    api_key=api_key,
+                    sleep=sleep,
                 )
             except SynthesisError as exc:
                 # `characters_sent` here is only ever the chunks that
@@ -468,7 +550,7 @@ def synthesize_episode(
         extra={"chunks": len(chunks), "characters": characters_sent, "model": config.tts_model},
     )
     try:
-        audio = _concat_mp3(audio_chunks)
+        audio = _concat_pcm(audio_chunks) if response_format == "pcm" else _concat_mp3(audio_chunks)
     except SynthesisError as exc:
         # Every chunk was already billed by this point — a concat failure
         # must not lose that spend either.
