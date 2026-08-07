@@ -46,7 +46,7 @@ Cited three times this month by items you marked useful.
 - [ ] approve <!-- sf:proposal=2 v=approve -->
 - [ ] reject <!-- sf:proposal=2 v=reject -->
 
-### add arXiv keyword: interpretability *(staged — no ingestor reads this block yet)*
+### add arXiv keyword: interpretability
 
 Three of your kept items this month were interpretability papers.
 

@@ -14,8 +14,11 @@ deterministic rendering of `interests.yaml` — sorted, no timestamps or run
 IDs (NEVER rule 10) — so the same config always renders to the same bytes and
 every batch request across every day can share one cache entry.
 
-No taxonomy.yaml section: `taxonomy.yaml` doesn't exist yet (DESIGN §10 is
-Phase 1; CLAUDE.md NEVER rule 15 — don't build ahead of the phase gate).
+No taxonomy.yaml section: `taxonomy.yaml` exists and validates (2026-08-07)
+but is not yet read by any tagger (DESIGN §10 is Phase 1; CLAUDE.md NEVER rule
+15 — don't build ahead of the phase gate). Adding it to this prefix later is a
+prompt change and requires bumping `RUBRIC_VERSION`, same as any other edit
+here — do not add the section without also bumping it.
 """
 
 from __future__ import annotations

@@ -323,13 +323,18 @@ def test_shipped_interests_yaml_validates() -> None:
     assert interests.architecture_philosophy
 
 
-def test_shipped_config_builds_every_phase0_ingestor(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_shipped_config_builds_every_ingestor(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     config = load_sources(CONFIG_DIR)
 
     ingestors = build_ingestors(config)
 
-    # one per feed + one per release repo + one HN
-    expected = len(config.rss) + len(config.github.releases if config.github else []) + 1
+    # one per feed + one per release repo + one HN + one arXiv
+    expected = (
+        len(config.rss)
+        + len(config.github.releases if config.github else [])
+        + 1
+        + (1 if config.arxiv and config.arxiv.categories else 0)
+    )
     assert len(ingestors) == expected
     assert len({i.source_id for i in ingestors}) == len(ingestors)

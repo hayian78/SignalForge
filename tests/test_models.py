@@ -350,28 +350,29 @@ def test_proposal_tier_vocabulary() -> None:
     assert {member.value for member in ProposalTier} == {"corpus", "web"}
 
 
-def test_only_arxiv_proposal_kinds_are_staged() -> None:
+def test_no_proposal_kinds_are_staged() -> None:
     """`is_staged` must name exactly the kinds whose block has no ingestor.
 
-    This is a phase fact, not a preference: `arxiv` is modeled in `sources.yaml`
-    but wired to nothing (NEVER rule 15), so applying an arXiv keyword changes a
-    file and no behaviour. Asserting it against the *actual* ingestor registry
-    means the day an arXiv ingestor lands, this test fails and points at the
-    `(staged)` label that would otherwise quietly lie in every digest.
+    This is a phase fact, not a preference. It used to assert `{"arxiv"}` — the
+    `arxiv` block was modeled in `sources.yaml` but wired to nothing (NEVER rule
+    15), so applying an arXiv keyword changed a file and no behaviour. That
+    ingestor shipped 2026-08-07 (`ingest/arxiv.py`), closing the gap, so nothing
+    is staged today — asserted directly against the *actual* ingestor registry
+    rather than a hardcoded set, so the day a future block (e.g. awesome-list
+    diffing) ships ahead of its ingestor, *that* addition is what makes this
+    fail, pointing at the `(staged)` label that must be added to
+    `ProposalKind.is_staged` to keep the digest honest.
     """
+    ingest_package = Path(signalforge.ingest.__file__).parent
+    wired = {path.stem for path in ingest_package.glob("*.py")}
+
     staged_blocks = {
         member.value.split("_", 1)[1].removesuffix("_keyword").removesuffix("_repo")
         for member in ProposalKind
         if member.is_staged
     }
-    assert staged_blocks == {"arxiv"}
-
-    ingest_package = Path(signalforge.ingest.__file__).parent
-    wired = {path.stem for path in ingest_package.glob("*.py")}
-    assert "arxiv" not in wired, (
-        "an arXiv ingestor now exists — arXiv proposals are no longer staged, "
-        "so ProposalKind.is_staged and the digest's (staged) label must be updated"
-    )
+    assert not staged_blocks
+    assert "arxiv" in wired
 
 
 def test_item_content_defaults_to_none() -> None:

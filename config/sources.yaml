@@ -124,12 +124,10 @@ github:
     - e2b-dev/awesome-ai-agents
     - punkpeye/awesome-mcp-servers
 
-# Phase 1 — modeled and configured now, ingested when the phase gate opens.
-# This block is staging only: `arxiv` isn't wired into any ingestor yet, so
-# editing `require_keywords` today has zero effect on a running pipeline
-# (NEVER rule 15) — it's here so the phase-gate flip is a config no-op.
-# Updated 2026-07-24 for the executive-briefing rebalance: research-agenda
-# keywords over low-level inference/fine-tuning terms.
+# Live (2026-08-07): `ingest/arxiv.py` folds `categories` + `require_keywords`
+# into one arXiv API query per run — editing either now has effect on the next
+# `signalforge ingest`. Updated 2026-07-24 for the executive-briefing
+# rebalance: research-agenda keywords over low-level inference/fine-tuning terms.
 arxiv:
   categories: [cs.AI, cs.CL, cs.LG, cs.SE]
   require_keywords:

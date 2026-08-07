@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/" xmlns:arxiv="http://arxiv.org/schemas/atom">
+  <link href="https://export.arxiv.org/api/query?search_query=%28cat%3Acs.AI%29&amp;start=0&amp;max_results=50" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: search_query=(cat:cs.AI) AND (abs:agents OR abs:%22tool use%22)</title>
+  <id>http://arxiv.org/api/aXiFakeQueryId123</id>
+  <updated>2026-07-16T00:00:00-04:00</updated>
+  <opensearch:totalResults>4</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <opensearch:itemsPerPage>50</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/abs/2507.12345v1</id>
+    <updated>2026-07-15T17:32:11Z</updated>
+    <published>2026-07-15T17:32:11Z</published>
+    <title>Planning with Long-Horizon Memory in
+Tool-Using Agents</title>
+    <summary>  We study how coding agents retain and reuse
+context across long multi-step tool-use episodes, and show that an
+explicit episodic memory outperforms naive context concatenation on
+a suite of agentic planning benchmarks.
+</summary>
+    <author><name>Jane Q. Researcher</name></author>
+    <author><name>Alex Chen</name></author>
+    <arxiv:comment>10 pages, 4 figures</arxiv:comment>
+    <link href="http://arxiv.org/abs/2507.12345v1" rel="alternate" type="text/html"/>
+    <link title="pdf" href="http://arxiv.org/pdf/2507.12345v1" rel="related" type="application/pdf"/>
+    <arxiv:primary_category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+    <category term="cs.LG" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2507.12345v1</id>
+    <updated>2026-07-15T17:32:11Z</updated>
+    <published>2026-07-15T17:32:11Z</published>
+    <title>Planning with Long-Horizon Memory in Tool-Using Agents (duplicate)</title>
+    <summary>Duplicate entry to exercise in-response dedup.</summary>
+    <author><name>Jane Q. Researcher</name></author>
+    <link href="http://arxiv.org/abs/2507.12345v1" rel="alternate" type="text/html"/>
+    <category term="cs.AI" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2506.09999v2</id>
+    <updated>2026-06-20T09:00:00Z</updated>
+    <published>2026-06-18T08:15:00Z</published>
+    <title>A Survey of Evaluation Protocols for Autonomous Coding Agents</title>
+    <summary>A broad survey covering benchmark design, contamination risks,
+and reproducibility issues across 40 recent coding-agent evaluation suites.</summary>
+    <author><name>Priya Natarajan</name></author>
+    <author><name>Sam Okafor</name></author>
+    <author><name>Lin Wei</name></author>
+    <link href="http://arxiv.org/abs/2506.09999v2" rel="alternate" type="text/html"/>
+    <category term="cs.SE" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+  <entry>
+    <id>http://arxiv.org/abs/2507.00042v1</id>
+    <updated>2026-07-01T12:00:00Z</updated>
+    <published>2026-07-01T12:00:00Z</published>
+    <title></title>
+    <summary>An entry with no title, which a publisher-side bug can produce; must be skipped without affecting the rest of the response.</summary>
+    <author><name>No Body</name></author>
+    <link href="http://arxiv.org/abs/2507.00042v1" rel="alternate" type="text/html"/>
+    <category term="cs.CL" scheme="http://arxiv.org/schemas/atom"/>
+  </entry>
+</feed>

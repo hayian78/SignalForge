@@ -41,7 +41,7 @@ __all__ = [
     "build_scout_user_prompt",
 ]
 
-SCOUT_PROMPT_VERSION: Final = "scout-v1"
+SCOUT_PROMPT_VERSION: Final = "scout-v2"
 """Bumped whenever this prompt's wording changes materially.
 
 Recorded into each proposal's `payload` rather than a column of its own, so a
@@ -51,6 +51,27 @@ other across months and must be comparable, whereas every proposal is read once
 by a human who then approves or rejects it."""
 
 _STAGED_KINDS: Final = tuple(kind.value for kind in ProposalKind if kind.is_staged)
+
+
+def _staged_rule() -> str:
+    """Rule 8, or nothing when no `ProposalKind` is currently staged.
+
+    Every kind maps to a wired ingestor as of `ingest/arxiv.py` (2026-08-07), so
+    this renders empty today. Kept rather than hardcoded to a fixed rule count so
+    a future block modeled ahead of its ingestor (NEVER rule 15 — `awesome_lists`
+    is the likely next one) can be added to `ProposalKind.is_staged` without a
+    second edit here. An unconditional f-string interpolation of an empty
+    `_STAGED_KINDS` previously rendered "Proposals of kind  are staged only" —
+    a malformed instruction in the one prompt CLAUDE.md §6 calls the most
+    expensive call in the pipeline.
+    """
+    if not _STAGED_KINDS:
+        return ""
+    return (
+        f"8. Proposals of kind {', '.join(_STAGED_KINDS)} are staged only — the "
+        "operator's pipeline does not read that block yet, so propose them "
+        "sparingly if at all.\n"
+    )
 
 
 def build_scout_system_prompt(interests: InterestsConfig) -> str:
@@ -120,9 +141,7 @@ errors. Your contribution is judgment the numbers cannot supply:
    Most additions should carry no weight at all. The operator sees the number you
    pick and will change it if they disagree, so an honest 1.0 is more useful than an
    optimistic 1.4.
-8. Proposals of kind {", ".join(_STAGED_KINDS)} are staged only — the operator's
-   pipeline does not read that block yet, so propose them sparingly if at all.
-
+{_staged_rule()}
 When you have finished searching, call the `{SCOUT_PROPOSE_TOOL_NAME}` tool
 exactly once with your proposals. Call it with an empty list if the evidence does
 not support any change this week.

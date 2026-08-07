@@ -1,0 +1,45 @@
+# The topic tree for the deterministic first-pass tagger (DESIGN §10).
+#
+# Two levels deep: a group (e.g. `industry`) contains leaves (e.g. `strategy`),
+# each carrying the lowercase keywords a match is decided on. Not yet read by
+# any runtime path — validated by `TaxonomyConfig` in src/signalforge/config.py,
+# same staging posture `arxiv:` in sources.yaml carried before `ingest/arxiv.py`
+# shipped (NEVER rule 15). Editing this file has no effect on a running pipeline
+# until the keyword tagger (`score/taxonomy.py`) lands — which also needs a new
+# DB table (DESIGN §5 has no `item_topics` yet) that does not exist.
+#
+# Deliberately minimal for now: exactly the six `group.leaf` pairs
+# `interests.yaml`'s `priority_topics` already names (that file's own comment
+# points here, and a shipped-config test enforces the two stay in sync). Every
+# keyword below is traceable to operator-authored config — nothing invented.
+# Sibling leaves (e.g. a second leaf under `agents` for tool use, or a
+# `models`/`engineering` group) are a real gap, but choosing what belongs in
+# an operator's own relevance vocabulary is an editorial call for the operator
+# to make, not one for an assistant to invent wholesale — the same reason
+# `curate/`'s scout proposals require a human tick before they land (§7.1)
+# rather than writing straight to `sources.yaml`. Add leaves the same way you'd
+# add a `priority_topics` entry: here, plus there.
+
+industry:
+  strategy:
+    keywords: [market strategy, competitive positioning, business model, go-to-market]
+
+frontier:
+  capabilities:
+    keywords: [frontier model, state of the art, benchmark record, capability jump]
+
+enterprise:
+  adoption:
+    keywords: [enterprise adoption, rollout, deployment at scale, procurement, pilot program]
+
+agents:
+  autonomy:
+    keywords: [autonomous agent, agentic, agent autonomy, self-directed, long-horizon task]
+
+policy:
+  regulation:
+    keywords: [regulation, ai act, executive order, export control]
+
+ai:
+  research-direction:
+    keywords: [research direction, research agenda, roadmap, position paper]

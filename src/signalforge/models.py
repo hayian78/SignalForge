@@ -78,12 +78,13 @@ class ProposalKind(StrEnum):
     def is_staged(self) -> bool:
         """True when applying this kind has no runtime effect yet.
 
-        The `arxiv` block in `sources.yaml` is modeled and configured but not
-        wired to any ingestor until the Phase 1 gate opens (NEVER rule 15), so an
-        applied arXiv keyword changes a file and nothing else. The digest tags
-        these `(staged)` rather than implying an effect they don't have.
+        Every kind currently maps to a block some ingestor reads (`ingest/arxiv.py`
+        shipped 2026-08-07, closing the last gap), so this is always False today.
+        The mechanism stays: a future block modeled ahead of its ingestor (NEVER
+        rule 15) tags its proposals `(staged)` in the digest by listing its kinds
+        here, rather than implying an effect they don't have.
         """
-        return self in (ProposalKind.ADD_ARXIV_KEYWORD, ProposalKind.REMOVE_ARXIV_KEYWORD)
+        return False
 
 
 _ACTION_LABELS: Final[dict[ProposalKind, str]] = {

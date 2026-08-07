@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom" xmlns:opensearch="http://a9.com/-/spec/opensearch/1.1/">
+  <link href="https://export.arxiv.org/api/query?search_query=nonsense%3A&amp;start=0&amp;max_results=50" rel="self" type="application/atom+xml"/>
+  <title type="html">ArXiv Query: search_query=nonsense:</title>
+  <id>http://arxiv.org/api/aXiFakeErrId456</id>
+  <updated>2026-07-16T00:00:00-04:00</updated>
+  <opensearch:totalResults>1</opensearch:totalResults>
+  <opensearch:startIndex>0</opensearch:startIndex>
+  <opensearch:itemsPerPage>50</opensearch:itemsPerPage>
+  <entry>
+    <id>http://arxiv.org/api/errors#incorrect_id_format_for_nonsense</id>
+    <title>Error</title>
+    <summary>incorrect id format for nonsense</summary>
+    <updated>2026-07-16T00:00:00-04:00</updated>
+    <link href="http://arxiv.org/api/errors#incorrect_id_format_for_nonsense" rel="alternate" type="text/html"/>
+  </entry>
+</feed>

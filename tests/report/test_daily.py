@@ -1017,8 +1017,9 @@ def test_a_settled_proposal_drops_out_after_its_display_window(
     assert "Proposed source changes" not in beyond
 
 
-def test_an_arxiv_proposal_is_tagged_staged(conn: sqlite3.Connection) -> None:
-    """Applying it changes a file and nothing else until the phase gate opens."""
+def test_an_arxiv_proposal_is_no_longer_tagged_staged(conn: sqlite3.Connection) -> None:
+    """`ingest/arxiv.py` shipped 2026-08-07: applying this now has a real effect,
+    so the digest must not claim otherwise (see `ProposalKind.is_staged`)."""
     _add_proposal(
         conn,
         kind=ProposalKind.ADD_ARXIV_KEYWORD,
@@ -1028,7 +1029,7 @@ def test_an_arxiv_proposal_is_tagged_staged(conn: sqlite3.Connection) -> None:
 
     rendered = render_digest(_proposal_context(conn))
 
-    assert "staged" in rendered
+    assert "staged" not in rendered
 
 
 def test_a_suggested_weight_is_shown_with_how_to_override_it(
