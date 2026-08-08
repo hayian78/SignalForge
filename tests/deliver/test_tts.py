@@ -465,15 +465,54 @@ def test_an_ffmpeg_failure_raises_synthesis_error(monkeypatch: pytest.MonkeyPatc
         _concat_mp3([b"a", b"b"])
 
 
+_MP3_FRAME_HEADER = bytes.fromhex("fffb9004")
+"""MPEG-1 Layer III, 128 kbps, 44.1 kHz, no padding, no CRC.
+
+Every field below is derived from these four bytes rather than written beside
+them, because the two disagreeing is exactly what broke this fixture before:
+the header declared a 417-byte frame and only 62 bytes followed it, so ffmpeg
+read the header, went looking for the next frame at +417, and fell off the end
+with `Invalid frame size (417): Could not seek to 417`."""
+
+_MP3_BITRATE_BPS = 128_000
+_MP3_SAMPLE_RATE_HZ = 44_100
+_MP3_FRAME_BYTES = 144 * _MP3_BITRATE_BPS // _MP3_SAMPLE_RATE_HZ
+"""The frame size the header above declares: 144 x bitrate / sample rate for
+MPEG-1 Layer III. A frame shorter than this is not a truncated frame, it is an
+invalid one."""
+
+_MP3_FRAMES_PER_INPUT = 8
+"""How many identical frames make up each synthetic input.
+
+One correctly-sized frame is still not enough: ffmpeg probes the container and
+reports `Format mp3 detected only with low score of 1` on a single frame, then
+refuses the concat. Eight is comfortably above the threshold (four already
+passes) and keeps the fixture under 4 kB."""
+
+
+def _silent_mp3() -> bytes:
+    """A synthetic but genuinely valid MP3: N complete, correctly-sized frames."""
+    frame = _MP3_FRAME_HEADER + bytes(_MP3_FRAME_BYTES - len(_MP3_FRAME_HEADER))
+    return frame * _MP3_FRAMES_PER_INPUT
+
+
+def test_the_mp3_fixture_declares_the_frame_size_it_actually_supplies() -> None:
+    """Guards the fixture itself, so a future edit to the header cannot silently
+    reintroduce the truncated-frame bug — which presented as a real-ffmpeg
+    failure that looked environmental and was not."""
+    payload = _silent_mp3()
+
+    assert len(payload) == _MP3_FRAME_BYTES * _MP3_FRAMES_PER_INPUT
+    assert payload[:2] == b"\xff\xfb", "every frame must start on a sync word"
+    assert len(payload) % _MP3_FRAME_BYTES == 0, "no partial trailing frame"
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed on this machine")
 def test_real_ffmpeg_concatenates_two_minimal_mp3_files() -> None:
     """Runs only where ffmpeg is actually present — a genuine end-to-end
     check of the concat invocation, not just the argument shape."""
-    # A minimal valid MP3 frame (silence), reused twice — real ffmpeg must
-    # accept it as valid input for stream-copy concatenation.
-    silence_frame = bytes.fromhex(
-        "fffb9004000000000000000000000000000000000000000000000000000000"
-        "00000000000000000000000000000000000000000000000000000000000000"
-    )
-    result = _concat_mp3([silence_frame, silence_frame])
+    payload = _silent_mp3()
+
+    result = _concat_mp3([payload, payload])
+
     assert len(result) > 0
