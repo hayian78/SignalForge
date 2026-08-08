@@ -13,6 +13,7 @@ unchanged.
 from __future__ import annotations
 
 import sqlite3
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -20,6 +21,7 @@ import pytest
 from signalforge.db import get_feedback, upsert_item
 from signalforge.feedback import (
     CHECKBOX_VERDICTS,
+    HARVEST_DIRS,
     LADDER,
     VERDICTS,
     HarvestResult,
@@ -29,7 +31,9 @@ from signalforge.feedback import (
     highest_rung,
     parse_marks,
 )
-from signalforge.report.daily import build_digest_context, render_digest
+from signalforge.report.daily import build_digest_context, digest_path, render_digest
+from signalforge.report.podcast import script_path
+from signalforge.report.weekly import brief_path
 from tests.conftest import make_item
 
 TARGET_DATE_STR = "2026-07-16"
@@ -311,3 +315,160 @@ def test_highest_rung_covers_every_ladder_rung() -> None:
     thought for how it aggregates — a new rung lands here first."""
     assert highest_rung(LADDER) == LADDER[-1]
     assert set(LADDER) <= set(VERDICTS)
+
+
+# --------------------------------------------------------------------------- #
+# the weekly brief's marks (DESIGN §11 — the acceptance gate's sensor)
+# --------------------------------------------------------------------------- #
+
+
+def _write_weekly(vault_dir: Path, name: str, text: str) -> Path:
+    weekly = vault_dir / "weekly"
+    weekly.mkdir(parents=True, exist_ok=True)
+    path = weekly / f"{name}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_harvest_reads_the_weekly_directory_too(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """Phase 1's gate is "≥80% of brief items rated useful or better". Those marks
+    are ticked on the brief, so without this the gate has no sensor at all."""
+    vault = tmp_path / "vault"
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _write_weekly(vault, "2026-08-09", f"- [x] useful <!-- sf:item={item_id} v=useful -->\n")
+
+    result = harvest_marks(conn, vault)
+
+    assert result == HarvestResult(files_scanned=1, marks_found=1, rows_recorded=1)
+
+
+def test_harvest_scans_both_directories_in_one_pass(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """One pass, not two commands: `digest` and `podcast` both call this, and
+    either may be the first to see a brief the operator ticked."""
+    vault = tmp_path / "vault"
+    first, _ = upsert_item(conn, make_item(external_id="a", url="https://example.com/a"))
+    second, _ = upsert_item(conn, make_item(external_id="b", url="https://example.com/b"))
+    _insert_score(conn, first)
+    _insert_score(conn, second)
+    _write_daily(vault, "2026-08-08", f"- [x] useful <!-- sf:item={first} v=useful -->\n")
+    _write_weekly(vault, "2026-08-09", f"- [x] noise <!-- sf:item={second} v=noise -->\n")
+
+    result = harvest_marks(conn, vault)
+
+    assert result == HarvestResult(files_scanned=2, marks_found=2, rows_recorded=2)
+    stored = {
+        (row[0], row[1]) for row in conn.execute("SELECT item_id, verdict FROM feedback").fetchall()
+    }
+    assert stored == {(first, "useful"), (second, "noise")}
+
+
+def test_the_same_mark_in_daily_and_weekly_records_exactly_one_row(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The property the whole change rests on. An item carried by both the digest
+    and the brief is the normal case, not the exception, and ticking it in each
+    place must not double-count it toward the gate."""
+    vault = tmp_path / "vault"
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    marker = f"- [x] useful <!-- sf:item={item_id} v=useful -->\n"
+    _write_daily(vault, "2026-08-08", marker)
+    _write_weekly(vault, "2026-08-09", marker)
+
+    result = harvest_marks(conn, vault)
+
+    assert result.marks_found == 2
+    assert result.rows_recorded == 1
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM feedback WHERE item_id = ? AND verdict = 'useful'",
+            (item_id,),
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_harvest_is_a_no_op_when_the_weekly_directory_does_not_exist(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """`Path.glob` on a missing directory yields nothing rather than raising, so a
+    vault predating the brief keeps working. Asserted explicitly so a future
+    refactor to `os.scandir` cannot quietly break it."""
+    vault = tmp_path / "vault"
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _write_daily(vault, "2026-08-08", f"- [x] useful <!-- sf:item={item_id} v=useful -->\n")
+    assert not (vault / "weekly").exists()
+
+    result = harvest_marks(conn, vault)
+
+    assert result == HarvestResult(files_scanned=1, marks_found=1, rows_recorded=1)
+
+
+def test_the_podcast_directory_is_never_harvested(conn: sqlite3.Connection, tmp_path: Path) -> None:
+    """The episode template renders no checkbox, so `podcast/` is deliberately
+    outside `HARVEST_DIRS`. Pinned because "scan every subdirectory" is the
+    tempting simplification, and it would make the episode an input surface."""
+    vault = tmp_path / "vault"
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    podcast = vault / "podcast"
+    podcast.mkdir(parents=True)
+    (podcast / "2026-08-09.md").write_text(
+        f"- [x] useful <!-- sf:item={item_id} v=useful -->\n", encoding="utf-8"
+    )
+
+    assert harvest_marks(conn, vault) == HarvestResult(
+        files_scanned=0, marks_found=0, rows_recorded=0
+    )
+
+
+def test_the_same_item_marked_differently_in_each_file_records_both(
+    conn: sqlite3.Connection, tmp_path: Path
+) -> None:
+    """The ladder-upgrade path, and the one case a shared timestamp would lose.
+
+    The migration-1 primary key is `(item_id, created_at)`, so two verdicts on one
+    item collide unless each mark gets its own stamp. `harvest_marks` offsets by a
+    single counter that runs across *all* directories; a per-directory counter
+    would look identical in `files_scanned`/`marks_found` and silently drop the
+    second row into the `except` branch.
+
+    This is the expected path, not an edge case: an item marked `useful` on
+    Tuesday's digest and promoted to `exceptional` on Sunday's brief is exactly
+    what "an item's rating is its highest rung" is for, and exactly what Phase 1's
+    "useful **or better**" gate reads.
+    """
+    vault = tmp_path / "vault"
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _write_daily(vault, "2026-08-08", f"- [x] useful <!-- sf:item={item_id} v=useful -->\n")
+    _write_weekly(
+        vault, "2026-08-09", f"- [x] exceptional <!-- sf:item={item_id} v=exceptional -->\n"
+    )
+
+    result = harvest_marks(conn, vault)
+
+    assert result == HarvestResult(files_scanned=2, marks_found=2, rows_recorded=2)
+    rows = conn.execute(
+        "SELECT verdict, created_at FROM feedback WHERE item_id = ? ORDER BY created_at",
+        (item_id,),
+    ).fetchall()
+    assert [row[0] for row in rows] == ["useful", "exceptional"]
+    assert rows[0][1] != rows[1][1], "each mark needs its own stamp or the PK collides"
+    assert highest_rung([row[0] for row in rows]) == "exceptional"
+
+
+def test_every_directory_harvested_is_one_a_report_actually_writes(tmp_path: Path) -> None:
+    """`HARVEST_DIRS` names a vault layout that `report/*.py` owns. Renaming a
+    report's directory would otherwise unplug the harvest silently — every test
+    green, and the acceptance gate quietly without a sensor."""
+    target = date(2026, 8, 9)
+    assert digest_path(tmp_path, target_date=target).parent.name in HARVEST_DIRS
+    assert brief_path(tmp_path, target_sunday=target).parent.name in HARVEST_DIRS
+    assert script_path(tmp_path, date=target).parent.name not in HARVEST_DIRS, (
+        "an episode is a delivery channel, never an input surface (DESIGN §13.2)"
+    )

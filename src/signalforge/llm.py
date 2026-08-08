@@ -65,6 +65,16 @@ __all__ = [
     "TRIAGE_MAX_TOKENS",
     "TRIAGE_MODEL",
     "WEB_SEARCH_USD_PER_REQUEST",
+    "WEEKLY_EFFORT",
+    "WEEKLY_MAX_ITEMS",
+    "WEEKLY_MAX_ITEM_REASONING_BYTES",
+    "WEEKLY_MAX_ITEM_SUMMARY_BYTES",
+    "WEEKLY_MAX_ITEM_TITLE_BYTES",
+    "WEEKLY_MAX_CLUSTERS",
+    "WEEKLY_MAX_LEADS",
+    "WEEKLY_MAX_TOKENS",
+    "WEEKLY_MODEL",
+    "WEEKLY_MONTHLY_CEILING_USD",
     "LlmError",
     "PodcastScript",
     "PodcastScriptResult",
@@ -75,10 +85,15 @@ __all__ = [
     "ScoutResult",
     "TriageBatchResult",
     "TriageResult",
+    "WeeklyBrief",
+    "WeeklyBriefResult",
+    "WeeklyCluster",
+    "WeeklyLead",
     "get_anthropic_client",
     "run_podcast_script",
     "run_source_scout",
     "run_triage_batch",
+    "run_weekly_brief",
 ]
 
 logger = logging.getLogger(__name__)
@@ -1476,6 +1491,387 @@ def run_podcast_script(
     )
     return PodcastScriptResult(
         script=script,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        dropped_item_count=dropped,
+        sent_item_ids=sent_ids,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Weekly Intelligence Brief (DESIGN §13, Phase 1)
+#
+# Phase 1's product and its acceptance gate. One Opus request per week, over
+# titles, summaries and the stored triage reasoning of the week's top-N items —
+# never `items.content`, which is what keeps this the cheapest of the three
+# Opus consumers despite the highest effort setting.
+# --------------------------------------------------------------------------- #
+
+WEEKLY_MODEL: Final = "claude-opus-5"
+"""Synthesis model for the weekly brief.
+
+The same string as `SCOUT_MODEL`/`PODCAST_MODEL`, deliberately. DESIGN §8's table
+still names `claude-opus-4-8` for this row; the two price identically and the repo
+standardised on `claude-opus-5` when the scout shipped, so introducing a third
+Opus id would fragment the prompt cache and the docs for nothing. The drift is
+recorded in DESIGN rather than perpetuated here."""
+
+WEEKLY_EFFORT: Final = "high"
+"""Reasoning effort, chosen on cadence — the same argument `PODCAST_EFFORT`
+records in reverse.
+
+That constant justifies "medium" purely by frequency: a daily call pays for its
+effort thirty times a month where a weekly one pays five. The brief is the weekly
+case, so `SCOUT_EFFORT`'s "high" is the applicable precedent, and effort adds
+nothing to the worst case because `WEEKLY_MAX_TOKENS` is what bounds the bill.
+Operator decision, 2026-08-08: this is the product's centrepiece and worth
+thinking hard about, with `WEEKLY_MAX_TOKENS` sized accordingly."""
+
+WEEKLY_MAX_TOKENS: Final = 12_288
+"""Output ceiling — sized for the *thinking*, not for the JSON.
+
+Nothing in this module passes `thinking`, so adaptive thinking is on by default
+and bills as output **and** counts against this number. Measured in this repo:
+the scout at `effort: high` consumes 78% of its budget; the podcast at `medium`
+consumes 43%. At 78% of 12,288 that leaves ~2,700 tokens for a structured output
+sized at ~1,400 — comfortable. The 8,192 this was first specced at would have
+left roughly 400 tokens of margin, and a truncated brief is a fully-billed call
+that produces nothing."""
+
+WEEKLY_MAX_ITEMS: Final = 24
+"""Hard ceiling on items per call, which config can only lower.
+
+`thresholds.weekly_top_n` is `ge=1` with no upper bound, so without this clamp a
+one-line YAML edit would move real spend with every test green — the exact
+failure `SCOUT_MAX_SEARCHES_CEILING` exists to prevent. Twice the shipped
+`weekly_top_n: 12`, and affordable at 24 only because no `content` field is sent:
+per-item worst-case bytes here are roughly a sixth of the podcast's."""
+
+WEEKLY_MAX_ITEM_TITLE_BYTES: Final = 300
+"""Mirrors `PODCAST_MAX_ITEM_TITLE_BYTES`. `Item.title` is flattened but not
+length-bounded upstream."""
+
+WEEKLY_MAX_ITEM_SUMMARY_BYTES: Final = 500
+"""Mirrors `PODCAST_MAX_ITEM_SUMMARY_BYTES`, and it is the binding cap here.
+Measured over a real week: the longest stored summary was ~4,000 bytes, eight
+times this. The ceiling below is only true because this one actually clamps."""
+
+WEEKLY_MAX_ITEM_REASONING_BYTES: Final = 600
+"""Cap on `scores.reasoning`, which has no analogue in the podcast payload.
+
+Unbounded model-authored prose: the rubric asks for one sentence, and nothing
+enforces that. `report/daily.py`'s 320-character trim is a *display* bound on a
+different surface and does not travel with the stored value."""
+
+WEEKLY_MONTHLY_CEILING_USD: Final = 3.50
+"""Hard worst-case ceiling on weekly-brief spend, enforced by a test.
+
+A bound derived from what the code permits, never from what cron is expected to
+do (DESIGN §8: "an estimate that assumes good behaviour is a forecast, not a
+bound"). The arithmetic is deliberately not written out here — see
+`SCOUT_MONTHLY_CEILING_USD` for why numbers copied into prose drift — but the
+terms the test reads are: every field at its byte cap, `WEEKLY_MAX_ITEMS` items,
+`WEEKLY_MAX_TOKENS` of output, a pessimistic bytes-per-token ratio, and **five**
+calls a month rather than 4.33, because a month can contain five Sundays.
+
+The margin is wider than the podcast's on purpose: that ceiling's own history
+records a 340-byte prefix addition eating a third of its headroom, and this
+prefix has its lead/cluster format and citation discipline still to grow.
+
+**One term this bound deliberately omits**, shared by all four of the pipeline's
+enforced ceilings: `get_anthropic_client` leaves the SDK's default
+`max_retries=2`, so a request that times out *after* the model has generated can
+bill up to three times before raising. Setting it to zero would trade a rare
+double-bill for a lost run on every transient network blip across triage,
+scout and podcast alike, which is the worse deal at this cadence. Recorded here
+rather than silently excluded; if a real run ever shows it firing, the honest fix
+is a 3x term in this bound, not a quieter docstring."""
+
+_WEEKLY_OUTPUT_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "properties": {
+        "leads": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "headline": {"type": "string"},
+                    "why_it_matters": {"type": "string"},
+                    "item_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["headline", "why_it_matters", "item_ids"],
+                "additionalProperties": False,
+            },
+        },
+        "clusters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "narrative": {"type": "string"},
+                    "item_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["title", "narrative", "item_ids"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["leads", "clusters"],
+    "additionalProperties": False,
+}
+"""Structured-output schema for the request.
+
+**Carries no `minItems`/`maxItems`** — the API rejects both outright for array
+types (`400 invalid_request_error: For 'array' type, property 'maxItems' is not
+supported`), which a first live call found. So every count bound lives in code:
+the prompt asks for the shape, `WEEKLY_MAX_LEADS`/`WEEKLY_MAX_CLUSTERS` clamp
+what comes back, and `WEEKLY_MAX_TOKENS` is what actually bounds the dollars.
+
+Loose in the same places for the same reason (non-empty strings, non-empty
+`item_ids`): `WeeklyLead`/`WeeklyCluster`/`WeeklyBrief` re-validate those, so a
+violation becomes a recorded parse error rather than a crash or silently accepted
+content."""
+
+WEEKLY_MAX_LEADS: Final = 3
+"""How many "things that mattered" a brief may carry.
+
+Clamped after the response rather than constrained in the schema, because the API
+rejects array bounds — and clamping is the better failure mode anyway: rejecting a
+whole paid response over a fourth lead throws away a good brief and, worse,
+invites the next invocation to re-bill for it."""
+
+WEEKLY_MAX_CLUSTERS: Final = 6
+"""How many themes a brief may carry. Not a dollar bound — `WEEKLY_MAX_TOKENS` is
+— but the thing that keeps a brief readable, and the counterpart to the prompt's
+own instruction."""
+
+
+class WeeklyLead(BaseModel):
+    """One of "the 3 things that mattered" (DESIGN §13's lead block).
+
+    `item_ids` is the citation surface NEVER rule 7 requires: the model cites
+    ids, never URLs, and never prose it invented a source for. Validation of
+    those ids against the set actually sent is `synth.weekly`'s job; resolving
+    an id to a link is `report/weekly.py`'s. This module never sees a URL.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    headline: str = Field(min_length=1)
+    why_it_matters: str = Field(min_length=1)
+    item_ids: list[int] = Field(min_length=1)
+
+
+class WeeklyCluster(BaseModel):
+    """A themed group of the week's items, with the narrative tying them together.
+
+    Grouping *and* narrating are both done by the model here, which is a
+    deliberate, temporary exception to the deterministic-vs-LLM split (DESIGN
+    §8 puts "clustering math" in the deterministic column and only "cluster
+    labeling and cross-source synthesis" in the LLM one). The deterministic
+    input that split assumes — embeddings and distance-based clustering — is
+    Phase 2 work and does not exist yet. When it lands, the grouping moves to
+    it and only the narration stays here.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1)
+    narrative: str = Field(min_length=1)
+    item_ids: list[int] = Field(min_length=1)
+
+
+class WeeklyBrief(BaseModel):
+    """The whole brief, as the model returned it — ids unvalidated, text unflattened.
+
+    Neither list is bounded here. "The 3 things that mattered" is a headline, not
+    a schema constraint — a hard floor on a thin week is an instruction to
+    manufacture a third thing that did not matter — and the ceiling cannot live
+    on this model either, because rejecting a whole paid response over one extra
+    block is a worse outcome than clamping it. `synth.weekly` clamps to
+    `WEEKLY_MAX_LEADS`/`WEEKLY_MAX_CLUSTERS` instead.
+
+    Neither list is required to survive cleaning, so both tolerate being
+    emptied: `synth.weekly` builds intermediate values of this model while
+    dropping blocks with unknown citations, and a brief left with nothing is a
+    decision `build_brief` makes explicitly rather than a `ValidationError`
+    raised mid-clean. The same reasoning `PodcastScript.segments` records.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    leads: list[WeeklyLead] = Field(default_factory=list)
+    clusters: list[WeeklyCluster] = Field(default_factory=list)
+
+
+@dataclass(slots=True)
+class WeeklyBriefResult:
+    """What one `run_weekly_brief` call produced, and what it spent.
+
+    Same shape and reasoning as `PodcastScriptResult`: usage is recorded whenever
+    a response actually came back, including one whose content fails to parse —
+    output tokens are billed for a malformed response too (NEVER rule 11) — so
+    `error` and `brief` never both carry information; exactly one is meaningful.
+
+    `sent_item_ids` is the "what the model could legitimately cite" set, narrower
+    than the caller's input list whenever `WEEKLY_MAX_ITEMS` clamped. Callers must
+    validate cited ids against *this*, not their own input, or a clamped-away item
+    reads as a legitimate citation.
+    """
+
+    brief: WeeklyBrief | None = None
+    error: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    dropped_item_count: int = 0
+    sent_item_ids: tuple[int, ...] = ()
+
+
+def _build_weekly_user_prompt(
+    *,
+    window_label: str,
+    items: Sequence[tuple[int, str, str | None, str]],
+) -> tuple[str, int, tuple[int, ...]]:
+    """The user turn: the window's label and the week's items as JSON.
+
+    Built here rather than accepted pre-rendered, for the reason
+    `_build_podcast_user_prompt` records: `WEEKLY_MAX_ITEMS` and the per-field
+    byte ceilings are *money* limits this module owns, and they have to clamp
+    structured items before they become prompt text rather than after.
+
+    All three text fields are capped. `summary` is the one that actually binds in
+    practice (a real week's longest ran eight times its cap), but a worst case
+    that bounds one field of three is not a worst case.
+
+    Returns `(prompt_text, dropped_item_count, sent_item_ids)`.
+    """
+    clamped = list(items[:WEEKLY_MAX_ITEMS])
+    dropped = len(items) - len(clamped)
+    payload = [
+        {
+            "item_id": item_id,
+            "title": _truncate_utf8_json_safe(title, WEEKLY_MAX_ITEM_TITLE_BYTES),
+            "summary": _truncate_utf8_json_safe(summary or "", WEEKLY_MAX_ITEM_SUMMARY_BYTES),
+            "why_it_was_kept": _truncate_utf8_json_safe(reasoning, WEEKLY_MAX_ITEM_REASONING_BYTES),
+        }
+        for item_id, title, summary, reasoning in clamped
+    ]
+    text = (
+        f"These are the items that cleared the bar for the week of {window_label}. "
+        "Write the brief from them, citing item_id(s) exactly as given below and "
+        "never an id not listed here:\n" + json.dumps(payload, sort_keys=True, ensure_ascii=False)
+        # `ensure_ascii=False` must match what `_truncate_utf8_json_safe` measures
+        # against; the default True re-encodes every non-ASCII character in an
+        # already-capped field as a 6-character escape, silently re-opening the
+        # gap that function closes.
+    )
+    sent_ids = tuple(item_id for item_id, _, _, _ in clamped)
+    return text, dropped, sent_ids
+
+
+def run_weekly_brief(
+    stable_system_prefix: str,
+    *,
+    window_label: str,
+    items: Sequence[tuple[int, str, str | None, str]],
+    client: anthropic.Anthropic | None = None,
+    model: str = WEEKLY_MODEL,
+) -> WeeklyBriefResult:
+    """Write one weekly brief from `items`. Titles, summaries and stored triage
+    reasoning only — never `items.content` (DESIGN §8).
+
+    Each item is `(item_id, title, summary, reasoning)`, deliberately a tuple and
+    not an `Item`: several of these rows *do* carry deep-read `content` from the
+    podcast path, and an `Item` seam would let it ride along into the prompt
+    unnoticed, multiplying the bill for material the brief was never priced for.
+
+    **No `cache_control` breakpoint**, unlike the podcast's daily call. One
+    request per run, seven days apart, no retry, so an ephemeral cache entry can
+    never be read before it expires — a breakpoint would be pure write premium.
+    This is the scout's recorded reasoning at the identical cadence (DESIGN §8),
+    and the prefix is below Opus's cacheable minimum anyway, which would make the
+    breakpoint a silent no-op rather than a cheap bet.
+
+    Never raises once a response has been billed: a refusal, a missing text block
+    and a schema failure each come back as a result carrying its usage
+    (NEVER rule 11). Only a pre-response `APIError` raises, when nothing was spent.
+    """
+    active_client = client if client is not None else get_anthropic_client()
+    prompt, dropped, sent_ids = _build_weekly_user_prompt(window_label=window_label, items=items)
+
+    try:
+        response = active_client.messages.create(
+            model=model,
+            max_tokens=WEEKLY_MAX_TOKENS,
+            system=[
+                {
+                    "type": "text",
+                    "text": stable_system_prefix,
+                    # No timestamps or run ids in this text (NEVER rule 10) — see
+                    # `synth.weekly.build_weekly_stable_prefix`, which takes only
+                    # `interests` so that is true by construction, not by care.
+                }
+            ],
+            output_config={
+                "effort": WEEKLY_EFFORT,
+                "format": {"type": "json_schema", "schema": _WEEKLY_OUTPUT_SCHEMA},
+            },
+            messages=[MessageParam(role="user", content=[{"type": "text", "text": prompt}])],
+        )
+    except anthropic.APIError as exc:
+        raise LlmError(f"failed to generate weekly brief: {exc}") from exc
+
+    usage = response.usage
+    input_tokens = (
+        usage.input_tokens
+        + (usage.cache_creation_input_tokens or 0)
+        + (usage.cache_read_input_tokens or 0)
+    )
+    output_tokens = usage.output_tokens
+
+    def failed(message: str) -> WeeklyBriefResult:
+        return WeeklyBriefResult(
+            error=message,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            dropped_item_count=dropped,
+            sent_item_ids=sent_ids,
+        )
+
+    if response.stop_reason == "refusal":
+        logger.warning("weekly brief call was refused")
+        return failed("weekly brief call was refused by safety classifiers")
+
+    text = next((block.text for block in response.content if block.type == "text"), None)
+    if text is None:
+        return failed("no text content in weekly brief response")
+
+    try:
+        brief = WeeklyBrief.model_validate_json(text)
+    except ValidationError as exc:
+        logger.warning("weekly brief failed schema validation", extra={"error": str(exc)})
+        return failed(f"schema validation failed: {exc}")
+
+    if not brief.leads and not brief.clusters:
+        # Neither list has a `min_length` on the model (see `WeeklyBrief`), so
+        # this is the explicit rejection that constraint would have given us,
+        # applied only to the model's own output and never to a cleaned value.
+        logger.warning("weekly brief had no leads and no clusters")
+        return failed("weekly brief had no leads and no clusters")
+
+    logger.info(
+        "weekly brief complete",
+        extra={
+            "lead_count": len(brief.leads),
+            "cluster_count": len(brief.clusters),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "dropped_item_count": dropped,
+        },
+    )
+    return WeeklyBriefResult(
+        brief=brief,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         dropped_item_count=dropped,

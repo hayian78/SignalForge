@@ -175,13 +175,15 @@ signalforge/
 │   │   └── scorer.py           # 3-dimension scoring with reasoning
 │   ├── synth/
 │   │   ├── podcast.py          # daily two-presenter script, via llm.py only (§13.3)
+│   │   ├── weekly.py           # the Sunday brief's one Opus call, via llm.py only (§13)
 │   │   ├── trends.py           # Phase 2
 │   │   ├── synthesis.py        # Phase 2: cross-source narrative
 │   │   └── impact.py           # Phase 3: Architecture Impact Engine
 │   ├── report/
 │   │   ├── templates/          # jinja2: daily.md.j2, podcast.md.j2, weekly.md.j2, monthly.md.j2
 │   │   ├── daily.py            # fills the daily digest template
-│   │   └── podcast.py          # fills/parses the podcast script template (§13.3)
+│   │   ├── podcast.py          # fills/parses the podcast script template (§13.3)
+│   │   └── weekly.py           # selects the week's items, then fills the brief template
 │   ├── deliver/                # §13.2: outbound mirrors of an already-written report
 │   │   ├── templates/          # jinja2: email_daily.html.j2, email_daily.txt.j2, podcast_feed.xml.j2
 │   │   ├── email.py            # renders + POSTs to a mail provider API
@@ -194,7 +196,7 @@ signalforge/
 ├── vault/                      # Obsidian vault — THE PRODUCT (own git repo or subdir)
 │   ├── daily/2026-07-16.md
 │   ├── podcast/2026-08-07.md   # episode script, source of truth for TTS (§13.3)
-│   ├── weekly/2026-W29.md
+│   ├── weekly/2026-08-09.md        # dated by the Sunday it is published on
 │   ├── monthly/2026-07.md
 │   ├── insights/               # Phase 3: atomic notes
 │   ├── watchlists/             # repos.md, people.md
@@ -658,7 +660,7 @@ Two notes for §8's accounting:
 
 The digest is not only output — it is also **input**. `feedback.py` harvests an item mark
 and `curate/approvals.py` harvests a proposal decision by scanning every line of every
-`vault/daily/*.md` for a checkbox pattern, and neither can tell which lines the template
+`vault/daily/*.md` and `vault/weekly/*.md` (`feedback.HARVEST_DIRS`) for a checkbox pattern, and neither can tell which lines the template
 wrote from which came from data. So any text that renders into a vault file and can contain
 a newline can *fabricate a decision the operator never made*.
 
@@ -676,9 +678,10 @@ Three fields make that reachable, in descending order of how easy they are to re
 
 The rule: **flatten model- and world-authored text to a single line at the boundary where
 it is stored**, and refuse rather than repair for identity fields, where a rewrite would
-change what the record means. `models.flatten_to_single_line` and
-`models.has_control_characters` are the two primitives; `Item._flatten_title`,
-`db.insert_proposal`, and `db._cited_proposals` are the three places that apply them.
+change what the record means. `models.flatten_to_single_line`,
+`models.has_control_characters` and `models.escape_markdown_link_text` are the primitives;
+`Item._flatten_title`, `db.insert_proposal`, `db._cited_proposals`,
+`synth/weekly.py::_flatten_and_finalize` and `report/weekly.py::_clean` apply them.
 
 Two notes for anyone extending this:
 
@@ -687,10 +690,23 @@ Two notes for anyone extending this:
   dataclass) and it cannot for items (`_row_to_item` reconstructs an `Item`, so the
   validator runs again). `report/daily.py` therefore re-flattens proposal prose and does
   not re-flatten titles — an unreachable defence is one nobody can test.
+- **Flattening alone did not close the hole, and the original argument for that was
+  wrong.** This section used to say denying newlines "closes the hole completely because a
+  marker must begin a line." It does not: text whose *entire value* already is
+  `- [x] useful <!-- sf:item=1 v=useful -->` is one line and single-spaced, so collapsing is
+  a no-op and the template emits it on a line of its own, where `MARK_RE` matches. That was
+  reproduced against this repo on 2026-08-08 — a `scores.reasoning` of exactly that string
+  yielded a real `Mark` — and the same shape reached `curate`'s approval markers and
+  feed-supplied titles. What closes the class is neutralising the HTML comment *opener*,
+  which both harvest patterns anchor on, so position and future template layout stop
+  mattering; `flatten_to_single_line` now does that as well as collapsing. Model- and
+  world-authored prose has no business emitting an HTML comment into the vault, and the
+  templates emit every real marker themselves.
 - Both harvesters treat a matching line as authoritative. Making the marker itself
   unforgeable (a signature) was considered and rejected: it adds a key to manage for a
-  single-user local tool, and denying newlines at the source closes the hole completely
-  because a marker must begin a line.
+  single-user local tool, and the opener escape above closes the class without one. Note
+  what the earlier version of this bullet got wrong, though — a defence argued from "a
+  marker must begin a line" was resting on a premise nobody had tested.
 
 ## 8. Deterministic vs LLM Boundary
 
@@ -711,22 +727,29 @@ Two notes for anyone extending this:
 | Task | Model | Mechanism | Est. volume |
 |---|---|---|---|
 | Daily triage + 3-dim scoring | `claude-haiku-4-5` | **Batches API** (50% off), structured outputs (`messages.parse` with a pydantic `ScoredItem`), ~25 items per request | ~100–300 items/day, titles+summaries only |
-| Deep-read of top-N (weekly) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
-| Weekly brief synthesis + impact engine | `claude-opus-4-8` | One streamed call; **prompt caching** on the stable rubric/interests/projects prefix (`cache_control: ephemeral`); adaptive thinking, `output_config: {effort: "high"}` | 1–2 calls/week |
+| Deep-read of top-N (the **podcast's** daily top-N, `ingest/fullcontent.py` — *not* the weekly brief, which deliberately sends no content) | `claude-haiku-4-5` | Full content, structured extraction | ~15–25 items/week |
+| **Weekly Intelligence Brief (§13, Phase 1) — shipped 2026-08-08** | `claude-opus-5` (this row said `claude-opus-4-8`; identical pricing, and the repo standardised on `opus-5` with the scout — a third Opus id would fragment the cache for nothing) | **Exactly one request per run, no retry, and no prompt cache.** The cache line here was aspirational: a weekly cadence means an ephemeral entry always expires unread, so a breakpoint is pure write premium — the scout's own recorded reasoning at the identical cadence — and the 1,928-byte prefix is below Opus's cacheable minimum anyway. `output_config` with `effort: "high"` and a `json_schema` format (which rejects array `minItems`/`maxItems`, so block counts are clamped in code). Payload is `(item_id, title, summary, reasoning)` 4-tuples — **never `items.content`**, even on rows the podcast's deep read has already populated. Three per-field byte caps applied *after* JSON escaping; item count clamped by `WEEKLY_MAX_ITEMS` (24), which config can only lower | 1 call/week (5 in a five-Sunday month); ships at `weekly_top_n: 12`; output bounded by `WEEKLY_MAX_TOKENS` (12,288) |
+| Impact engine synthesis | `claude-opus-5` | **Phase 3, unbuilt.** Split out of the weekly-brief row above, which used to describe both — the brief shipped without it, and pricing the two together overstated the brief by roughly 2x | — |
 | Monthly trend report | `claude-opus-4-8` | One call over pre-computed trend tables | 1 call/month |
 | Source curation scout (§7.1) | `claude-opus-5` | **Exactly one request per run — a paused turn is not resumed**, because `max_tokens` bounds output *per request* and resuming multiplies it past this feature's budget; `max_uses` caps searches server-side; a custom tool carries the structured output; **no prompt cache** (weekly cadence ⇒ zero cache reads, so a breakpoint is pure write premium, and the ~900-token prefix is below the cacheable minimum anyway) | 1 call/week; input is the rendered prompt (~4.5k at full evidence) plus search results, measured at ~22-30k tokens per search on the first two real runs; output capped by `SCOUT_MAX_TOKENS`; ships at 12 searches |
 | Podcast episode script (§13.3) | `claude-opus-5` | At most two requests per episode — the first attempt, and one "shorter" retry (`synth/podcast.py::build_script`) if it ran long; prompt-cached stable prefix (show-format brief + interests/taxonomy, `build_podcast_stable_prefix`), the day's top-`podcast_top_n` items (titles, summaries, and full deep-read content — unlike triage, NEVER rule 9's sibling exemption) after the breakpoint | 1 call/day (2 on a long-running episode); item count capped by `PODCAST_MAX_ITEMS`, output by `PODCAST_MAX_TOKENS`/`PODCAST_RETRY_MAX_TOKENS` |
 | Podcast TTS synthesis (§13.3) | OpenRouter (not Anthropic — `deliver/tts.py`, outside `llm.py`) | Per-line coalesce-and-concat: consecutive same-speaker turns join, each chunk synthesized separately, `ffmpeg -f concat` joins the mp3s. Billed per character, not per token — `runs.tts_characters`, not `runs.llm_*_tokens` | 1 episode/day; total dialogue capped at `TTS_MAX_CHARS` (14,000 chars) |
 
-Prompt-caching discipline (from day one, it's free to get right): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
+**One recorded exception to the deterministic column in §8's first table.** The weekly brief has the model both *group* the week's items and *narrate* the groups, where this table puts clustering math in the deterministic column and only cluster labeling and cross-source synthesis in the LLM one. The deterministic input that split assumes — embeddings and distance-based clustering — is Phase 2 work and does not exist yet (§16). When it lands the grouping moves to it and only the narration stays; `llm.WeeklyCluster`'s docstring carries the same note where a reader of the code will hit it.
 
-**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly Opus synthesis ≈ 4 × (80k in / 8k out) ≈ **$2.40**; deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (12 searches × ~28k in/search, the average of the three real runs measured so far ≈ $1.69 + ~7.6k out ≈ $0.19 + 12 searches ≈ $0.12) ≈ **$8.65**; podcast script ≈ 30 × (~15k in / ~3k out on `claude-opus-5`) ≈ **$4.50**; podcast TTS ≈ 30 episodes × ~8k spoken characters (a nine-to-twelve-minute show) on the shipped `hexgrad/kokoro-82m` rate ($0.62/1M chars) ≈ **$0.15**. **Itemized total ≈ $20.30/month**, against a **$5–10 target** and a **$30 alarm**.
+Prompt-caching discipline, for the **daily-cadence** calls (weekly-cadence ones — the scout and the brief — deliberately carry no breakpoint, since an ephemeral entry always expires unread): system prompt = frozen rubric + `interests.yaml` + taxonomy, cache-controlled; the day's items go after the breakpoint. No timestamps or run IDs in the prefix.
+
+**Cost estimate.** Per line: triage ≈ 150 items/day × ~700 tokens ≈ 3.2M input tokens/month on Haiku via Batches ≈ **$1.60**; weekly brief ≈ 4.33 × (~14k in ≈ $0.07 + ~7k out including adaptive thinking ≈ $0.18) ≈ **$1.10** (replacing an earlier `4 × (80k in / 8k out) ≈ $2.40` line that was wrong in both terms — real input is ~14 kB, not 80k tokens, and it double-counted the unbuilt impact engine; the reduction is stated rather than pocketed. First measured run 2026-08-08 (`runs` id 151): 3,300 in / 2,143 out = $0.07, so this line is conservative, and it stays unmeasured until four real Sundays exist); deep reads and monthly report ≈ **$3.00**; curation scout ≈ 4.33 × (12 searches × ~28k in/search, the average of the three real runs measured so far ≈ $1.69 + ~7.6k out ≈ $0.19 + 12 searches ≈ $0.12) ≈ **$8.65**; podcast script ≈ 30 × (~15k in / ~3k out on `claude-opus-5`) ≈ **$4.50**; podcast TTS ≈ 30 episodes × ~8k spoken characters (a nine-to-twelve-minute show) on the shipped `hexgrad/kokoro-82m` rate ($0.62/1M chars) ≈ **$0.15**. **Itemized total ≈ $19.00/month**, against a **$5–10 target** and a **$30 alarm**.
 
 Each line must price **input, output, and per-call tool spend**. An earlier version of the scout line multiplied input tokens only and understated itself by ~35%; on a call whose output is billed at 5× its input rate, output is the larger half.
 
 Two things that estimate is not. It is not measured: the only measured figures to date are **≈ $0.40/month actual** on triage (July 2026: 23 `score` runs, 0.37M input / 0.09M output on Haiku) and **three real scout runs** on 2026-07-30/31 (~$1.20 at 6 searches, ~$1.20 at 6 again, ~$1.02 at 7), because everything else prices a component that does not exist yet or has run too few times to average — the podcast script and TTS lines above are estimates in the same unmeasured category, priced against the shipped config's `podcast_top_n`/`hexgrad/kokoro-82m` defaults rather than an observed month of episodes. And the band is no longer mid-range: the scout alone, raised deliberately to 12 searches after the operator judged the extra research depth worth it, already accounted for over half the itemized total before the podcast landed, and the podcast's own two lines have pushed the **whole pipeline further past its own $5–10 target on paper** — still under the $30 alarm on these realistic volumes, but the next new LLM or TTS consumer, or a scout re-tune in the other direction, needs the band revisited rather than absorbed.
 
-**The $30 alarm now covers TTS characters, not just LLM tokens.** `signalforge status`'s month-to-date readout prices `runs.tts_characters` alongside `runs.llm_*_tokens` (Stage 6, DESIGN §13.3) — the TTS line above is not invisible to the alarm the way the search-tool dollar figure still is (next paragraph). Separately from the realistic estimate above, the **worst-case hard ceilings** for the podcast's two new spend categories are `llm.PODCAST_MONTHLY_CEILING_USD` = **$23.00** and `deliver.tts.TTS_MONTHLY_CEILING_USD` ≈ **$43.40** — summing to **$66.40**, well past $30 on their own. That sum is not a forecast: each ceiling is a hard cap priced at the most expensive plausible per-unit rate a config change could reach (every item field at its byte cap, a switch to the priciest listed TTS model) and enforced by code, the same discipline `SCOUT_MONTHLY_CEILING_USD` uses (§7.1). Recorded here rather than silently narrowed to fit under $30 by shrinking the show — see `PODCAST_MONTHLY_CEILING_USD`'s own docstring, which named this paragraph as its resolution.
+**The $30 alarm now covers TTS characters, not just LLM tokens.** `signalforge status`'s month-to-date readout prices `runs.tts_characters` alongside `runs.llm_*_tokens` (Stage 6, DESIGN §13.3) — the TTS line above is not invisible to the alarm the way the search-tool dollar figure still is (next paragraph). Separately from the realistic estimate above, the **worst-case hard ceilings** now number four: `llm.SCOUT_MONTHLY_CEILING_USD` = **$13.00**, `llm.PODCAST_MONTHLY_CEILING_USD` = **$23.00**, `deliver.tts.TTS_MONTHLY_CEILING_USD` ≈ **$43.40**, and `llm.WEEKLY_MONTHLY_CEILING_USD` = **$3.50** — summing to **$82.90**, well past $30 on their own. That sum is not a forecast: each ceiling is a hard cap priced at the most expensive plausible per-unit rate a config change could reach (every item field at its byte cap, a switch to the priciest listed TTS model) and enforced by code, the same discipline `SCOUT_MONTHLY_CEILING_USD` uses (§7.1). Recorded here rather than silently narrowed to fit under $30 by shrinking the show — see `PODCAST_MONTHLY_CEILING_USD`'s own docstring, which named this paragraph as its resolution.
+
+The weekly brief's own bound is the smallest of the four and the most conservatively derived: priced at `WEEKLY_MAX_ITEMS` (24, never the shipped `weekly_top_n: 12`), every field at its byte cap, `WEEKLY_MAX_TOKENS` of output, **1.0 bytes/token** (the pessimistic end of the podcast test's own sensitivity table, not its 1.5), **5 calls a month** because a month can contain five Sundays, and no cache-write multiplier. Computed worst case **$2.47/month**, 29% headroom. The *derivation* is not restated — `tests/test_llm_weekly.py::test_the_worst_case_weekly_cost_stays_within_the_recorded_ceiling` computes it from the constants and the shipped `interests.yaml` by calling the real prompt builder.
+
+**One term none of the four ceilings accounts for.** `get_anthropic_client` leaves the SDK's default `max_retries=2`, so a request that times out *after* the model has generated can bill up to three times. Setting it to zero would trade a rare double-bill for a lost run on every transient network blip across triage, scout, podcast and brief alike, which is the worse deal at these cadences. Recorded rather than silently excluded; if a real run ever shows it firing, the honest fix is a 3x term in the bounds, not a quieter docstring.
 
 **Not everything is billed per token.** The web search server tool costs **$10 per 1,000 searches** on top of the tokens its results consume, so token counts alone understate the bill. `runs.server_tool_requests` records the per-run count. Turning that into a dollar figure beside the token spend in `signalforge status` lands with the `curate` CLI commands — **until it does, the search line has no readout and the $30 alarm does not see the whole invoice.**
 
@@ -827,7 +850,7 @@ This file is injected (cached) into every scoring and synthesis prompt. It is th
 
 The `feedback` table (§5) is the sensor; this is the servo. Design constraint up front: **never per-mark reactive** — a single thumbs-down changes nothing except a stored row. Adaptation is batch, aggregated, capped, and *proposed rather than auto-applied*.
 
-**Capture (Phase 1).** `signalforge mark <id> useful|noise|exceptional|missed` (+ optional note). The first three form an **ordinal ladder** — `noise < useful < exceptional` — where `exceptional` means "not merely worth surfacing; worth remembering". An item may carry more than one rung (`UNIQUE(item_id, verdict)` stores each separately), so **an item's rating is its highest rung, and every aggregation must reduce to that** rather than testing `verdict = 'useful'` — otherwise the Phase 1 acceptance gate below deflates as marks migrate to the top rung. `missed` sits off the ladder — it describes an item the digest *didn't* show — and is CLI-only, because a rendered item was by definition surfaced; it is the highest-value verdict; the weekly brief footer lists near-miss items (scored just below threshold) to make it easy to give. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table. **Two commands harvest, not one:** `digest` before it re-renders, and `podcast` before it selects (§13.3) — the marks that rank an episode are ticked *after* the digest that offered them, so the episode has to go and get them itself. Re-harvesting a stored checkbox is a no-op, so running both is safe.
+**Capture (Phase 1).** `signalforge mark <id> useful|noise|exceptional|missed` (+ optional note). The first three form an **ordinal ladder** — `noise < useful < exceptional` — where `exceptional` means "not merely worth surfacing; worth remembering". An item may carry more than one rung (`UNIQUE(item_id, verdict)` stores each separately), so **an item's rating is its highest rung, and every aggregation must reduce to that** rather than testing `verdict = 'useful'` — otherwise the Phase 1 acceptance gate below deflates as marks migrate to the top rung. `missed` sits off the ladder — it describes an item the digest *didn't* show — and is CLI-only, because a rendered item was by definition surfaced; it is the highest-value verdict; the weekly brief footer lists near-miss items to make it easy to give. **"Near miss" needed no new arithmetic in the end**: because `score/rubrics.py` already tells triage to keep on "plausibly clears" the weekly bar, the population is definitionally *kept, citable, non-`noise` items in the window that failed the `weekly_min_*` gate* — the top `weekly_near_miss_n` in the existing ranking. No magic "just below" constant in Python (NEVER rule 6), a pure sub-sequence of the same ranking, and disjoint from the brief's body by construction. They render with the item id and **no checkbox**, because `missed` is off-ladder and CLI-only. Friction decides whether this gets 20 marks a month or 2, and reading happens in Obsidian while `mark` lives in a terminal — so the digest/brief templates render a mark affordance per item (checkbox or `#useful`/`#noise` tag line), and the next run **harvests marks from the vault file before regenerating it** (the writer already overwrites reports idempotently; harvest-then-overwrite keeps that). CLI and vault marks land in the same `feedback` table. **Three commands harvest:** `digest` before it re-renders, `podcast` before it selects (§13.3), and `weekly` before it selects *and* before it overwrites — the last matters twice over, because a brief's ticks exist only in the file until something reads them, so a `--force` that regenerated first would destroy them — the marks that rank an episode are ticked *after* the digest that offered them, so the episode has to go and get them itself. Re-harvesting a stored checkbox is a no-op, so running both is safe.
 
 **Adaptation (Phase 2), monthly, alongside the monthly report:**
 
@@ -876,7 +899,7 @@ All reports land in the vault, git-committed, with frontmatter for Obsidian quer
 | Report | Cadence / trigger | Contents | Phase |
 |---|---|---|---|
 | **Daily Digest** | cron 19:00 (§14) | Top `daily_max_items` (default 15) kept items after crowding limits (below): title, one-line why-it-matters, scores, link. 60-second read. Footer: yesterday's source failures + items killed count + kept items not shown. Frontmatter: `item_count` = rendered, `kept_count` = all kept (semantics split when the cap landed; older digests predate `kept_count`) | 0 |
-| **Weekly Intelligence Brief** | Sunday 07:00 | *The product.* Lead: "The 3 things that mattered." Then clustered top items with synthesis + citations, impact-engine verdicts per project (P3), trend deltas (P2), watchlist changes, cost/ops footer | 1 |
+| **Weekly Intelligence Brief** *(shipped 2026-08-08)* | Sunday 07:00 | *The product.* Up to three leads ("the things that mattered"), then themed groups, each with synthesis + citations. Then every selected item with its mark checkboxes — the acceptance gate's denominator, deliberately not tied to what the model chose to cite. Footer: near-misses (gate-failers, offered for `mark <id> missed`), counts that reconcile, any fabricated citation dropped, and — if `weekly_top_n` were ever raised above `WEEKLY_MAX_ITEMS` — how many rendered items the synthesis never read. Impact-engine verdicts (P3), trend deltas (P2) and watchlist changes (P2) are **not** built (NEVER rule 15) | 1 |
 | **Monthly Trend Report** | 1st of month | Rising/falling topics vs 3-month baseline, new entrants, cluster arcs, "boring but steady" section | 2 |
 | **Technology Radar** | Monthly, regenerated | Adopt/Trial/Assess/Hold per tool, derived from impact verdict history | 3 |
 | **Research Radar** | Monthly | arXiv themes gaining implementation traction (paper → repo appearances) | 3 |
@@ -1150,6 +1173,12 @@ earning its exception; it is dead weight carrying one anyway.
   The **evening** half is the digest's, not an arbitrary shift: `get_digest_items` buckets by `scored_at`, and there is exactly one ingest+score pass per day, so moving the pass moves the whole bucket with it. Nothing falls between two days.
 
 The scout is `curate run`, not a bare `curate`, deliberately: it is the one command in the system that spends money on being typed, and a bare noun is too easy to invoke by reflex. It also **refuses to run twice inside six days** unless `--force`, because nothing else makes a weekly job weekly: the unique index stops a re-run *storing* duplicates and does nothing about the call being billed again, and wired into `daily` by mistake that is ~$60/month at real measured cost (≈$2.00/run at the shipped 12 searches × 30 daily runs) — over this feature's own $13 budget and the whole pipeline's $30 alarm, on one mis-wired command. The guard reads only the `curate` kind — counting the free morning `curate-apply` would refuse every scout run forever. `curate` alone prints the group's help. Its `--dry-run` is also unlike every other `--dry-run` here — it skips the writes but **still makes the paid call**, because a preview that did not would not be a preview of anything; the `runs` row is written either way, since that row is the spend record.
+- **The weekly brief's double-spend defence is a date, not a guard.** Unlike the scout, `weekly` has no six-day `runs` check. It does not need one: `--date` names the Sunday the brief is *published* on, defaults to the most recent Sunday, and **refuses a non-Sunday rather than snapping it** (`cli._resolve_target_sunday`). Every day of a week therefore resolves to the same vault path, so the file guard (`brief_path(...).is_file()`) sees an existing brief and skips the call — a mis-wired daily invocation costs one call a week, not thirty a month, which is strictly stronger than a `runs` guard and needs one function rather than a query plus a `--force` semantic. `--force` is the only way to pay twice for one week. Two things this rests on, both load-bearing: the vault file is written on **every** outcome including a refused or unusable synthesis (so the guard fires next time regardless), and the write is the last thing that can raise between a billed response and disk.
+
+- **The brief harvests for itself, and reads the same overnight marking window the episode does.** Saturday's 19:00 digest and Sunday's 07:00 brief are twelve hours apart — the same gap the digest/episode split exists to create (above) — so `weekly` calls `harvest_marks` before it selects, which is what lets a `noise` tick keep an item out, and before it overwrites, which is what stops `--force` destroying ticks that exist only in the file.
+
+- `weekly --dry-run` prints the selection and makes **no** paid call, unlike `curate run --dry-run`. The difference is what is being previewed: the scout's subject *is* the call, while everything worth seeing before a brief — the window, the items, the gated-out count, the near-misses — is deterministic.
+
 - Every command is **idempotent**: re-running today's digest overwrites today's file; ingest upserts on the unique keys; scoring skips already-scored items. A missed run self-heals on the next one (ingestors look back 7 days, not 1).
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token + TTS character spend (§13.3, priced at the configured podcast TTS model).
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.
@@ -1169,7 +1198,7 @@ The scout is `curate run`, not a bare `curate`, deliberately: it is the one comm
 | Config/validation | `pydantic` v2 + `pydantic-settings` | — |
 | DB | `sqlite3` stdlib + thin `db.py`; **no ORM** | SQLAlchemy (abstraction tax for ~12 tables); DuckDB (wrong write pattern; add later for analytics if needed); Postgres (deferred until a real multi-writer need exists) |
 | Vectors (P2) | `sentence-transformers` (bge-small / all-MiniLM) or Ollama embeddings + `sqlite-vec` | chromadb/qdrant (a server for a problem SQLite solves at this scale) |
-| LLM | `anthropic` SDK: `claude-haiku-4-5` (triage, Batches API) + `claude-opus-4-8` (synthesis); structured outputs via `messages.parse`; prompt caching throughout | LangChain/LangGraph (the pipeline is deterministic Python; an orchestration framework adds surface, not capability) |
+| LLM | `anthropic` SDK: `claude-haiku-4-5` (triage, Batches API) + `claude-opus-5` (synthesis — the scout, podcast and weekly brief all ship on it; §8's tables carry the `claude-opus-4-8` drift note); structured outputs via `messages.parse`; prompt caching throughout | LangChain/LangGraph (the pipeline is deterministic Python; an orchestration framework adds surface, not capability) |
 | CLI | `typer` + `rich` | — |
 | Templates | `jinja2` | — |
 | Transcripts (P3) | `yt-dlp` auto-captions | Whisper (cost/time; only if caption quality proves inadequate) |
@@ -1197,7 +1226,12 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 **Local-day boundary (resolved).** Storage and every timestamp are UTC; the reader-facing calendar day is resolved through one configurable IANA timezone in `config/settings.yaml` (`SettingsConfig`, defaulting to `UTC` — §4, config not code). The daily digest computes "today" as `datetime.now(tz).date()`, and `report/daily.py::utc_day_window` converts that local date to the half-open UTC range `[local-midnight, next-local-midnight)` actually queried against `scored_at` (built from the two adjacent local midnights, so a DST-shortened/lengthened day stays exactly one calendar day). This is what lets a `score` and a `digest` run that straddle UTC midnight still agree on which day the work belongs to — the failure mode that gave a UTC+10 operator an empty digest while the items hid under the prior UTC date. `settings.yaml` is its own file because a timezone is neither a relevance rule (`interests.yaml`) nor a source (`sources.yaml`): it is who and where the operator is, and it is the seam that makes the tool portable to any locale. Scope is deliberately narrow: only the reader-facing digest day is localized. The `status` command's month-to-date token bucket (the $30 alarm) stays UTC — durations and freshness are timezone-invariant, and only the cost-month's first/last day would differ; keeping ops in UTC avoids a second, subtly different notion of "month" for a marginal readout.
 
 ### Phase 1 — MVP: the weekly question (4–6 more weekends)
-**Status — not started** (gated on Phase 0's acceptance).
+**Status — the gate's component shipped 2026-08-08; the gate itself is four Sundays of reading.**
+- [x] **Weekly Intelligence Brief** (`report/weekly.py`, `synth/weekly.py`, `llm.run_weekly_brief`, `signalforge weekly`) — deterministic selection over the seven days *before* its Sunday, one Opus call, vault-written on every outcome, marks harvested from `weekly/` so the gate has a sensor
+- [ ] Four consecutive Sunday briefs, ≥ 80% of brief items rated `useful` or better
+- [ ] vault git-committed · [ ] `score/taxonomy.py` tagger · [ ] awesome-list diffing
+- [x] `status` + `mark` commands · [x] adaptive source curation (#9) · [x] arXiv ingestion
+
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml` (**config staged 2026-08-07** — validated, `score/taxonomy.py` tagger still pending, §10); arXiv (`ingest/arxiv.py`, **shipped 2026-08-07**) + awesome-list diffing (still pending); 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).
 **Acceptance:** four consecutive Sunday briefs that answer the primary question; ≥ 80% of brief items rated **`useful` or better** — an item's rating is its highest rung on the §11 ladder, so an item marked only `exceptional` counts toward this gate.
 **Curation gate (§7.1):** four consecutive weekly scout runs in which at least one proposal was approved and applied, and no applied change had to be reverted by hand. Curation is scheduled here rather than in Phase 2 — where the rest of the feedback servo lives (§11) — because the source list going stale is a felt gap in a digest already being read daily, which is the test risk 1 sets. It degrades gracefully on thin `feedback` data by falling back to keep/kill ratios, so it does not depend on Phase 2's mark volume.

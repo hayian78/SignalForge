@@ -29,6 +29,8 @@ __all__ = [
     "SourceType",
     "canonicalize_url",
     "compute_content_hash",
+    "MARKDOWN_LINK_TEXT_ESCAPE",
+    "escape_markdown_link_text",
     "flatten_to_single_line",
     "has_control_characters",
     "is_safe_url",
@@ -162,9 +164,44 @@ def flatten_to_single_line(text: str) -> str:
 
     Whitespace becomes a space rather than nothing so words either side of a stripped
     newline do not run together.
+
+    Flattening alone is **not** enough, and the gap is easy to miss. It defeats a
+    forged marker only when the marker is *preceded* by other text: prose whose
+    entire value already is `- [x] useful <!-- sf:item=1 v=useful -->` is one line
+    and single-spaced, so collapsing is a no-op and the template emits it on a
+    line of its own, where `feedback.MARK_RE` matches it. That is not
+    hypothetical — `scores.reasoning` is model-authored from feed content and is
+    rendered straight into the digest, so a feed able to steer one triage
+    rationale could tick a box on any item id it names. Both harvest patterns
+    (`feedback.MARK_RE`, `curate.approvals.PROPOSAL_RE`) anchor on the HTML
+    comment, so neutralizing the comment *opener* kills the whole class no matter
+    where in the string it sits or how a future template lays the line out. Model
+    and world-authored prose has no business emitting an HTML comment into the
+    vault; the templates emit every real marker themselves.
     """
     collapsed = " ".join(text.split())
-    return "".join(char for char in collapsed if not has_control_characters(char))
+    stripped = "".join(char for char in collapsed if not has_control_characters(char))
+    return stripped.replace("<!--", "&lt;!--")
+
+
+MARKDOWN_LINK_TEXT_ESCAPE: Final = "&#93;"
+"""What a `]` becomes inside markdown link text.
+
+One constant, imported by every report module that renders a world-authored
+title into `[text](url)`. A second copy would drift from this one silently, and
+both halves of the podcast's round trip (`report/podcast.py`'s escape and its
+inverse) have to agree on the exact replacement string."""
+
+
+def escape_markdown_link_text(text: str) -> str:
+    """Neutralize a `]` so `text` cannot close its own markdown link early.
+
+    Titles are world-authored — they arrive from a feed — so an unescaped `]`
+    lets a headline break out of its link and write raw markdown into a vault
+    file. Distinct from `flatten_to_single_line`, which guards the *line* the
+    text sits on; this guards the *link* it sits inside.
+    """
+    return text.replace("]", MARKDOWN_LINK_TEXT_ESCAPE)
 
 
 _URL_SAFE: Final = re.compile(r"[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=%]+")

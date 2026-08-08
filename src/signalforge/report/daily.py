@@ -60,6 +60,7 @@ __all__ = [
     "render_digest",
     "select_digest_items",
     "utc_day_window",
+    "utc_range_window",
     "write_digest",
 ]
 
@@ -455,18 +456,33 @@ def select_digest_items(
     return selected
 
 
+def utc_range_window(first_local_date: Date, last_local_date: Date, tz: tzinfo) -> tuple[str, str]:
+    """The UTC ISO `[start, end)` covering `first_local_date`..`last_local_date` in `tz`.
+
+    Both bounds are inclusive calendar dates in `tz`; the returned range is
+    half-open in UTC, running from the local midnight opening the first day to
+    the local midnight opening the day *after* the last.
+
+    Built from two real local midnights, each converted to UTC — never
+    `start + N × 24h` — so a span containing a DST transition is still exactly
+    the calendar days asked for, not a fixed slab of hours. That is why the
+    weekly brief's 7-day window is not 168 hours in a zone that observes DST.
+    """
+    start_local = datetime.combine(first_local_date, time.min, tzinfo=tz)
+    end_local = datetime.combine(last_local_date + timedelta(days=1), time.min, tzinfo=tz)
+    return start_local.astimezone(UTC).isoformat(), end_local.astimezone(UTC).isoformat()
+
+
 def utc_day_window(local_date: Date, tz: tzinfo) -> tuple[str, str]:
     """The UTC ISO `[start, end)` bracketing `local_date` as one day in `tz`.
 
-    Built from the two adjacent local midnights, each converted to UTC — never
-    `start + 24h` — so a day shortened or lengthened by a DST transition is
-    still exactly one calendar day in `tz`, not a fixed 24-hour slab. With
-    `tz=UTC` this collapses to `[DT00:00:00+00:00, (D+1)T00:00:00+00:00)`, i.e.
-    the same rows the old date-prefix match selected (backward compatible).
+    The single-day case of `utc_range_window`, and delegating to it is what
+    keeps the daily digest and the weekly brief on one DST-correct boundary
+    rule instead of two that can drift. With `tz=UTC` this collapses to
+    `[DT00:00:00+00:00, (D+1)T00:00:00+00:00)`, i.e. the same rows the old
+    date-prefix match selected (backward compatible).
     """
-    start_local = datetime.combine(local_date, time.min, tzinfo=tz)
-    end_local = datetime.combine(local_date + timedelta(days=1), time.min, tzinfo=tz)
-    return start_local.astimezone(UTC).isoformat(), end_local.astimezone(UTC).isoformat()
+    return utc_range_window(local_date, local_date, tz)
 
 
 def build_digest_context(

@@ -74,7 +74,7 @@ Strict responsibilities — DESIGN §4. Violations are architectural regressions
 DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
 
 - Triage/scoring: `claude-haiku-4-5`, **Batches API**, structured outputs, batched ~25 items/request, on **titles + summaries only**. Full content is fetched lazily for top-N survivors only — never feed full content to triage.
-- Synthesis/impact: `claude-opus-4-8`, prompt-cached stable prefix (rubric + interests + taxonomy), items after the breakpoint. ❌ No timestamps, run IDs, or other volatile data in the cached prefix.
+- Synthesis: `claude-opus-5` (scout, podcast, weekly brief). **Daily-cadence** calls prompt-cache a stable prefix (rubric + interests + taxonomy) with items after the breakpoint; **weekly-cadence** ones deliberately carry no breakpoint, because an ephemeral entry always expires unread and a breakpoint is then pure write premium (DESIGN §8). ❌ No timestamps, run IDs, or other volatile data in a cached prefix.
 - Every call goes through `llm.py`, which records tokens into `runs`.
 - Podcast TTS is a dollar spend outside `llm.py`'s token accounting: every character sent to `deliver/tts.py` is recorded to `runs.tts_characters` (DESIGN §13.3), and `signalforge status` prices it at the configured model.
 - Any diff touching `llm.py`, prompts, model choice, batching, or `deliver/tts.py`'s price table/ceiling gets an `llm-cost-guard` review before merge (see agent file).
@@ -119,7 +119,7 @@ DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
 | 14 | NEVER add an ORM, orchestration framework, or server the design explicitly rejected | §9, DESIGN §15 |
 | 15 | NEVER build ahead of the current phase gate | §1, DESIGN §16; two recorded exceptions: DESIGN §13.2, §13.3 |
 | 16 | NEVER commit `.env` / API keys; never log secrets | `.claude/conventions.md` |
-| 17 | NEVER render model- or world-authored text into a vault file without flattening it to one line | §5 |
+| 17 | NEVER render model- or world-authored text into a vault file without passing it through `flatten_to_single_line` — which collapses lines *and* neutralizes the HTML comment opener; flattening alone was proven insufficient | §5 |
 | 18 | NEVER let `curate/` write an `items` row, or fetch before the LLM has proposed | §2 |
 | 19 | NEVER deliver a report before its vault write succeeded, and never let a channel fail the run or become an input surface | §5, DESIGN §13.2 |
 | 20 | NEVER synthesize audio for a script not already written to the vault | DESIGN §13.3 |

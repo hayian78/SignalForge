@@ -74,7 +74,12 @@ import yaml
 
 from signalforge.db import DigestItem, get_item
 from signalforge.feedback import highest_rung
-from signalforge.models import flatten_to_single_line, is_safe_url
+from signalforge.models import (
+    MARKDOWN_LINK_TEXT_ESCAPE,
+    escape_markdown_link_text,
+    flatten_to_single_line,
+    is_safe_url,
+)
 from signalforge.synth.podcast import BuiltScript
 
 if TYPE_CHECKING:
@@ -114,7 +119,7 @@ _REASON_LABELS: Final[dict[str, str]] = {
     "truncated": "dropped: episode ran long",
 }
 
-_TITLE_BRACKET_ESCAPE: Final = "&#93;"
+_TITLE_BRACKET_ESCAPE: Final = MARKDOWN_LINK_TEXT_ESCAPE
 """Stands in for a literal `]` inside a title rendered as `[title](url)`.
 Not a general HTML-entity encoder — this is the one character that can
 make the parser's `\\](` boundary land in the wrong place (see this
@@ -446,7 +451,7 @@ def build_script_context(
 
 
 def _escape_title(title: str) -> str:
-    return title.replace("]", _TITLE_BRACKET_ESCAPE)
+    return escape_markdown_link_text(title)
 
 
 def _unescape_title(title: str) -> str:

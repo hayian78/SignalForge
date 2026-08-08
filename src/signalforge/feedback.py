@@ -47,6 +47,7 @@ from signalforge import db
 
 __all__ = [
     "CHECKBOX_VERDICTS",
+    "HARVEST_DIRS",
     "LADDER",
     "MARK_RE",
     "VERDICTS",
@@ -72,6 +73,25 @@ an item the digest *didn't* show, so it sits off the ladder rather than below it
 An item may hold several rungs at once (`UNIQUE(item_id, verdict)` stores each
 separately), so aggregations reduce it to its highest — never `verdict =
 'useful'`. Rationale and the acceptance gate that depends on it: DESIGN §11, §16."""
+
+HARVEST_DIRS: Final = ("daily", "weekly")
+"""Vault subdirectories whose markdown carries feedback checkboxes.
+
+`podcast/` is deliberately absent, and the reason is the boundary rule, not the
+template: a delivery channel is outbound only and never an input surface (DESIGN
+§13.2). That holds however the episode template is written. It happens also to
+render no harvestable marker today — its `<!-- sf:item=N -->` source lines carry
+no verdict label, so `MARK_RE` rejects them — but grounding the exclusion in a
+template fact would let a future template edit quietly invalidate it.
+
+`weekly/` is here because Phase 1's acceptance gate is measured off marks made on
+the brief; without it the gate has no sensor at all, and worse, regenerating a
+brief the operator had already ticked would destroy those ticks, since the rows
+only exist if something read the file first.
+
+The vault layout this names is owned by `report/*.py`'s path helpers; a test ties
+the two together so renaming a report's directory cannot silently unplug the
+harvest."""
 
 CHECKBOX_VERDICTS: Final = ("useful", "noise", "exceptional")
 """The verdicts that render as a checkbox affordance, in render order. Not
@@ -185,16 +205,16 @@ def _now() -> datetime:
 
 
 def harvest_marks(conn: sqlite3.Connection, vault_dir: Path) -> HarvestResult:
-    """Read the daily vault markdown and store every checked mark. Vault-read-only.
+    """Read the vault's markable markdown and store every checked mark. Vault-read-only.
 
-    Globs `<vault_dir>/daily/*.md`, parses each file (never writes one — NEVER
-    rule 8), and records each mark through `db.record_feedback`. A mark whose
-    `item_id` is not in `items` is skipped with a warning rather than raised: a
-    hand-edited or stale id must never abort the harvest (CLAUDE.md §7). The
+    Globs `<vault_dir>/<dir>/*.md` for each of `HARVEST_DIRS`, parses each file
+    (never writes one — NEVER rule 8), and records each mark through
+    `db.record_feedback`. A mark whose `item_id` is not in `items` is skipped
+    with a warning rather than raised: a hand-edited or stale id must never
+    abort the harvest (CLAUDE.md §7). The
     unique index makes a re-harvest of the same checkbox a no-op, so this is
     safe to run before every render (DESIGN §11 harvest-then-overwrite).
     """
-    daily_dir = vault_dir / "daily"
     files_scanned = 0
     marks_found = 0
     rows_recorded = 0
@@ -206,36 +226,40 @@ def harvest_marks(conn: sqlite3.Connection, vault_dir: Path) -> HarvestResult:
     # re-harvest a no-op regardless of timestamp, so idempotency holds.
     base = _now()
 
-    for path in sorted(daily_dir.glob("*.md")):
-        files_scanned += 1
-        text = path.read_text(encoding="utf-8")
-        for mark in parse_marks(text):
-            created_at = base + timedelta(microseconds=marks_found)
-            marks_found += 1
-            if db.get_item(conn, mark.item_id) is None:
-                logger.warning(
-                    "feedback mark references an unknown item; skipping",
-                    extra={"item_id": mark.item_id, "verdict": mark.verdict, "file": str(path)},
-                )
-                continue
-            try:
-                if db.record_feedback(
-                    conn,
-                    item_id=mark.item_id,
-                    verdict=mark.verdict,
-                    note=None,
-                    created_at=created_at,
-                ):
-                    rows_recorded += 1
-            except Exception:
-                # One mark's write failing must never abort the pass (CLAUDE.md
-                # §7). With distinct timestamps the expected dual-verdict path no
-                # longer collides, so reaching here is a genuinely unexpected
-                # error — logged loudly, not swallowed as normal flow.
-                logger.exception(
-                    "could not record a feedback mark; skipping it",
-                    extra={"item_id": mark.item_id, "verdict": mark.verdict, "file": str(path)},
-                )
+    # A fixed directory order with `sorted()` inside each keeps the microsecond
+    # offsets below deterministic; a missing directory globs to nothing rather
+    # than raising, so a vault without one of these is a silent no-op.
+    for directory in HARVEST_DIRS:
+        for path in sorted((vault_dir / directory).glob("*.md")):
+            files_scanned += 1
+            text = path.read_text(encoding="utf-8")
+            for mark in parse_marks(text):
+                created_at = base + timedelta(microseconds=marks_found)
+                marks_found += 1
+                if db.get_item(conn, mark.item_id) is None:
+                    logger.warning(
+                        "feedback mark references an unknown item; skipping",
+                        extra={"item_id": mark.item_id, "verdict": mark.verdict, "file": str(path)},
+                    )
+                    continue
+                try:
+                    if db.record_feedback(
+                        conn,
+                        item_id=mark.item_id,
+                        verdict=mark.verdict,
+                        note=None,
+                        created_at=created_at,
+                    ):
+                        rows_recorded += 1
+                except Exception:
+                    # One mark's write failing must never abort the pass (CLAUDE.md
+                    # §7). With distinct timestamps the expected dual-verdict path no
+                    # longer collides, so reaching here is a genuinely unexpected
+                    # error — logged loudly, not swallowed as normal flow.
+                    logger.exception(
+                        "could not record a feedback mark; skipping it",
+                        extra={"item_id": mark.item_id, "verdict": mark.verdict, "file": str(path)},
+                    )
 
     logger.info(
         "harvested vault feedback marks",

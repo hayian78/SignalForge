@@ -9,6 +9,53 @@ consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
 ## [Unreleased]
 
 ### Added
+- **Weekly Intelligence Brief** (`report/weekly.py`, `synth/weekly.py`,
+  `llm.run_weekly_brief`, `signalforge weekly` — DESIGN §13, Phase 1). *The
+  product*: up to three leads on what mattered, then themed groups, each
+  citing the stored items behind it — followed by every selected item with its
+  mark checkboxes, and a footer of near-misses offered for
+  `mark <id> missed`. Cron Sun 07:00.
+
+  **Covers the seven days *before* its Sunday, not including it.** The score
+  pass runs at 19:00 and the brief at 07:00, so the publication day's own
+  bucket is still twelve hours from being filled; a window ending on the
+  target Sunday would have wasted a day *and* left the previous Sunday in no
+  window at all, permanently. Consecutive Sundays now tile exactly.
+
+  **Stricter than the digest, deliberately.** `interests.yaml`'s
+  `weekly_min_*` thresholds had existed since Phase 0 as prompt text only —
+  telling Haiku what bar to keep at. This applies the arithmetic (DESIGN §9),
+  so an item scored 3/3/2 that the digest showed is legitimately absent, and
+  becomes a near-miss instead. That population needed no new constant: it is
+  definitionally the gate-failers in the existing ranking (NEVER rule 6).
+
+  **Checkboxes attach to items, never to what the model cited**, so
+  `item_count` — the acceptance gate's denominator — is a pure function of
+  `(date, timezone, db state, config)` and the model's citation behaviour
+  cannot influence the metric it is measured by. `feedback.harvest_marks` now
+  scans `weekly/` alongside `daily/` (`HARVEST_DIRS`); without it the gate had
+  no sensor, and regenerating a brief would have destroyed ticks that existed
+  only in the file.
+
+  **The vault file is written on every outcome**, including a refused or
+  unusable synthesis — body, checkboxes and near-misses come from the
+  deterministic selection, never from the model (DESIGN §13.2). That is also
+  what bounds the spend: every day of a week resolves to the same Sunday and
+  therefore the same path, so the file guard makes a mis-wired daily
+  invocation cost one call a week rather than thirty a month. A non-Sunday
+  `--date` is refused rather than snapped. `--dry-run` previews the selection
+  and makes **no** call, unlike `curate run --dry-run`, because everything
+  worth previewing here is deterministic.
+
+  **Cost:** one Opus request per run, no retry, and **no prompt cache** — at a
+  weekly cadence an ephemeral entry always expires unread, so a breakpoint is
+  pure write premium (the scout's own recorded reasoning). Payload is
+  `(item_id, title, summary, reasoning)` — never `items.content`, even on rows
+  the podcast's deep read has populated. `WEEKLY_MONTHLY_CEILING_USD` = $3.50,
+  guarded by a test that prices at the *ceiling* item count, at 1.0
+  bytes/token, and at **five** calls a month because a month can contain five
+  Sundays. Computed worst case $2.47; first real run measured $0.08.
+
 - **`taxonomy.yaml`** (DESIGN §10, Phase 1). The two-level topic tree —
   a group (`industry`, `frontier`, ...) containing leaves, each carrying its
   match keywords — validated by the new `TaxonomyConfig` in `config.py`.
@@ -107,6 +154,17 @@ consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
   `interests.yaml` can no longer silently contradict the prompt.
 
 ### Fixed
+- **A feed could forge your feedback marks** (`models.flatten_to_single_line`).
+  `scores.reasoning` is model-authored from feed content and renders straight
+  into the daily digest, and `harvest_marks` reads a verdict from any line
+  matching its pattern. Flattening defeated a forged marker only when other
+  text preceded it — a value that *is* a marker is already one line, so
+  collapsing was a no-op and the template emitted it on a line of its own.
+  Reproduced on `main`: it yielded a real `Mark`. Both harvest patterns anchor
+  on the HTML comment, so the opener is now neutralised, which closes the
+  class wherever the marker sits. The same hole existed for `curate`'s
+  approval markers and for feed-supplied item titles.
+
 - Empty digest for non-UTC operators: the digest day is now resolved in the
   configured timezone via a DST-correct half-open UTC window, instead of a naive
   UTC date prefix that hid a UTC+10 reader's items under the prior date.

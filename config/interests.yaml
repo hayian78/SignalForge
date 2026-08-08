@@ -88,3 +88,10 @@ thresholds:
   # One release per repo — the highest-ranked, not the newest (a prerelease
   # publishes after the stable release it follows).
   daily_max_per_github_repo: 1
+
+  # Weekly Intelligence Brief: how many items the brief carries, and how many
+  # gate-failers its footer lists so `mark <id> missed` is cheap to give.
+  # Unlike daily_max_items this bounds an Opus call, so it is a cost knob —
+  # llm.WEEKLY_MAX_ITEMS is the hard ceiling this can only lower.
+  weekly_top_n: 12
+  weekly_near_miss_n: 5
