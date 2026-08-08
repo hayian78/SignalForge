@@ -667,6 +667,12 @@ def test_shipped_interests_yaml_parses(repo_config_dir: Path) -> None:
     assert config.thresholds.daily_max_per_github_repo <= config.thresholds.daily_max_per_source, (
         "the per-repo limit is the tighter of the two; above the per-source cap it is a no-op"
     )
+    # The weekly brief is Phase 1's acceptance gate, and both its knobs are
+    # optional in the model (absent = brief off). Assert the shipped file sets
+    # them, so deleting either key fails here rather than silently producing no
+    # brief on a Sunday nobody is watching.
+    assert config.thresholds.weekly_top_n is not None
+    assert config.thresholds.weekly_near_miss_n is not None
     assert config.priority_topics, "interests.yaml defines 'relevant to me' — it cannot be empty"
 
 
@@ -930,6 +936,34 @@ def test_podcast_top_n_rejects_meaningless_values(bad: int) -> None:
         "podcast_top_n": bad,
     }
     with pytest.raises(ValueError, match="podcast_top_n"):
+        Thresholds(**values)
+
+
+@pytest.mark.parametrize("knob", ["weekly_top_n", "weekly_near_miss_n"])
+def test_weekly_brief_knobs_default_to_none_which_means_the_brief_is_off(knob: str) -> None:
+    # Same posture as podcast_top_n: an interests.yaml predating the weekly
+    # brief stays valid, and the brief stays off rather than switching itself on
+    # with an invented item count that would bill an Opus call.
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+    }
+    assert getattr(Thresholds(**values), knob) is None
+
+
+@pytest.mark.parametrize("knob", ["weekly_top_n", "weekly_near_miss_n"])
+@pytest.mark.parametrize("bad", [0, -1])
+def test_weekly_brief_knobs_reject_meaningless_values(knob: str, bad: int) -> None:
+    values = {
+        "weekly_min_signal": 3,
+        "weekly_min_relevance": 3,
+        "weekly_min_total": 10,
+        "daily_max_items": 15,
+        knob: bad,
+    }
+    with pytest.raises(ValueError, match=knob):
         Thresholds(**values)
 
 

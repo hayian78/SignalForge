@@ -294,6 +294,34 @@ class Thresholds(_StrictModel):
     weekly_min_relevance: int = Field(ge=1, le=5)
     weekly_min_total: int = Field(ge=3, le=15)
 
+    weekly_top_n: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Weekly Intelligence Brief item cap: the top-N kept items from the brief's "
+            "7-day window, after the `weekly_min_*` gates above and the same crowding "
+            "limits the digest uses, become source material for `synth/weekly.py`. "
+            "Separate from `daily_max_items` for the same reason `podcast_top_n` is — a "
+            "read-length knob and an Opus-cost knob are different concerns sharing one "
+            "ranking. Bounded by top-N, never by how many items triage keeps, so a "
+            "keep-rate improvement cannot silently become a cost multiplier. Whatever is "
+            "set here, `llm.WEEKLY_MAX_ITEMS` will be the hard ceiling config can only "
+            "lower. None disables the weekly brief."
+        ),
+    )
+
+    weekly_near_miss_n: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "How many near-miss items the brief's footer lists: kept items in the window "
+            "that failed the `weekly_min_*` gates, top-N in the same ranking. They exist "
+            "to make `signalforge mark <id> missed` cheap to give (DESIGN §11) — `missed` "
+            "is the highest-value verdict and the one the operator has no other prompt "
+            "for. None omits the footer section."
+        ),
+    )
+
     daily_max_items: int = Field(
         ge=1,
         description=(

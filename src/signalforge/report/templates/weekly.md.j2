@@ -1,0 +1,94 @@
+---
+kind: weekly-brief
+date: {{ context.date.isoformat() }}
+window_start: {{ context.window_start.isoformat() }}
+window_end: {{ context.window_end.isoformat() }}
+tags: [signalforge, weekly-brief]
+brief_version: {{ context.brief_version }}
+model: {{ context.model }}
+item_count: {{ context.item_count }}
+---
+
+# Weekly Intelligence Brief — {{ context.date.isoformat() }}
+
+*The week of {{ context.window_start.isoformat() }} to {{ context.window_end.isoformat() }}.*
+
+{% if context.leads %}
+## The things that mattered
+
+{% for lead in context.leads %}
+### {{ loop.index }}. {{ lead.headline }}
+
+{{ lead.why_it_matters }}
+
+**Sources:**
+{% for source in lead.sources %}
+- [{{ escape_title(source.title) }}]({{ source.url }}) <!-- sf:item={{ source.item_id }} -->
+{% endfor %}
+
+{% endfor %}
+{% endif %}
+{% if context.clusters %}
+## Themes
+
+{% for cluster in context.clusters %}
+### {{ cluster.title }}
+
+{{ cluster.narrative }}
+
+**Sources:**
+{% for source in cluster.sources %}
+- [{{ escape_title(source.title) }}]({{ source.url }}) <!-- sf:item={{ source.item_id }} -->
+{% endfor %}
+
+{% endfor %}
+{% endif %}
+{% if not context.leads and not context.clusters %}
+*No synthesis this week — the narrative call produced nothing usable. The week's items are still below, still markable. Check `signalforge status`.*
+
+{% endif %}
+---
+
+## Items
+
+{% if context.items %}
+*{{ context.item_count }} item(s) — tick a box to record how each one landed.*
+
+{% for line in context.items %}
+### {{ loop.index }}. {{ line.title }}
+
+**Scores:** signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
+**Link:** {{ line.url }}
+
+{% for verdict in checkbox_verdicts %}
+{{ checkbox_marker(line.id, verdict) }}
+{% endfor %}
+
+{% endfor %}
+{% else %}
+*Nothing cleared the brief's bar this week — a quiet week, or a pipeline problem worth checking with `signalforge status`.*
+
+{% endif %}
+{% if context.near_misses %}
+---
+
+## Near misses
+
+*Kept by triage, but below the brief's bar. If one of these should have made it, `signalforge mark <id> missed` is the most useful thing you can tell the pipeline.*
+
+{% for line in context.near_misses %}
+- `{{ line.id }}` [{{ escape_title(line.title) }}]({{ line.url }}) — signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
+{% endfor %}
+
+{% endif %}
+---
+
+*{{ context.gated_out_count }} kept item(s) below the brief's bar · {{ context.hidden_count }} more above it but not shown (source limits and the item cap).*
+{% if context.unread_item_count %}
+
+**{{ context.unread_item_count }} item(s) below were not read by the synthesis** — the item cap (`llm.WEEKLY_MAX_ITEMS`) is lower than `weekly_top_n`. They are still markable; the narrative above just does not cover them.
+{% endif %}
+{% if context.dropped_item_ids %}
+
+**Fabricated citations dropped:** {{ context.dropped_item_ids | join(", ") }} — the synthesis cited item id(s) it was never given.
+{% endif %}

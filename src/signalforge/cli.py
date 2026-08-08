@@ -126,8 +126,17 @@ from signalforge.report.daily import (
     utc_day_window,
 )
 from signalforge.report.podcast import order_by_verdict, script_path, write_script
+from signalforge.report.weekly import (
+    WEEKLY_WINDOW_DAYS,
+    WeeklySelection,
+    brief_path,
+    select_weekly_items,
+    weekly_window,
+    write_brief,
+)
 from signalforge.score import ScoreOutcome, score_unscored_items
 from signalforge.synth.podcast import build_podcast_stable_prefix, build_script
+from signalforge.synth.weekly import build_brief, build_weekly_stable_prefix
 
 __all__ = [
     "app",
@@ -161,12 +170,27 @@ RUN_KIND_DIGEST: Final = "daily"
 RUN_KIND_CURATE: Final = "curate"
 RUN_KIND_CURATE_APPLY: Final = "curate-apply"
 RUN_KIND_PODCAST: Final = "podcast"
+RUN_KIND_WEEKLY: Final = "weekly"
 """Matches the `runs.kind` vocabulary in DESIGN §5.
 
 `curate` and `curate-apply` are separate kinds on purpose: one makes a paid Opus
 call and the other edits a file for free, and `status` shows the last run of each
 kind. Folding them together would hide a scout that has stopped running behind an
 apply that runs every morning."""
+
+_SUNDAY: Final = 6
+"""`date.weekday()` for Sunday — Monday is 0. A brief is dated by the Sunday it is
+published on, and `_resolve_target_sunday` refuses any other day."""
+
+
+def _weekly_window_label(target_sunday: Date) -> str:
+    """The window as the brief's prompt names it. Prose only — the actual window
+    is `report.weekly.weekly_window`, and this must never become a second,
+    drifting definition of it."""
+    start = target_sunday - timedelta(days=WEEKLY_WINDOW_DAYS)
+    end = target_sunday - timedelta(days=1)
+    return f"{start.isoformat()} to {end.isoformat()}"
+
 
 _MIN_CURATE_INTERVAL_DAYS: Final = 6
 """How recently a `curate` run may have happened before another is refused.
@@ -1799,6 +1823,271 @@ def curate_reopen(
 # --------------------------------------------------------------------------- #
 # daily
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# weekly — the Sunday brief (DESIGN §13, Phase 1's acceptance gate)
+# --------------------------------------------------------------------------- #
+
+
+def _most_recent_sunday(today: Date) -> Date:
+    """The Sunday on or before `today`.
+
+    Split out from `_resolve_target_sunday` so the arithmetic is testable without
+    a clock: it is what makes every day of a week resolve to one vault path, and
+    therefore what bounds this command's spend at one call per week.
+    """
+    # Monday is 0 in `weekday()`, so Sunday is 6; `(weekday + 1) % 7` is how many
+    # days back the most recent Sunday is, and it is 0 on a Sunday.
+    return today - timedelta(days=(today.weekday() + 1) % 7)
+
+
+def _resolve_target_sunday(target_date: datetime | None, *, tz: tzinfo) -> Date:
+    """The Sunday a brief is published on: `--date`, or the most recent one.
+
+    This is the whole double-spend defence, and it lives here rather than in a
+    `runs` guard on purpose. `weekly` is safe to invoke any day — every day of a
+    week resolves to the same Sunday, so it resolves to the same vault path, so
+    the file guard in `weekly` sees the existing file and skips the call. A
+    command defaulting to "today" would instead produce a different filename
+    every day, and a mis-wired daily invocation would bill thirty times a month
+    while the file guard saw nothing.
+
+    A non-Sunday `--date` is refused rather than snapped. Silently rewriting an
+    operator's explicit date would make `--date 2026-08-05` quietly write the
+    2026-08-02 brief, and finding that out from the filename is worse than
+    finding it out from an error.
+    """
+    if target_date is None:
+        return _most_recent_sunday(datetime.now(tz).date())
+
+    resolved = target_date.date()
+    if resolved.weekday() != _SUNDAY:
+        raise typer.BadParameter(
+            f"{resolved.isoformat()} is a {resolved.strftime('%A')}. A brief is dated by the "
+            "Sunday it is published on, and covers the seven days before it — pass that "
+            "Sunday, or omit --date for the most recent one.",
+            param_hint="--date",
+        )
+    return resolved
+
+
+def _select_weekly_items(
+    conn: sqlite3.Connection,
+    *,
+    interests: InterestsConfig,
+    target_sunday: Date,
+    tz: tzinfo,
+) -> WeeklySelection:
+    """The week's rows, partitioned into the brief's body and its near-misses.
+
+    All deterministic (`report/weekly.py`); the only judgement in the whole
+    command is what synthesis then writes *about* these items.
+    """
+    start, end = weekly_window(target_sunday, tz)
+    rows = get_digest_items(conn, start=start, end=end)
+    verdicts = feedback_verdicts_for_items(
+        conn, [scored.item.id for scored in rows if scored.item.id is not None]
+    )
+    return select_weekly_items(rows, verdicts, thresholds=interests.thresholds)
+
+
+def _render_weekly_preview(selection: WeeklySelection, *, target_sunday: Date) -> None:
+    """What `--dry-run` prints. Everything here is deterministic, which is why
+    the preview needs no paid call to be a preview of anything — unlike
+    `curate run --dry-run`, whose whole subject is the call (DESIGN §14)."""
+    window_start = target_sunday - timedelta(days=WEEKLY_WINDOW_DAYS)
+    console.print(
+        f"[bold]week of {window_start.isoformat()} to "
+        f"{(target_sunday - timedelta(days=1)).isoformat()}[/bold] "
+        f"→ brief dated {target_sunday.isoformat()}"
+    )
+    for index, scored in enumerate(selection.items, start=1):
+        console.print(
+            f"  {index:2}. [{scored.signal}/{scored.relevance}/{scored.novelty}] "
+            f"{escape(scored.item.title)}"
+        )
+    if selection.near_misses:
+        console.print("[dim]near misses:[/dim]")
+        for scored in selection.near_misses:
+            console.print(
+                f"  [dim]id={scored.item.id} "
+                f"[{scored.signal}/{scored.relevance}/{scored.novelty}] "
+                f"{escape(scored.item.title)}[/dim]"
+            )
+    console.print(
+        f"[dim]{selection.gated_out_count} below the bar · "
+        f"{selection.hidden_count} above it but not shown[/dim]"
+    )
+
+
+@app.command()
+def weekly(
+    config_dir: Annotated[
+        Path, typer.Option("--config-dir", help="Directory holding interests.yaml.")
+    ] = DEFAULT_CONFIG_DIR,
+    db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
+    vault_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--vault-dir", help="Vault root (briefs land in <vault>/weekly/). See `digest`."
+        ),
+    ] = None,
+    target_date: Annotated[
+        datetime | None,
+        typer.Option(
+            "--date",
+            formats=["%Y-%m-%d"],
+            help="The Sunday the brief is dated (default: the most recent one).",
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the selection. No LLM call, no writes."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Rewrite an existing brief (a fresh, billed Opus call)."),
+    ] = False,
+) -> None:
+    """Write the Weekly Intelligence Brief — Phase 1's product and its gate.
+
+    Covers the **seven days before** its Sunday, not including it: the score pass
+    runs in the evening and this runs Sunday morning (DESIGN §14), so the
+    publication day's own items do not exist yet. Consecutive Sundays tile
+    exactly.
+
+    Stricter than the daily digest by design. `interests.yaml`'s `weekly_min_*`
+    thresholds have until now existed only as prompt text telling triage what bar
+    to keep at; this applies the arithmetic (DESIGN §9), so items the digest
+    showed can legitimately be absent. Those become the near-miss list, which is
+    there to make `signalforge mark <id> missed` cheap to give.
+
+    Idempotent, and that is what bounds the spend (CLAUDE.md §3, §6). Every day of
+    a week resolves to the same Sunday and therefore the same vault path, so a
+    brief already on disk is left alone and no call is made; `--force` is the only
+    way to pay twice for one week.
+
+    **The vault file is written on every outcome**, including a refused or
+    unusable synthesis — the body, the checkboxes and the near-misses come from
+    the deterministic selection, never from the model (DESIGN §13.2). A failed
+    call therefore degrades the brief rather than skipping it, and because the
+    file still lands, the next invocation still declines to re-bill.
+
+    `thresholds.weekly_top_n` unset means the brief is off: a clean exit, no call.
+    """
+    interests = _load_interests_or_exit(config_dir)
+    settings = _load_settings_or_exit(config_dir)
+    tz = settings.tzinfo
+    effective_vault_dir = vault_dir if vault_dir is not None else settings.vault_dir
+    target_sunday = _resolve_target_sunday(target_date, tz=tz)
+
+    with connection(db) as conn:
+        run_id = start_run(conn, RUN_KIND_WEEKLY, started_at=datetime.now(UTC))
+        run_level_error: dict[str, str] | None = None
+        harvest_error: dict[str, str] | None = None
+        status_value = "failed"
+        input_tokens = 0
+        output_tokens = 0
+
+        try:
+            if interests.thresholds.weekly_top_n is None:
+                console.print(
+                    "[yellow]weekly brief is off[/yellow]: set `thresholds.weekly_top_n` "
+                    "in interests.yaml to turn it on."
+                )
+                status_value = "ok"
+                return
+
+            # Harvest before selection (so `noise` applies) and before the write
+            # (so `--force` cannot destroy ticks that exist only in the file).
+            # One pass satisfies both. Skipped on --dry-run: a preview must never
+            # write ground-truth feedback rows. Non-fatal — a broken harvest is
+            # recorded to `runs.errors` and surfaced by `status`, and the brief
+            # still renders (CLAUDE.md §7).
+            if not dry_run:
+                try:
+                    harvested = harvest_marks(conn, effective_vault_dir)
+                    if harvested.rows_recorded:
+                        console.print(
+                            f"[green]harvested feedback[/green]: "
+                            f"{harvested.rows_recorded} new mark(s) after scanning "
+                            f"{harvested.files_scanned} vault file(s)."
+                        )
+                except Exception as exc:
+                    logger.exception("harvesting vault feedback failed; continuing to the brief")
+                    harvest_error = _run_level_error(exc)
+
+            selection = _select_weekly_items(
+                conn, interests=interests, target_sunday=target_sunday, tz=tz
+            )
+
+            if dry_run:
+                _render_weekly_preview(selection, target_sunday=target_sunday)
+                console.print("[yellow]dry run[/yellow]: no LLM call, nothing written.")
+                status_value = "ok"
+                return
+
+            if not selection.items:
+                console.print(
+                    "[yellow]nothing cleared the brief's bar this week[/yellow] — no call made."
+                )
+                status_value = "ok"
+                return
+
+            path = brief_path(effective_vault_dir, target_sunday=target_sunday)
+            if path.is_file() and not force:
+                console.print(
+                    f"[dim]brief already written:[/dim] {path} "
+                    "[dim](--force to rewrite; that is a fresh, billed call)[/dim]"
+                )
+                status_value = "ok"
+                return
+
+            built = build_brief(
+                build_weekly_stable_prefix(interests),
+                window_label=_weekly_window_label(target_sunday),
+                items=selection.items,
+            )
+            input_tokens = built.input_tokens
+            output_tokens = built.output_tokens
+            if built.brief is None:
+                console.print(
+                    "[yellow]synthesis produced nothing usable[/yellow] — writing the "
+                    "brief without a narrative."
+                )
+
+            # Last thing that can raise between a billed response and disk. If a
+            # write failure ever became routine here the next run would re-bill,
+            # which is the one repeat-spend path the Sunday snap does not close.
+            written = write_brief(
+                built,
+                selection,
+                target_sunday=target_sunday,
+                vault_dir=effective_vault_dir,
+            )
+            console.print(
+                f"[green]wrote[/green] {written} "
+                f"[dim]({len(selection.items)} item(s), "
+                f"{input_tokens + output_tokens} tokens)[/dim]"
+            )
+            status_value = "ok"
+        except BaseException as exc:
+            run_level_error = _run_level_error(exc)
+            raise
+        finally:
+            errors = [record for record in (run_level_error, harvest_error) if record is not None]
+            finish_run(
+                conn,
+                run_id,
+                status=status_value,
+                finished_at=datetime.now(UTC),
+                llm_input_tokens=input_tokens,
+                llm_output_tokens=output_tokens,
+                errors=errors or None,
+            )
+        if status_value != "ok":
+            raise typer.Exit(code=1)
 
 
 @app.command()

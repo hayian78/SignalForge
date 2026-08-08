@@ -68,8 +68,12 @@ uv run signalforge ingest    # fetch from all configured sources into SQLite
 uv run signalforge score     # batched Haiku triage + scoring of unscored items
 uv run signalforge digest    # render today's Daily Digest into <vault_dir>/daily/
 uv run signalforge podcast   # write today's episode script and publish it, if configured
-uv run signalforge daily     # curate apply -> ingest -> score -> digest -> podcast (cron 06:00)
+uv run signalforge weekly    # the Sunday brief for the seven days before it (Opus; --dry-run is free)
+uv run signalforge mark      # record how an item landed: useful | noise | exceptional | missed
+uv run signalforge daily     # curate apply -> ingest -> score -> digest (cron 19:00, --no-podcast)
 uv run signalforge status    # last-run health, per-source freshness, token + TTS spend
+
+uv run signalforge curate run     # weekly source scout (paid; Fri 05:30)
 
 uv run signalforge deliver test   # send one sample email, to prove the channel works
 ```
