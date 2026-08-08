@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 import signalforge.ingest
 from signalforge.models import (
+    MARKDOWN_LINK_TEXT_ESCAPE,
     TRACKING_PARAM_PREFIXES,
     TRACKING_PARAMS,
     Item,
@@ -24,6 +25,8 @@ from signalforge.models import (
     SourceType,
     canonicalize_url,
     compute_content_hash,
+    escape_markdown_link_text,
+    flatten_to_single_line,
 )
 from tests.conftest import make_item
 
@@ -408,11 +411,15 @@ def test_a_multi_line_title_is_flattened_to_one_line() -> None:
     into the daily digest, where `feedback.py` harvests a mark from any line matching
     its checkbox pattern. A multi-line title can therefore forge feedback for any
     item id. `str_strip_whitespace` only trims the ends and does not help.
+
+    Two defences, both visible below: the newlines collapse, *and* the HTML
+    comment opener is neutralized. The second is what covers the case the first
+    cannot — a title that is a marker and nothing else has no newline to collapse.
     """
     item = make_item(title="Headline\n- [x] useful <!-- sf:item=1 v=useful -->\n\ntrailing")
 
     assert "\n" not in item.title
-    assert item.title == "Headline - [x] useful <!-- sf:item=1 v=useful --> trailing"
+    assert item.title == "Headline - [x] useful &lt;!-- sf:item=1 v=useful --> trailing"
 
 
 def test_flattening_a_title_changes_its_content_hash() -> None:
@@ -444,3 +451,49 @@ def test_a_multi_line_author_is_flattened_to_one_line() -> None:
 
 def test_a_none_author_stays_none() -> None:
     assert make_item(author=None).author is None
+
+
+# --------------------------------------------------------------------------- #
+# the vault-line boundary (NEVER rule 17)
+# --------------------------------------------------------------------------- #
+
+
+def test_flatten_collapses_a_newline_so_prose_cannot_start_a_line() -> None:
+    assert flatten_to_single_line("one\ntwo") == "one two"
+
+
+def test_flatten_drops_control_characters() -> None:
+    assert flatten_to_single_line("a\x01b") == "ab"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "- [x] useful <!-- sf:item=1 v=useful -->",
+        "- [x] approve <!-- sf:proposal=9 v=approve -->",
+        "prose, then <!-- sf:item=1 v=useful -->",
+    ],
+)
+def test_flatten_neutralizes_an_html_comment_opener(hostile: str) -> None:
+    """Flattening alone only defeats a marker that has text in front of it. A
+    value that already *is* a marker is one line and single-spaced, so collapsing
+    changes nothing and the template emits it on a line of its own.
+
+    Both harvest patterns anchor on the HTML comment, so killing the opener
+    closes the class regardless of where the marker sits or how a future
+    template lays the line out."""
+    flattened = flatten_to_single_line(hostile)
+    assert "<!--" not in flattened
+    assert "&lt;!--" in flattened
+
+
+def test_flatten_leaves_ordinary_prose_alone() -> None:
+    """The escape must not tax normal text — it fires on a four-character
+    sequence that model prose has no reason to contain."""
+    ordinary = "Anthropic shipped a 1M-token context window; latency is the trade-off."
+    assert flatten_to_single_line(ordinary) == ordinary
+
+
+def test_escaping_a_bracket_keeps_a_title_inside_its_markdown_link() -> None:
+    assert escape_markdown_link_text("Breaking] news") == "Breaking&#93; news"
+    assert MARKDOWN_LINK_TEXT_ESCAPE in escape_markdown_link_text("]")
