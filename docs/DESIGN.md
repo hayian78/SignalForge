@@ -1183,7 +1183,15 @@ The scout is `curate run`, not a bare `curate`, deliberately: it is the one comm
 - `signalforge status` prints last-run health, per-source freshness, and month-to-date token + TTS character spend (§13.3, priced at the configured podcast TTS model).
 - **Docker** is provided as an optional `Dockerfile` + compose file for portability, but the default deployment is a `uv`-managed venv + crontab — one fewer layer between you and the logs.
 - Backups: the vault is git (push to a private remote); `signalforge.db` gets a nightly `sqlite3 .backup` copy; both configs are in the repo. `data/audio/` (the podcast's local mp3 cache, §13.3) is deliberately **not** backed up — R2 already holds the durable copy, and the pruning logic never treats a missing local file as evidence an episode should be deleted remotely.
-- **Out-of-repo vault (`settings.yaml` `vault_dir`).** The output directory is configurable (e.g. a `/mnt/c` Windows Obsidian vault read from a WSL pipeline). When `vault_dir` points outside the repo, the vault has its own git story: the Phase 1 auto-commit in `report/writer.py` must target *that* directory's repo (or no-op cleanly when it isn't a repo), and the backup line above rides on the vault's actual location, not this repo. Decide this when `writer.py` is specced — it does not exist yet.
+- **Out-of-repo vault (`settings.yaml` `vault_dir`).** The output directory is configurable (e.g. a `/mnt/c` Windows Obsidian vault read from a WSL pipeline), so the vault has its own git story and the backup line above rides on the vault's actual location, not this repo. **Shipped 2026-08-16 as `report/vaultgit.py`** (not `writer.py` — there is no such module; each report writes itself, so the commit is a helper the three write paths call rather than a stage inside one writer). `commit_vault` runs after `digest`, `weekly`, and `podcast` have written their file, toggled by `vault_git.enabled`.
+
+  Three properties are load-bearing, in descending order of how badly they bite:
+
+  1. **It commits only when `vault_dir` is itself the repository top level**, checked twice — `rev-parse --show-toplevel` must equal the resolved vault *and* `<vault>/.git` must exist. The shipped vault sits under a Windows user profile, and a stray `git init` anywhere above it would otherwise let `git add` reach the whole profile. The environment is scrubbed of `GIT_*` before every invocation for the same reason: an inherited `GIT_DIR` forces git's repo discovery and makes a single-check guard agree with itself.
+  2. **Every command carries the `-- daily weekly podcast` pathspec**, including the emptiness check and the commit. A bare `git commit -m` commits the whole index, which would sweep in whatever the operator had staged in their own vault.
+  3. **It cannot fail a run.** The report is already on disk — and, for the brief, already billed — so every failure returns an outcome (NEVER rules 12, 19). A *guarded refusal* is not an error at all: an operator who never ran `git init` should not collect a `runs.errors` row every evening for a feature they never opted into.
+
+  No `git push`: a push is a network call and `report/` makes none (CLAUDE.md §2). Adding a private remote and pushing it stays a manual operator step.
 
 ---
 
@@ -1229,7 +1237,7 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 **Status — the gate's component shipped 2026-08-08; the gate itself is four Sundays of reading.**
 - [x] **Weekly Intelligence Brief** (`report/weekly.py`, `synth/weekly.py`, `llm.run_weekly_brief`, `signalforge weekly`) — deterministic selection over the seven days *before* its Sunday, one Opus call, vault-written on every outcome, marks harvested from `weekly/` so the gate has a sensor
 - [ ] Four consecutive Sunday briefs, ≥ 80% of brief items rated `useful` or better
-- [ ] vault git-committed · [ ] `score/taxonomy.py` tagger · [ ] awesome-list diffing
+- [x] **vault git-committed** (`report/vaultgit.py`, shipped 2026-08-16 — §14) · [ ] `score/taxonomy.py` tagger · [ ] awesome-list diffing
 - [x] `status` + `mark` commands · [x] adaptive source curation (#9) · [x] arXiv ingestion
 
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml` (**config staged 2026-08-07** — validated, `score/taxonomy.py` tagger still pending, §10); arXiv (`ingest/arxiv.py`, **shipped 2026-08-07**) + awesome-list diffing (still pending); 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).

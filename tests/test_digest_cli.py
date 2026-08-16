@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import sqlite3
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -439,3 +441,101 @@ def test_no_curation_block_means_no_settled_proposals_render(
     assert result.exit_code == 0, result.output
     content = (vault_dir / "daily" / "2026-07-16.md").read_text(encoding="utf-8")
     assert "Recently decided" not in content
+
+
+# --------------------------------------------------------------------------- #
+# Vault auto-commit wiring (DESIGN §16 — `report/vaultgit.py`)
+# --------------------------------------------------------------------------- #
+
+
+def _init_vault_repo(vault_dir: Path) -> None:
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["init", "--initial-branch=main"],
+        ["config", "user.email", "test@signalforge.invalid"],
+        ["config", "user.name", "SignalForge Test"],
+    ):
+        subprocess.run(["git", "-C", str(vault_dir), *args], capture_output=True, check=True)
+
+
+def _vault_commits(vault_dir: Path) -> int:
+    result = subprocess.run(
+        ["git", "-C", str(vault_dir), "rev-list", "--count", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return int(result.stdout.strip()) if result.returncode == 0 else 0
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_digest_commits_the_vault_when_it_is_a_repo(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """The wiring: a written digest lands in the vault's own history."""
+    _seed(db_path)
+    _init_vault_repo(vault_dir)
+
+    result = _invoke(db_path, vault_dir, config_dir)
+
+    assert result.exit_code == 0, result.output
+    assert _vault_commits(vault_dir) == 1
+    assert "vault committed" in result.output
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_rerunning_digest_does_not_pile_up_empty_commits(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """Idempotency through the real command (NEVER rule 4): the second run
+    re-renders the identical file, so there is nothing new to commit."""
+    _seed(db_path)
+    _init_vault_repo(vault_dir)
+
+    assert _invoke(db_path, vault_dir, config_dir).exit_code == 0
+    assert _invoke(db_path, vault_dir, config_dir).exit_code == 0
+
+    assert _vault_commits(vault_dir) == 1
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_dry_run_does_not_commit_the_vault(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """A preview has no side effects — the same reason it does not harvest."""
+    _seed(db_path)
+    _init_vault_repo(vault_dir)
+
+    assert _invoke(db_path, vault_dir, config_dir, "--dry-run").exit_code == 0
+
+    assert _vault_commits(vault_dir) == 0
+
+
+def test_digest_still_succeeds_when_the_vault_is_not_a_repo(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """The default vault is not a git repo, and that must stay a clean, error-free
+    run — not a `runs.errors` record every evening."""
+    _seed(db_path)
+
+    result = _invoke(db_path, vault_dir, config_dir)
+
+    assert result.exit_code == 0, result.output
+    assert _runs(db_path)[-1]["errors"] is None
+
+
+def test_vault_git_can_be_disabled_in_settings(
+    db_path: Path, vault_dir: Path, config_dir: Path
+) -> None:
+    """The toggle is config, so it has to have an effect through the real command."""
+    _seed(db_path)
+    (config_dir / "settings.yaml").write_text("vault_git:\n  enabled: false\n", encoding="utf-8")
+    if shutil.which("git") is not None:
+        _init_vault_repo(vault_dir)
+
+    result = _invoke(db_path, vault_dir, config_dir)
+
+    assert result.exit_code == 0, result.output
+    assert "vault committed" not in result.output
+    if shutil.which("git") is not None:
+        assert _vault_commits(vault_dir) == 0

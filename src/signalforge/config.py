@@ -55,6 +55,7 @@ __all__ = [
     "TaxonomyConfig",
     "TaxonomyLeaf",
     "Thresholds",
+    "VaultGitConfig",
     "get_secret",
     "load_interests",
     "load_settings",
@@ -734,6 +735,26 @@ class DeliveryConfig(_StrictModel):
     podcast: PodcastChannelConfig | None = None
 
 
+class VaultGitConfig(_StrictModel):
+    """The `vault_git:` block — auto-commit of written reports (DESIGN §14, §16).
+
+    Only a toggle, deliberately. *Which* paths get staged is a safety property
+    rather than a preference (`report.vaultgit.COMMITTABLE_SUBDIRS`), and the
+    commit is refused outright unless `vault_dir` is its own repository root —
+    so there is no knob here that can widen what gets committed.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Commit each written report into the vault's own git history. Safe to "
+            "leave on: when the vault is not a git repository — or is nested inside "
+            "a wider one — the commit no-ops with a logged reason rather than "
+            "staging anything. Nothing is ever pushed; a remote is a manual step."
+        ),
+    )
+
+
 class SettingsConfig(_StrictModel):
     """Root model for `settings.yaml` — machine-local app and locale settings.
 
@@ -772,6 +793,10 @@ class SettingsConfig(_StrictModel):
     """Outbound mirrors of a rendered report (DESIGN §13.2's push channel). Absent means
     the vault is the only destination, which is the historical behaviour and stays the
     default: delivery is additive, never a substitute for the vault write."""
+
+    vault_git: VaultGitConfig = Field(default_factory=VaultGitConfig)
+    """Local git history for the vault. Defaults to on because the guarded no-op
+    is harmless — an operator whose vault is not a repo simply never gets a commit."""
 
     @field_validator("vault_dir", mode="before")
     @classmethod

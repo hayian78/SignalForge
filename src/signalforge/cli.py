@@ -126,6 +126,7 @@ from signalforge.report.daily import (
     utc_day_window,
 )
 from signalforge.report.podcast import order_by_verdict, script_path, write_script
+from signalforge.report.vaultgit import VaultCommitStatus, commit_vault
 from signalforge.report.weekly import (
     WEEKLY_WINDOW_DAYS,
     WeeklySelection,
@@ -803,6 +804,49 @@ def _report_delivery_outcomes(outcomes: list[DeliveryOutcome]) -> list[dict[str,
     return errors
 
 
+def _commit_vault_and_report(
+    *, settings: SettingsConfig, vault_dir: Path, message: str
+) -> list[dict[str, str]]:
+    """Snapshot the just-written report into the vault's git history, and say so.
+
+    Called only *after* a vault write succeeded — the vault is written first and
+    always (DESIGN §13.2). Returns the records that belong in `runs.errors`,
+    which is at most one and only for a genuine git failure: a guarded refusal
+    (vault is not its own repo) is a correct outcome, not a run error, and must
+    not accumulate one every evening for an operator who never opted in.
+
+    `detail` is escaped before printing for the same reason
+    `_report_delivery_outcomes` escapes a provider body: git's stderr can
+    contain `[...]`, which rich reads as markup, and a `MarkupError` raised here
+    would fail the run over a *successful* report (NEVER rules 12 and 19).
+    """
+    outcome = commit_vault(vault_dir, message=message, enabled=settings.vault_git.enabled)
+    detail = escape(outcome.detail)
+
+    if outcome.status is VaultCommitStatus.COMMITTED:
+        console.print(f"[green]vault committed[/green]: {outcome.commit_sha}")
+    elif outcome.status is VaultCommitStatus.FAILED:
+        err_console.print(f"[red]vault not committed[/red]: {detail}")
+    elif outcome.status in (VaultCommitStatus.NOT_REPO_ROOT, VaultCommitStatus.GIT_UNAVAILABLE):
+        # Worth a visible line: the operator probably meant this to work.
+        err_console.print(f"[yellow]vault not committed[/yellow]: {detail}")
+
+    if not outcome.is_error:
+        return []
+    # Built inline rather than through `_run_level_error`, which takes an
+    # exception: nothing was raised here by design, and inventing one just to
+    # unwrap it would be theatre. Same record shape either way.
+    return [
+        {
+            "source_id": _RUN_LEVEL_SOURCE_ID,
+            "source_type": "-",
+            "error_type": "VaultCommitError",
+            "message": outcome.detail or outcome.status.value,
+            "occurred_at": datetime.now(UTC).isoformat(),
+        }
+    ]
+
+
 @app.command()
 def digest(
     config_dir: Annotated[
@@ -894,6 +938,7 @@ def digest(
         run_level_error: dict[str, str] | None = None
         harvest_error: dict[str, str] | None = None
         delivery_errors: list[dict[str, str]] = []
+        vault_commit_errors: list[dict[str, str]] = []
         status_value = "failed"
         item_count = 0
 
@@ -941,6 +986,11 @@ def digest(
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(rendered, encoding="utf-8")
                 console.print(f"[green]digest written[/green]: {path} ({item_count} item(s)).")
+                vault_commit_errors = _commit_vault_and_report(
+                    settings=settings,
+                    vault_dir=effective_vault_dir,
+                    message=f"vault: daily digest {resolved_date.isoformat()}",
+                )
                 # Only after the vault write succeeded. The vault is canonical
                 # (DESIGN §13.2); a channel is a mirror of a file that already
                 # exists, never a substitute for writing it. Suppressed on
@@ -977,7 +1027,9 @@ def digest(
                 # didn't. Delivery failures ride the same way, for the same
                 # reason: the digest is on disk either way.
                 errors=(
-                    [e for e in (harvest_error, run_level_error) if e is not None] + delivery_errors
+                    [e for e in (harvest_error, run_level_error) if e is not None]
+                    + delivery_errors
+                    + vault_commit_errors
                 )
                 or None,
             )
@@ -1203,6 +1255,7 @@ def podcast(
         harvest_error: dict[str, str] | None = None
         deep_read_errors: list[dict[str, str]] = []
         delivery_errors: list[dict[str, str]] = []
+        vault_commit_errors: list[dict[str, str]] = []
         input_tokens = output_tokens = 0
         tts_characters = 0
         item_count = 0
@@ -1298,6 +1351,11 @@ def podcast(
                                 vault_dir=effective_vault_dir,
                             )
                             console.print(f"[green]script written[/green]: {written}")
+                            vault_commit_errors = _commit_vault_and_report(
+                                settings=settings,
+                                vault_dir=effective_vault_dir,
+                                message=f"vault: podcast script {resolved_date.isoformat()}",
+                            )
 
                     # Attempted regardless of whether the script above was fresh or
                     # reused: `deliver_podcast` is its own idempotency boundary
@@ -1340,6 +1398,7 @@ def podcast(
                         *([harvest_error] if harvest_error is not None else []),
                         *deep_read_errors,
                         *delivery_errors,
+                        *vault_commit_errors,
                     ]
                     or None
                 ),
@@ -1986,6 +2045,7 @@ def weekly(
         run_id = start_run(conn, RUN_KIND_WEEKLY, started_at=datetime.now(UTC))
         run_level_error: dict[str, str] | None = None
         harvest_error: dict[str, str] | None = None
+        vault_commit_errors: list[dict[str, str]] = []
         status_value = "failed"
         input_tokens = 0
         output_tokens = 0
@@ -2071,12 +2131,19 @@ def weekly(
                 f"[dim]({len(selection.items)} item(s), "
                 f"{input_tokens + output_tokens} tokens)[/dim]"
             )
+            vault_commit_errors = _commit_vault_and_report(
+                settings=settings,
+                vault_dir=effective_vault_dir,
+                message=f"vault: weekly brief {target_sunday.isoformat()}",
+            )
             status_value = "ok"
         except BaseException as exc:
             run_level_error = _run_level_error(exc)
             raise
         finally:
-            errors = [record for record in (run_level_error, harvest_error) if record is not None]
+            errors = [
+                record for record in (run_level_error, harvest_error) if record is not None
+            ] + vault_commit_errors
             finish_run(
                 conn,
                 run_id,

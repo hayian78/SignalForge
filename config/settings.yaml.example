@@ -111,3 +111,25 @@ timezone: UTC
 #
 #     retention_episodes: 30
 #     feed_title: SignalForge Daily
+
+# --------------------------------------------------------------------------- #
+# vault_git — local git history for the vault (DESIGN §14, §16)
+# --------------------------------------------------------------------------- #
+#
+# The vault is the product (CLAUDE.md §3); this gives it an undo. Each written
+# report is committed into the vault's *own* repository, immediately after the
+# file lands on disk.
+#
+# Safe to leave on. The commit is refused unless `vault_dir` is itself the
+# repository top level, so a vault sitting inside a wider repo — a stray
+# `git init` in your home directory, say — can never be staged through it. A
+# vault that is not a repo at all simply never gets a commit.
+#
+# Nothing is ever pushed: a push is a network call, and `report/` makes none
+# (CLAUDE.md §2). Add a remote and push it yourself, or from cron.
+#
+# To turn it on for a fresh vault:
+#     git -C <vault_dir> init
+#
+# vault_git:
+#   enabled: true
