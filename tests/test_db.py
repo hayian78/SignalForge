@@ -147,12 +147,13 @@ def test_migrations_are_append_only_and_ordered() -> None:
     assert versions[0] == 1
 
 
-def test_schema_version_is_five_after_the_podcast_migration() -> None:
-    # Migration 5 (podcast TTS spend) is the last one; SCHEMA_VERSION derives
-    # from it. If this drops, a fresh DB stops getting `tts_characters` and
-    # every podcast run's spend goes unrecorded.
-    assert SCHEMA_VERSION == 5
-    assert MIGRATIONS[-1].version == 5
+def test_schema_version_is_six_after_the_topics_migration() -> None:
+    # Migration 6 (`item_topics`) is the last one; SCHEMA_VERSION derives from
+    # it. Bump this deliberately when a migration is added — it is the tripwire
+    # against a migration being appended without anyone noticing the schema the
+    # rest of the code now assumes.
+    assert SCHEMA_VERSION == 6
+    assert MIGRATIONS[-1].version == 6
 
 
 def test_migrating_a_populated_v2_database_backfills_server_tool_requests(
@@ -1958,7 +1959,8 @@ def test_migrating_a_populated_v4_database_backfills_tts_characters(db_path: Pat
         assert row["tts_characters"] == 0
         total = conn.execute("SELECT SUM(tts_characters) AS n FROM runs").fetchone()["n"]
         assert total == 0  # a NULL here would break the status spend line
-        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == 5
+        # Migrating from v4 runs every later migration, not just the next one.
+        assert int(conn.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
     finally:
         conn.close()
 

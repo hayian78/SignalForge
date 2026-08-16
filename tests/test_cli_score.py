@@ -255,3 +255,151 @@ def test_a_runs_row_is_written_even_when_score_unscored_items_raises(
 def test_bad_config_dir_exits_two(tmp_path: Path) -> None:
     result = runner.invoke(app, ["score", "--config-dir", str(tmp_path / "missing")])
     assert result.exit_code == 2
+
+
+# --------------------------------------------------------------------------- #
+# Topic tagging (DESIGN §10 — deterministic, runs alongside scoring)
+# --------------------------------------------------------------------------- #
+
+_TAXONOMY_YAML = "policy:\n  regulation:\n    keywords: [export control]\n"
+
+
+def _write_taxonomy(config_dir: Path, body: str = _TAXONOMY_YAML) -> None:
+    (config_dir / "taxonomy.yaml").write_text(body, encoding="utf-8")
+
+
+def _topics(db_path: Path) -> list[tuple[str, str]]:
+    return [
+        (str(row["topic"]), str(row["matched_keyword"]))
+        for row in _rows(db_path, "SELECT topic, matched_keyword FROM item_topics ORDER BY topic")
+    ]
+
+
+def test_scoring_also_tags_topics(
+    config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_taxonomy(config_dir)
+    item_id = _seed_item(db_path, title="New export control rules land")
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={item_id: _triage_result()}, input_tokens=1, output_tokens=1
+        ),
+    )
+
+    result = _invoke(config_dir, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert _topics(db_path) == [("policy.regulation", "export control")]
+
+
+def test_tagging_is_idempotent_across_runs(
+    config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second `score` re-examines nothing and writes nothing (NEVER rule 4)."""
+    _write_taxonomy(config_dir)
+    item_id = _seed_item(db_path, title="New export control rules land")
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={item_id: _triage_result()}, input_tokens=1, output_tokens=1
+        ),
+    )
+
+    assert _invoke(config_dir, db_path).exit_code == 0
+    before = _topics(db_path)
+    assert _invoke(config_dir, db_path).exit_code == 0
+
+    assert _topics(db_path) == before
+
+
+def test_tagging_runs_even_when_there_is_nothing_new_to_score(
+    config_dir: Path, db_path: Path
+) -> None:
+    """The tagger is not downstream of the LLM call. An item scored before the
+    taxonomy existed still gets tagged on the next run."""
+    _write_taxonomy(config_dir)
+    item_id = _seed_item(db_path, title="New export control rules land")
+    with connection(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO scores (item_id, triage, signal, relevance, novelty, reasoning,
+                                rubric_version, model, scored_at)
+            VALUES (?, 'keep', 4, 4, 3, 'A reason.', 'v1', 'claude-haiku-4-5',
+                    '2026-07-16T06:05:00+00:00')
+            """,
+            (item_id,),
+        )
+
+    result = _invoke(config_dir, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert _topics(db_path) == [("policy.regulation", "export control")]
+
+
+def test_a_missing_taxonomy_file_does_not_fail_the_run(
+    config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tagging is additive. An operator with no `taxonomy.yaml` gets scoring,
+    not an exit code — which is also every pre-tagger config directory."""
+    item_id = _seed_item(db_path)
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={item_id: _triage_result()}, input_tokens=1, output_tokens=1
+        ),
+    )
+
+    result = _invoke(config_dir, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert _topics(db_path) == []
+
+
+def test_an_invalid_taxonomy_file_is_reported_but_still_scores(
+    config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo silently costing the operator their topics is worth shouting
+    about — but not worth failing the scoring the run was actually for."""
+    _write_taxonomy(config_dir, "policy:\n  regulation:\n    keywords: []\n")
+    item_id = _seed_item(db_path)
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={item_id: _triage_result()}, input_tokens=1, output_tokens=1
+        ),
+    )
+
+    result = _invoke(config_dir, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert "taxonomy config error" in result.output
+    assert _rows(db_path, "SELECT status FROM runs")[-1]["status"] == "ok"
+
+
+def test_a_tagging_failure_does_not_fail_the_scoring_run(
+    config_dir: Path, db_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Additive work after the run's real job succeeded — a recorded error and a
+    printed line, never a failed run (CLAUDE.md §7)."""
+    _write_taxonomy(config_dir)
+    item_id = _seed_item(db_path, title="New export control rules land")
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={item_id: _triage_result()}, input_tokens=1, output_tokens=1
+        ),
+    )
+
+    def boom(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("tagger exploded")
+
+    monkeypatch.setattr("signalforge.cli.tag_untagged_items", boom)
+
+    result = _invoke(config_dir, db_path)
+
+    assert result.exit_code == 0, result.output
+    assert "topic tagging failed" in result.output
+    row = _rows(db_path, "SELECT status, errors FROM runs")[-1]
+    assert row["status"] == "ok"
+    assert "tagger exploded" in str(row["errors"])

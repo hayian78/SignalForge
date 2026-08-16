@@ -46,9 +46,16 @@ from signalforge.db import (
     get_digest_items,
     get_latest_run,
     get_proposals,
+    topics_for_items,
 )
 from signalforge.feedback import CHECKBOX_VERDICTS, checkbox_marker
 from signalforge.models import ProposalStatus, SourceType, flatten_to_single_line
+
+# A constant, not a code path: `report/` reads which topic vocabulary the stored
+# rows belong to, and never tags anything itself. `score.taxonomy` imports
+# nothing from `llm.py`, so this does not pull the Anthropic SDK into the report
+# writer (NEVER rule 1).
+from signalforge.score.taxonomy import TAXONOMY_VERSION
 
 __all__ = [
     "DigestContext",
@@ -95,6 +102,11 @@ class DigestLine:
     signal: int | None
     relevance: int | None
     novelty: int | None
+
+    topics: tuple[str, ...] = ()
+    """`group.leaf` topics from the deterministic tagger (DESIGN §10), rendered
+    as Obsidian tags. Defaulted empty so every pre-tagger digest — and every
+    item the keywords simply miss — renders exactly as it did before."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,13 +241,16 @@ def _trim_reasoning(text: str, *, limit: int = _WHY_IT_MATTERS_MAX_CHARS) -> str
     return f"{truncated}…"
 
 
-def _to_line(scored: DigestItem) -> DigestLine | None:
+def _to_line(scored: DigestItem, topics: dict[int, list[str]] | None = None) -> DigestLine | None:
     """One digest line, or None if `scored` cannot be cited.
 
     `Item.url` is required by the model, so this should be unreachable in
     practice — but the citation rule (NEVER rule 7) is enforced here rather
     than trusted, so a future nullable path can never slip a bare claim
     through the report writer.
+
+    `topics` is the pre-fetched `{item_id: [topic, ...]}` map. Passed in rather
+    than queried per line so a 15-item digest is one query, not fifteen.
     """
     if not scored.item.url:
         logger.warning(
@@ -243,8 +258,9 @@ def _to_line(scored: DigestItem) -> DigestLine | None:
             extra={"item_id": scored.item.id},
         )
         return None
+    item_id = scored.item.id
     return DigestLine(
-        id=scored.item.id,
+        id=item_id,
         # Not flattened here, unlike the proposal fields below: every read path
         # reconstructs an `Item`, so `Item._flatten_title` runs even for a title
         # edited directly in the database. A second call here would be genuinely
@@ -255,6 +271,7 @@ def _to_line(scored: DigestItem) -> DigestLine | None:
         signal=scored.signal,
         relevance=scored.relevance,
         novelty=scored.novelty,
+        topics=tuple((topics or {}).get(item_id, ())) if item_id is not None else (),
     )
 
 
@@ -527,7 +544,11 @@ def build_digest_context(
         max_per_source=max_per_source,
         max_per_github_repo=max_per_github_repo,
     )
-    lines = tuple(line for scored in selected if (line := _to_line(scored)) is not None)
+    # Fetched only for the items that survived selection — one query for the
+    # whole digest, and nothing loaded for items that will not render.
+    selected_ids = [scored.item.id for scored in selected if scored.item.id is not None]
+    topics = topics_for_items(conn, selected_ids, taxonomy_version=TAXONOMY_VERSION)
+    lines = tuple(line for scored in selected if (line := _to_line(scored, topics)) is not None)
     killed_count = count_killed_items(conn, start=start, end=end)
 
     return DigestContext(

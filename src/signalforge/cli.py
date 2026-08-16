@@ -73,15 +73,18 @@ from rich.table import Table
 from signalforge import feedback
 from signalforge.config import (
     SETTINGS_FILENAME,
+    TAXONOMY_FILENAME,
     ConfigError,
     CurationConfig,
     InterestsConfig,
     SettingsConfig,
     SourcesConfig,
+    TaxonomyConfig,
     get_secret,
     load_interests,
     load_settings,
     load_sources,
+    load_taxonomy,
 )
 from signalforge.curate.apply import apply_approved_proposals
 from signalforge.curate.approvals import DECISIONS, harvest_approvals
@@ -136,6 +139,7 @@ from signalforge.report.weekly import (
     write_brief,
 )
 from signalforge.score import ScoreOutcome, score_unscored_items
+from signalforge.score.taxonomy import stale_topics, tag_untagged_items
 from signalforge.synth.podcast import build_podcast_stable_prefix, build_script
 from signalforge.synth.weekly import build_brief, build_weekly_stable_prefix
 
@@ -272,6 +276,27 @@ def _load_interests_or_exit(config_dir: Path) -> InterestsConfig:
     except ConfigError as exc:
         err_console.print(f"[red]config error:[/red] {exc}")
         raise typer.Exit(code=2) from exc
+
+
+def _load_taxonomy_or_none(config_dir: Path) -> TaxonomyConfig | None:
+    """Load `taxonomy.yaml`, or None when there isn't one.
+
+    The one loader here that does not exit on failure, and the asymmetry is
+    deliberate. Tagging is *additive* — a digest without topic tags is the
+    digest this pipeline shipped for its whole first phase — so an operator
+    with no `taxonomy.yaml` should get scoring, not an exit code. A file that
+    exists but does not validate is a different thing entirely: that is a typo
+    silently costing the operator their topics, so it is reported loudly and
+    still does not fail the scoring the run was actually for (CLAUDE.md §7).
+    """
+    if not (config_dir / TAXONOMY_FILENAME).is_file():
+        return None
+    try:
+        return load_taxonomy(config_dir)
+    except ConfigError as exc:
+        err_console.print(f"[yellow]taxonomy config error[/yellow]: {exc}")
+        err_console.print("[yellow]continuing without topic tagging[/yellow].")
+        return None
 
 
 def _load_settings_or_exit(config_dir: Path) -> SettingsConfig:
@@ -663,10 +688,38 @@ def _render_score_report(outcome: ScoreOutcome, *, dry_run: bool, pending: int =
     )
 
 
+def _tag_and_report(conn: sqlite3.Connection, taxonomy: TaxonomyConfig) -> list[dict[str, str]]:
+    """Run the deterministic topic tagger and print what it did.
+
+    Never raises and never changes the run's status — same posture as
+    `_deliver_and_report` and `_commit_vault_and_report`, for the same reason:
+    this is additive work after the thing the run was for already succeeded.
+    """
+    try:
+        outcome = tag_untagged_items(conn, taxonomy)
+    except Exception as exc:
+        logger.exception("topic tagging failed; scores are unaffected")
+        err_console.print(f"[yellow]topic tagging failed[/yellow]: {escape(str(exc))}")
+        return [_run_level_error(exc)]
+
+    if outcome.topics_written:
+        console.print(
+            f"[green]tagged[/green]: {outcome.items_tagged} item(s), "
+            f"{outcome.topics_written} topic(s) across {outcome.items_examined} examined."
+        )
+    elif outcome.items_examined:
+        console.print(
+            f"[yellow]tagged[/yellow]: 0 of {outcome.items_examined} examined item(s) "
+            "matched a taxonomy keyword."
+        )
+    return outcome.errors
+
+
 @app.command()
 def score(
     config_dir: Annotated[
-        Path, typer.Option("--config-dir", help="Directory holding interests.yaml.")
+        Path,
+        typer.Option("--config-dir", help="Directory holding interests.yaml and taxonomy.yaml."),
     ] = DEFAULT_CONFIG_DIR,
     db: Annotated[Path, typer.Option("--db", help="SQLite database path.")] = DEFAULT_DB_PATH,
     dry_run: Annotated[
@@ -684,8 +737,14 @@ def score(
     (CLAUDE.md §3): an item that already carries a `scores` row is invisible
     to the selection query, so re-running `score` twice sends nothing already
     scored to the LLM and spends zero additional tokens.
+
+    Also runs the deterministic topic tagger (DESIGN §10), which costs nothing
+    and calls nothing — it is here rather than in its own command because the
+    two share a trigger ("new items have arrived") and neither is worth a cron
+    line of its own.
     """
     interests = _load_interests_or_exit(config_dir)
+    taxonomy = _load_taxonomy_or_none(config_dir)
 
     with connection(db) as conn:
         if dry_run:
@@ -697,6 +756,7 @@ def score(
 
         run_id = start_run(conn, RUN_KIND_SCORE, started_at=datetime.now(UTC))
         run_level_error: dict[str, str] | None = None
+        tag_errors: list[dict[str, str]] = []
         outcome = ScoreOutcome()
         status_value = "failed"
         try:
@@ -708,6 +768,12 @@ def score(
             else:
                 status_value = "failed"
             _render_score_report(outcome, dry_run=False)
+            # After scoring, and outside its status arithmetic. Tagging spends
+            # nothing and is not what the run is *for*, so a tagging problem is
+            # a recorded error and a printed line, never the difference between
+            # an `ok` and a `failed` scoring run (CLAUDE.md §7).
+            if taxonomy is not None:
+                tag_errors = _tag_and_report(conn, taxonomy)
         except BaseException as exc:
             # Includes KeyboardInterrupt, mirroring `ingest`'s no-silent-runs
             # rule (CLAUDE.md §3): a crash mid-batch still closes its `runs`
@@ -726,7 +792,12 @@ def score(
                 items_new=0,  # score writes no `items` rows, only `scores` rows.
                 llm_input_tokens=outcome.input_tokens,
                 llm_output_tokens=outcome.output_tokens,
-                errors=[*outcome.errors, *([run_level_error] if run_level_error else [])] or None,
+                errors=[
+                    *outcome.errors,
+                    *tag_errors,
+                    *([run_level_error] if run_level_error else []),
+                ]
+                or None,
             )
 
     if status_value == "failed":
@@ -2584,6 +2655,31 @@ def _render_freshness(conn: sqlite3.Connection, config: SourcesConfig, *, now: d
         )
 
 
+def _render_stale_topics(
+    conn: sqlite3.Connection,
+    taxonomy: TaxonomyConfig | None,
+    *,
+    now: datetime,
+    days: int,
+) -> None:
+    """Name taxonomy leaves that have matched nothing lately (DESIGN §10).
+
+    Printed only when there is something to say. A leaf going quiet is a nudge
+    to edit `taxonomy.yaml`, not a fault — the reports are the monitoring
+    channel (CLAUDE.md §7), and a permanent "all topics healthy" row would be
+    noise in a readout whose job is to make the abnormal visible.
+    """
+    if taxonomy is None:
+        return
+    stale = stale_topics(conn, taxonomy, now=now, days=days)
+    if not stale:
+        return
+    err_console.print(
+        f"[yellow]taxonomy[/yellow]: {len(stale)} leaf/leaves matched nothing in {days} days — "
+        f"{', '.join(stale)}. Edit their keywords in taxonomy.yaml, or drop them."
+    )
+
+
 def _render_token_spend(conn: sqlite3.Connection, *, now: datetime, tts_model: str | None) -> None:
     """Month-to-date spend: tokens, plus the two lines tokens cannot express.
 
@@ -2639,9 +2735,11 @@ def status(
     """Show last-run health, per-source freshness, and month-to-date token/TTS spend."""
     config = _load_sources_or_exit(config_dir)
     settings = _load_settings_or_exit(config_dir)
+    taxonomy = _load_taxonomy_or_none(config_dir)
     tts_model = settings.delivery.podcast.tts_model if settings.delivery.podcast else None
     now = datetime.now(UTC)
     with connection(db) as conn:
         _render_last_runs(conn, now=now)
         _render_freshness(conn, config, now=now)
+        _render_stale_topics(conn, taxonomy, now=now, days=settings.taxonomy_stale_days)
         _render_token_spend(conn, now=now, tts_model=tts_model)
