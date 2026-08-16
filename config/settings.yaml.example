@@ -133,3 +133,13 @@ timezone: UTC
 #
 # vault_git:
 #   enabled: true
+
+# --------------------------------------------------------------------------- #
+# taxonomy_stale_days — the topic tagger's dead-keyword warning (DESIGN §10)
+# --------------------------------------------------------------------------- #
+#
+# `signalforge status` names any `taxonomy.yaml` leaf that has matched nothing
+# in this many days. A leaf nobody's corpus hits is either a dead interest or a
+# badly chosen keyword; both are your edit to make, so this only reports.
+#
+# taxonomy_stale_days: 60

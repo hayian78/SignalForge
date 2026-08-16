@@ -251,6 +251,15 @@ CREATE TABLE scores (
     scored_at      TEXT NOT NULL
 );
 
+CREATE TABLE item_topics (                   -- deterministic keyword tagger's output (§10)
+    item_id          INTEGER NOT NULL REFERENCES items(id),
+    topic            TEXT NOT NULL,          -- "group.leaf" from taxonomy.yaml
+    matched_keyword  TEXT NOT NULL,          -- which keyword fired: the evidence for a taxonomy edit
+    taxonomy_version TEXT NOT NULL,          -- ties a tag to the vocabulary that produced it
+    tagged_at        TEXT NOT NULL,
+    UNIQUE (item_id, topic)                  -- the idempotency lever; a version bump updates, not duplicates
+);
+
 -- Phase 2
 CREATE TABLE embeddings (                    -- paired with a sqlite-vec virtual table
     item_id    INTEGER PRIMARY KEY REFERENCES items(id),
@@ -817,9 +826,25 @@ tooling:
   cli: {keywords: [cli, terminal, tui]}
 ```
 
-**What actually shipped (2026-08-07)** is deliberately smaller: `config/taxonomy.yaml`, validated by `TaxonomyConfig` in `config.py`, carries only the six `group.leaf` pairs `interests.yaml`'s `priority_topics` already names (`industry.strategy`, `frontier.capabilities`, `enterprise.adoption`, `agents.autonomy`, `policy.regulation`, `ai.research-direction`) — every keyword traceable to operator-authored config, nothing invented wholesale. Growing the tree past those six is an operator edit, the same posture `sources.yaml` and `interests.yaml` already have (CLAUDE.md §4) — not a redesign task for whoever builds the tagger. The config layer is staged ahead of the tagger itself (NEVER rule 15): `score/taxonomy.py` (keyword match first, Haiku-triage fallback for unmatched items) is not built, and DESIGN §5's schema has no `item_topics` table yet to store a tagged item's topic(s) — that storage question is still open.
+**The config layer shipped 2026-08-07** and is deliberately smaller: `config/taxonomy.yaml`, validated by `TaxonomyConfig` in `config.py`, carries only the six `group.leaf` pairs `interests.yaml`'s `priority_topics` already names (`industry.strategy`, `frontier.capabilities`, `enterprise.adoption`, `agents.autonomy`, `policy.regulation`, `ai.research-direction`) — every keyword traceable to operator-authored config, nothing invented wholesale. Growing the tree past those six is an operator edit, the same posture `sources.yaml` and `interests.yaml` already have (CLAUDE.md §4).
 
-Tagging (once built): lowercase keyword match first (free, covers ~80%); unmatched items get topics assigned in the same Haiku triage call (marginal cost ~zero). New leaf topics are a YAML edit; the tagger warns on taxonomy keys that haven't matched anything in 60 days.
+**The tagger shipped 2026-08-16** as `score/taxonomy.py`, run by `signalforge score` after the triage batch and stored in `item_topics` (§5).
+
+**Keyword-only — the Haiku fallback is deliberately not built, and the reason is not cost.** A cost-guard review priced the fallback at **≈$0.06/month** against the real corpus (≈46 unmatched items/day, ~2 extra batch requests/day, ~250 tokens of taxonomy joining the prefix). DESIGN's original "marginal cost ~zero" was correct. The real reasons to defer are that it edits the triage prompt — forcing a `RUBRIC_VERSION` bump (NEVER rule 5), which makes every stored score incomparable to every new one — and that it puts an LLM surface on a stage that can currently be verified by reading it. That is a review-burden argument, not a money one, and it should be stated as such.
+
+**Measured coverage is 3.9%, not the ~80% this section originally claimed.** Against the 2,082 stored items: 82 matched, 2,000 did not. Per leaf: `agents.autonomy` 62, `enterprise.adoption` 11, `frontier.capabilities` 8, `ai.research-direction` 3, `industry.strategy` 1, `policy.regulation` 1. The keywords are mostly multi-word phrases (`competitive positioning`, `deployment at scale`, `benchmark record`) that real headlines do not contain verbatim, and 724 items carry no summary at all. **The vocabulary is the gap, not the mechanism** — which is an operator edit (CLAUDE.md §4), the same posture `sources.yaml` has. Widening the leaves toward single tokens (`regulation`, `benchmark`, `procurement`) is where the coverage is; reaching for the Haiku fallback before doing that would be paying an LLM to compensate for a keyword list nobody tuned.
+
+Mechanics worth knowing:
+
+- **Matching is bounded, not substring.** `(?<!\w)…(?!\w)` rather than `\b`, because `\b` is defined relative to the adjacent character and so never matches a keyword ending in punctuation (`\bc\+\+\b` matches nothing). Keywords are `re.escape`d, and multi-word phrases match across any run of whitespace, so a phrase broken over a line in a summary still counts.
+- **`TAXONOMY_VERSION` is the `RUBRIC_VERSION` of tagging.** Bump it when an existing leaf's keywords change — that changes what a stored row *means*. Adding a brand-new leaf does not need one; previously-tagged items simply never carried it. A bump re-tags everything on the next `score` run, and `UNIQUE (item_id, topic)` makes that an update rather than a duplicate.
+- **An item that matches nothing writes no row**, and so is re-examined every run. Deliberate: re-matching is free, and a sentinel "no topics" row would need its own cleanup on every taxonomy edit. This is also why the tagging pass walks an `id` cursor rather than re-issuing one `LIMIT` query — permanently-unmatched items are the *majority* of a real corpus, so a re-query would hand back the same rows forever and spin. Two independent reviews caught that as a hang on the first real run; the regression test uses a majority-unmatched corpus above the batch size.
+- **`ON CONFLICT DO UPDATE`, never `INSERT OR IGNORE`.** `UNIQUE (item_id, topic)` excludes the version by design, so an ignore would leave a stale-version row in the slot, report success, and make the item fail the current-version check forever — silently emptying every topic line in the digest after a bump.
+- **Tagging never fails a run.** It is additive work after the run's real job succeeded, so a failure is a recorded error and a printed line (CLAUDE.md §7). An absent `taxonomy.yaml` is not an error at all; an invalid one is reported loudly and still does not stop scoring.
+- **Stale-leaf warning.** `signalforge status` names leaves that matched nothing within `settings.yaml`'s `taxonomy_stale_days` (default 60). Printed only when there is something to say.
+- **Read surface.** The daily digest renders an item's topics as nested Obsidian tags (`industry.strategy` → `#industry/strategy`), scoped to the current `TAXONOMY_VERSION` so a bump cannot leak stale tags into a fresh digest.
+
+The original sketch, for the record: lowercase keyword match first (free, covers ~80%); unmatched items get topics assigned in the same Haiku triage call (marginal cost ~zero). New leaf topics are a YAML edit; the tagger warns on taxonomy keys that haven't matched anything in 60 days. Everything but the Haiku half shipped.
 
 ---
 
@@ -1237,7 +1262,7 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 **Status — the gate's component shipped 2026-08-08; the gate itself is four Sundays of reading.**
 - [x] **Weekly Intelligence Brief** (`report/weekly.py`, `synth/weekly.py`, `llm.run_weekly_brief`, `signalforge weekly`) — deterministic selection over the seven days *before* its Sunday, one Opus call, vault-written on every outcome, marks harvested from `weekly/` so the gate has a sensor
 - [ ] Four consecutive Sunday briefs, ≥ 80% of brief items rated `useful` or better
-- [x] **vault git-committed** (`report/vaultgit.py`, shipped 2026-08-16 — §14) · [ ] `score/taxonomy.py` tagger · [ ] awesome-list diffing
+- [x] **vault git-committed** (`report/vaultgit.py`, shipped 2026-08-16 — §14) · [x] **`score/taxonomy.py` tagger** (keyword-only, shipped 2026-08-16 — §10) · [ ] awesome-list diffing
 - [x] `status` + `mark` commands · [x] adaptive source curation (#9) · [x] arXiv ingestion
 
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml` (**config staged 2026-08-07** — validated, `score/taxonomy.py` tagger still pending, §10); arXiv (`ingest/arxiv.py`, **shipped 2026-08-07**) + awesome-list diffing (still pending); 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).

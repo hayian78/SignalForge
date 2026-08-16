@@ -68,9 +68,11 @@ __all__ = [
     "reopen_proposal",
     "source_yield_stats",
     "start_run",
+    "topics_for_items",
     "update_item_content",
     "update_proposal_probe",
     "upsert_item",
+    "upsert_item_topics",
 ]
 
 logger = logging.getLogger(__name__)
@@ -264,12 +266,47 @@ _MIGRATION_0005_PODCAST = Migration(
     ),
 )
 
+_MIGRATION_0006_TOPICS = Migration(
+    version=6,
+    name="item_topics",
+    statements=(
+        # Where the deterministic keyword tagger stores its verdicts (DESIGN §10).
+        # A separate table rather than a column on `items`: an item can carry
+        # several topics, and the tagger re-runs independently of ingestion.
+        """
+        CREATE TABLE item_topics (
+            item_id          INTEGER NOT NULL REFERENCES items(id),
+            -- "group.leaf" from taxonomy.yaml, e.g. "industry.strategy".
+            topic            TEXT    NOT NULL,
+            -- Which keyword fired. Kept because it is the only way to tell a
+            -- precise match from a lucky one when tuning the taxonomy, and
+            -- tuning is an operator YAML edit (CLAUDE.md §4) that needs evidence.
+            matched_keyword  TEXT    NOT NULL,
+            -- Mirrors `scores.rubric_version`: a keyword edit changes what
+            -- tagging *means*, so rows tagged under an older vocabulary must be
+            -- distinguishable rather than silently mixed in.
+            taxonomy_version TEXT    NOT NULL,
+            tagged_at        TEXT    NOT NULL,
+            -- The idempotency lever (CLAUDE.md §3, NEVER rule 4): re-tagging an
+            -- item is an INSERT OR IGNORE that changes nothing. Keyed without
+            -- the version so a version bump *updates* an item's topic rather
+            -- than accumulating a second row per topic per bump.
+            UNIQUE (item_id, topic)
+        )
+        """,
+        # The read pattern is "which items carry this topic" (per-topic yield
+        # stats, and the Phase 2 trend work that follows).
+        "CREATE INDEX idx_item_topics_topic ON item_topics (topic)",
+    ),
+)
+
 MIGRATIONS: Final[tuple[Migration, ...]] = (
     _MIGRATION_0001_PHASE0,
     _MIGRATION_0002_FEEDBACK_DEDUP,
     _MIGRATION_0003_CURATION,
     _MIGRATION_0004_DELIVERIES,
     _MIGRATION_0005_PODCAST,
+    _MIGRATION_0006_TOPICS,
 )
 """Ordered, append-only. Never edit an applied migration — add a new one."""
 
@@ -720,6 +757,69 @@ def count_killed_items(conn: sqlite3.Connection, *, start: str, end: str) -> int
         (start, end),
     ).fetchone()
     return int(row["n"])
+
+
+def upsert_item_topics(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    topics: Sequence[tuple[str, str]],
+    taxonomy_version: str,
+    tagged_at: str,
+) -> None:
+    """Store one item's `(topic, matched_keyword)` pairs, replacing older ones.
+
+    `ON CONFLICT DO UPDATE`, not `INSERT OR IGNORE`. `UNIQUE (item_id, topic)`
+    deliberately excludes the version, so a row tagged under an older vocabulary
+    already occupies the slot — `OR IGNORE` would leave it there and report
+    success. The item would then still fail the current-version `NOT EXISTS`
+    check, be re-examined on every run forever, and vanish from the digest,
+    which reads topics at the current version only. Updating in place is what
+    makes a `TAXONOMY_VERSION` bump actually re-tag.
+    """
+    conn.executemany(
+        """
+        INSERT INTO item_topics
+            (item_id, topic, matched_keyword, taxonomy_version, tagged_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (item_id, topic) DO UPDATE SET
+            matched_keyword  = excluded.matched_keyword,
+            taxonomy_version = excluded.taxonomy_version,
+            tagged_at        = excluded.tagged_at
+        """,
+        [(item_id, topic, keyword, taxonomy_version, tagged_at) for topic, keyword in topics],
+    )
+
+
+def topics_for_items(
+    conn: sqlite3.Connection, item_ids: list[int], *, taxonomy_version: str
+) -> dict[int, list[str]]:
+    """`{item_id: [topic, ...]}` for the given items, at one taxonomy version.
+
+    One query for a whole digest rather than one per line. Ids with no topics
+    are absent from the result, so a caller renders nothing for them.
+
+    `taxonomy_version` is a parameter rather than an import of
+    `score.taxonomy.TAXONOMY_VERSION`: `db.py` is the thin storage layer and
+    stays below every other module, so the caller names the vocabulary it wants.
+    """
+    if not item_ids:
+        return {}
+    # `?` placeholders generated from the id count — the ids themselves are
+    # still bound, never interpolated.
+    placeholders = ",".join("?" for _ in item_ids)
+    rows = conn.execute(
+        f"""
+        SELECT item_id, topic FROM item_topics
+        WHERE taxonomy_version = ? AND item_id IN ({placeholders})
+        ORDER BY item_id, topic
+        """,  # noqa: S608 - see above; no data reaches the SQL string
+        (taxonomy_version, *item_ids),
+    ).fetchall()
+    grouped: dict[int, list[str]] = {}
+    for row in rows:
+        grouped.setdefault(int(row["item_id"]), []).append(str(row["topic"]))
+    return grouped
 
 
 # --------------------------------------------------------------------------- #

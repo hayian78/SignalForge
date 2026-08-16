@@ -1,12 +1,22 @@
 # The topic tree for the deterministic first-pass tagger (DESIGN §10).
 #
 # Two levels deep: a group (e.g. `industry`) contains leaves (e.g. `strategy`),
-# each carrying the lowercase keywords a match is decided on. Not yet read by
-# any runtime path — validated by `TaxonomyConfig` in src/signalforge/config.py,
-# same staging posture `arxiv:` in sources.yaml carried before `ingest/arxiv.py`
-# shipped (NEVER rule 15). Editing this file has no effect on a running pipeline
-# until the keyword tagger (`score/taxonomy.py`) lands — which also needs a new
-# DB table (DESIGN §5 has no `item_topics` yet) that does not exist.
+# each carrying the lowercase keywords a match is decided on. Live since
+# 2026-08-16: `signalforge score` runs `score/taxonomy.py` over every untagged
+# item and stores matches in `item_topics`, and the daily digest renders them as
+# nested Obsidian tags (`industry.strategy` -> `#industry/strategy`).
+#
+# Matching is bounded, not substring — a keyword cannot match inside a longer
+# word — and case-insensitive, over title + summary.
+#
+# IMPORTANT: editing an *existing* leaf's keywords changes what an already
+# stored tag means, so bump `TAXONOMY_VERSION` in score/taxonomy.py when you do
+# (the same discipline `RUBRIC_VERSION` has). Adding a brand-new leaf needs no
+# bump. A bump re-tags everything on the next `score` run.
+#
+# `signalforge status` will name any leaf that has matched nothing in
+# `taxonomy_stale_days` (settings.yaml, default 60) — that is the signal to
+# rewrite its keywords or drop it.
 #
 # Deliberately minimal for now: exactly the six `group.leaf` pairs
 # `interests.yaml`'s `priority_topics` already names (that file's own comment

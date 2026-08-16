@@ -41,6 +41,7 @@ from signalforge.report.daily import (
     utc_range_window,
     write_digest,
 )
+from signalforge.score.taxonomy import TAXONOMY_VERSION
 from tests.conftest import make_item
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -348,7 +349,7 @@ def test_to_line_drops_an_item_with_no_url_rather_than_render_an_uncited_line(
     )
 
     with caplog.at_level("WARNING"):
-        line = _to_line(scored)
+        line = _to_line(scored, {})
 
     assert line is None
     assert "citation" in caplog.text.lower() or "url" in caplog.text.lower()
@@ -1550,3 +1551,58 @@ def test_a_forged_marker_in_a_probe_label_cannot_approve_anything(
 
     assert parse_proposal_marks(rendered) == []
     assert "Real Author" in rendered
+
+
+# --------------------------------------------------------------------------- #
+# Topic tags (DESIGN §10 — the deterministic tagger's read surface)
+# --------------------------------------------------------------------------- #
+
+
+def _tag(conn: sqlite3.Connection, item_id: int, topic: str, *, version: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO item_topics (item_id, topic, matched_keyword, taxonomy_version, tagged_at)
+        VALUES (?, ?, 'a keyword', ?, '2026-07-16T06:10:00+00:00')
+        """,
+        (item_id, topic, version),
+    )
+
+
+def test_topics_render_as_obsidian_tags(conn: sqlite3.Connection) -> None:
+    """`group.leaf` becomes `#group/leaf` — a nested tag Obsidian can filter on."""
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _tag(conn, item_id, "industry.strategy", version=TAXONOMY_VERSION)
+    _tag(conn, item_id, "policy.regulation", version=TAXONOMY_VERSION)
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert "**Topics:** #industry/strategy #policy/regulation" in rendered
+
+
+def test_an_untagged_item_renders_no_topic_line(conn: sqlite3.Connection) -> None:
+    """The line is absent, not empty — a pre-tagger digest renders as it always did."""
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert "**Topics:**" not in rendered
+
+
+def test_topics_from_an_older_taxonomy_version_do_not_render(conn: sqlite3.Connection) -> None:
+    """A version bump changes what a topic means; stale rows must not leak into a
+    digest as though they were current."""
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _tag(conn, item_id, "industry.strategy", version="tax-v0")
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    assert "**Topics:**" not in rendered

@@ -38,6 +38,7 @@ from signalforge.models import has_control_characters
 __all__ = [
     "SETTINGS_FILENAME",
     "SOURCES_FILENAME",
+    "TAXONOMY_FILENAME",
     "ArxivConfig",
     "ConfigError",
     "CurationConfig",
@@ -793,6 +794,18 @@ class SettingsConfig(_StrictModel):
     """Outbound mirrors of a rendered report (DESIGN §13.2's push channel). Absent means
     the vault is the only destination, which is the historical behaviour and stays the
     default: delivery is additive, never a substitute for the vault write."""
+
+    taxonomy_stale_days: int = Field(
+        default=60,
+        ge=1,
+        description=(
+            "How long a `taxonomy.yaml` leaf may go without matching anything before "
+            "`signalforge status` names it (DESIGN §10). A leaf nobody's corpus hits is "
+            "either a dead interest or a badly chosen keyword — either way the fix is an "
+            "operator edit, so this only reports. 60 days is long enough that a quiet "
+            "fortnight is not an alarm."
+        ),
+    )
 
     vault_git: VaultGitConfig = Field(default_factory=VaultGitConfig)
     """Local git history for the vault. Defaults to on because the guarded no-op
