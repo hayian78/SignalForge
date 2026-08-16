@@ -26,6 +26,7 @@ posture `deliver/` already takes, NEVER rule 19).
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -107,17 +108,42 @@ class VaultCommitOutcome:
         return self.status is VaultCommitStatus.FAILED
 
 
+def _scrubbed_env() -> dict[str, str]:
+    """The process environment with every `GIT_*` variable removed.
+
+    This is part of the repo-root guard, not hygiene. `GIT_DIR` (or
+    `GIT_WORK_TREE`) in the inherited environment *forces* git's repository
+    discovery: `rev-parse --show-toplevel` then reports the forced work tree —
+    the vault — instead of the repository that actually contains it. The guard
+    below compares those two values, so a leaked `GIT_DIR` makes them agree and
+    the commit lands in the foreign repository the guard exists to protect.
+
+    It leaks more easily than it sounds: a cron line that sources a profile,
+    signalforge invoked from inside a git hook, or an operator who exported it
+    in the shell they ran a catch-up run from.
+    """
+    return {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+
+
 def _run_git(vault_dir: Path, *args: str) -> subprocess.CompletedProcess[str]:
     """One git invocation, scoped with `-C` and never inheriting a shell.
 
     `check=False`: every caller here inspects `returncode` itself, because a
     non-zero exit is frequently the *expected* answer (`rev-parse` outside a
     repo, `diff --cached --quiet` on a clean tree).
+
+    `errors="replace"` because this module's contract is that it never raises,
+    and the default strict decoding does: git echoes paths verbatim, a vault on
+    a Windows-side mount can hold a name that is not valid UTF-8, and the
+    resulting `UnicodeDecodeError` would escape to a caller that has already
+    written (and, for the weekly brief, already paid for) its report.
     """
     return subprocess.run(  # noqa: S603 - fixed argv, no shell, no user-controlled binary
         ["git", "-C", str(vault_dir), *args],
         capture_output=True,
         text=True,
+        errors="replace",
+        env=_scrubbed_env(),
         timeout=GIT_TIMEOUT_SECONDS,
         check=False,
     )
@@ -150,6 +176,13 @@ def commit_vault(
 
     Never raises. Every failure path — missing `git`, a timeout on a stalled
     `/mnt/c` mount, a git error — comes back as an outcome.
+
+    `message` is a label, not a manifest. Every call stages all three report
+    directories, so a run that finds an existing podcast script and skips the
+    synthesis never calls this — and that script is then swept into the next
+    daily digest's commit, under the digest's message. The history stays
+    complete; only the wording is approximate, which is the right trade against
+    a commit per directory.
     """
     if not enabled:
         return VaultCommitOutcome(VaultCommitStatus.DISABLED)
@@ -180,10 +213,16 @@ def commit_vault(
                 detail=f"{resolved_vault} is not inside a git repository",
             )
 
-        # The guard. A vault nested inside someone else's repository must never
-        # be staged through that repository — `git add` there reaches every
-        # sibling directory under its top level.
-        if repo_root != resolved_vault:
+        # The guard, in two independent parts. A vault nested inside someone
+        # else's repository must never be staged through that repository —
+        # `git add` there reaches every sibling directory under its top level.
+        #
+        # The `.git` check is deliberately redundant with the `repo_root`
+        # comparison: it is a plain filesystem fact that no environment variable
+        # or git configuration can talk us out of, so subverting the guard now
+        # takes two independent failures rather than one.
+        has_own_git_dir = (resolved_vault / ".git").exists()
+        if repo_root != resolved_vault or not has_own_git_dir:
             logger.warning(
                 "vault is nested inside a wider git repository; refusing to commit",
                 extra={"vault_dir": str(resolved_vault), "repo_root": str(repo_root)},
@@ -208,16 +247,32 @@ def commit_vault(
         if staged.returncode != 0:
             return _failure("git add", staged)
 
+        # Every command below carries the same pathspec, and that is what makes
+        # `COMMITTABLE_SUBDIRS` a real promise rather than a comment. A bare
+        # `git commit -m` commits the whole index, so anything the operator had
+        # staged in their own vault and not yet committed — notes, a `.env` —
+        # would be swept into a commit signalforge authored (NEVER rules 8, 16).
+        # The emptiness check needs it for the same reason: unscoped, a dirty
+        # index elsewhere reads as "we have something to commit" and
+        # NOTHING_TO_COMMIT never fires.
+        pathspec = ["--", *present]
+
         # `diff --cached --quiet` exits 1 when there *are* staged changes. Any
         # other non-zero is a real error, so the two are distinguished rather
         # than both read as "something to commit".
-        diff = _run_git(resolved_vault, "diff", "--cached", "--quiet")
+        diff = _run_git(resolved_vault, "diff", "--cached", "--quiet", *pathspec)
         if diff.returncode == 0:
             return VaultCommitOutcome(VaultCommitStatus.NOTHING_TO_COMMIT)
         if diff.returncode != 1:
             return _failure("git diff --cached", diff)
 
-        committed = _run_git(resolved_vault, "commit", "-m", message)
+        # `-c commit.gpgsign=false`: an unsigned snapshot is the intent, and an
+        # operator with global signing on would otherwise have every cron run
+        # block on a pinentry nobody is there to answer, burn the full timeout,
+        # and land a `runs.errors` row every evening.
+        committed = _run_git(
+            resolved_vault, "-c", "commit.gpgsign=false", "commit", "-m", message, *pathspec
+        )
         if committed.returncode != 0:
             return _failure("git commit", committed)
 
@@ -235,7 +290,14 @@ def commit_vault(
             VaultCommitStatus.FAILED,
             detail=f"git timed out after {GIT_TIMEOUT_SECONDS}s: {exc.cmd}",
         )
-    except OSError as exc:
+    except Exception as exc:
+        # Deliberately broad. This is a snapshot helper running *after* a report
+        # has been written to disk — and, for the weekly brief, after a billed
+        # Opus call. Nothing it can do is worth failing that run for, so the
+        # "never raises" contract in the docstring is enforced here rather than
+        # by enumerating the exception types git might produce (NEVER rules 12,
+        # 19). `subprocess.TimeoutExpired` is caught above only to give it a
+        # clearer message.
         logger.exception("running git failed; leaving the vault uncommitted")
         return VaultCommitOutcome(VaultCommitStatus.FAILED, detail=str(exc))
 

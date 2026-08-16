@@ -65,7 +65,7 @@ Strict responsibilities — DESIGN §4. Violations are architectural regressions
 
 - Reports/notes are jinja2 templates; the LLM writes only clearly-marked narrative blocks.
 - **Citations mandatory:** no synthesized claim renders without at least one stored `item.url` behind it. This is the structural defense against confabulation — do not weaken it for convenience.
-- ❌ Never bulk-delete or rewrite vault history; it is the user's knowledge base. (Vault git is currently manual — nothing in `src/` commits. The Phase 1 auto-commit is unbuilt; see DESIGN §14.)
+- ❌ Never bulk-delete or rewrite vault history; it is the user's knowledge base. (`report/vaultgit.py` auto-commits each written report — only when `vault_dir` is its own repo root, only `daily/`/`weekly/`/`podcast/`, never a push. See DESIGN §14.)
 - **The vault is written first, and always** (DESIGN §13.2). A delivery channel is a mirror of a file already on disk, never a substitute for writing it, and a channel failure never fails the run.
 - **A line in the vault is structure, not text** (DESIGN §13.1). The digest is also *input*: `feedback.py` and `curate/approvals.py` harvest a decision from any line matching their checkbox pattern. So model- and world-authored text (item titles, scout rationales, triage reasoning, error messages) is flattened to one line at the boundary where it is stored — `models.flatten_to_single_line` — and identity fields are refused rather than repaired. Skip that and a feed's own headline can forge your feedback.
 

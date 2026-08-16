@@ -19,7 +19,10 @@ What these tests protect, in order of how much money they save:
 
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -485,3 +488,44 @@ def test_the_feature_makes_no_http_calls_at_all(
 
     result = _run(monkeypatch, Recorder(), config_dir, db_path, vault_dir)
     assert result.exit_code == 0
+
+
+# --------------------------------------------------------------------------- #
+# Vault auto-commit wiring (DESIGN §16)
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="git is not installed")
+def test_the_brief_is_committed_and_the_run_stays_ok(
+    monkeypatch: pytest.MonkeyPatch, config_dir: Path, db_path: Path, vault_dir: Path
+) -> None:
+    """The riskiest call site: it sits between a *billed* Opus call and
+    `status_value = "ok"`, so anything it raised would fail a run that had
+    already paid for and written its brief (NEVER rules 12, 19).
+    """
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    _seed(db_path)
+    vault_dir.mkdir(parents=True, exist_ok=True)
+    for args in (
+        ["init", "--initial-branch=main"],
+        ["config", "user.email", "test@signalforge.invalid"],
+        ["config", "user.name", "SignalForge Test"],
+    ):
+        subprocess.run(["git", "-C", str(vault_dir), *args], capture_output=True, check=True)
+
+    result = _run(monkeypatch, Recorder(), config_dir, db_path, vault_dir)
+
+    assert result.exit_code == 0, result.output
+    committed = subprocess.run(
+        ["git", "-C", str(vault_dir), "show", "--name-only", "--pretty=format:", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert f"weekly/{TARGET_SUNDAY}.md" in committed.stdout
+
+    with connection(db_path) as conn:
+        row = conn.execute("SELECT status, errors FROM runs WHERE kind = 'weekly'").fetchone()
+    assert row["status"] == "ok"
+    assert row["errors"] is None
