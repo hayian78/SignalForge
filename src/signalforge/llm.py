@@ -197,7 +197,7 @@ from 7 to 12 — see that docstring for why. This is the operator's deliberate
 decision, not a code default: three real runs cost ~$1.00-1.20 each at 6-7 searches,
 and weekly-times-more-research-depth was judged worth paying for, against a stated
 tolerance of "a dollar a run, still under a cup of coffee a month." Still small
-against the $30 whole-pipeline alarm (CLAUDE.md §6), but no longer small against
+against the $50 whole-pipeline alarm (CLAUDE.md §6), but no longer small against
 this project's overall $5-10/month target — this one feature can now cost as much
 as the rest of the pipeline combined, which is worth knowing next time total spend
 is reviewed.
@@ -1033,7 +1033,7 @@ close that. Second: even with `ensure_ascii=False`, JSON still escapes
 `"`, `\\`, and every C0 control character — a raw `\\n` or an unstripped
 control byte in feed content expands after the byte-based cap already ran,
 measured to land as high as $71/month against this ceiling from this field
-alone, over 3x the ceiling and past the $30 whole-pipeline alarm by itself.
+alone, over 3x the ceiling and past the $50 whole-pipeline alarm by itself.
 `_truncate_utf8_json_safe` bisects on the actual `json.dumps(...,
 ensure_ascii=False)`-encoded length, so the bytes this constant bounds are
 the bytes that reach the API, regardless of script or embedded escapes."""
@@ -1074,19 +1074,17 @@ a real dollar figure rather than an intended one — see
 
 **Honest note on the whole-pipeline alarm (CLAUDE.md §6):** this ceiling plus
 `SCOUT_MONTHLY_CEILING_USD` ($13) sums to $36/month on paper — both ceilings at
-their full margin, clearly past the $30 alarm, not merely brushing it the way
-an earlier (under-pessimistic) version of this constant did. The two *computed*
-worst cases sum to less, but the gap has grown alongside the honesty of the
-arithmetic, not shrunk. This is squarely the situation DESIGN §8 already names:
-"the next new LLM consumer... needs the band revisited rather than absorbed" —
-and by this point it is not a footnote-sized revision. Recorded here rather
-than silently forced under $30 by shrinking this feature's item count or
-content allowance past what makes a nine-to-twelve-minute daily show useful;
-Stage 7 is where the $30 figure itself gets revisited with the operator, and
-where DESIGN §8's own cost table — currently silent on this feature and on
-Stage 5's TTS spend — gets the new lines. The size of this gap is exactly the
-kind of thing that should reach the operator before Stage 3 is considered
-done, not only at Stage 7's doc pass.
+their full margin. Against the $30 alarm this docstring was written under, that
+was clearly past the line, and it said so rather than shrinking the show to fit.
+
+**That escalation was answered on 2026-08-16 and the alarm is now $50**, so
+$36 sits under it. The number changed; the reasoning did not, and it is kept
+here because it is the record of how the band moved: measured spend had reached
+≈$29.30/month, two reductions worth ≈$15.40/month were costed and offered, and
+the operator declined them and raised the band instead (DESIGN §8). What that
+buys is headroom, not permission — the $5–10 *target* is unchanged, and a
+ceiling pair summing to $36 is still two thirds of the alarm on paper. The next
+new LLM consumer faces exactly the question this note originally raised.
 
 Enforced by six facts, all checkable from code, the same discipline
 `SCOUT_MONTHLY_CEILING_USD` uses: at most two non-batch requests per script call
@@ -1255,7 +1253,7 @@ def _truncate_utf8_json_safe(text: str, max_bytes: int) -> str:
     changelog or release-note shape, not adversarial input) priced the
     worst case at $30.58/month against a $23 ceiling, and unstripped control
     characters (nothing upstream removes them from `summary`/`content`) at
-    $71.38/month — over 3x the ceiling and 2.4x the $30 whole-pipeline alarm
+    $71.38/month — over 3x the ceiling and 1.4x the $50 whole-pipeline alarm
     from this one field. Binary-searching the truncation point against the
     actual `json.dumps` output, the same "measure the thing that's billed"
     move that motivated the byte-vs-character fix, closes this the same way.

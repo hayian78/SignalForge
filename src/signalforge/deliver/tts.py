@@ -163,10 +163,11 @@ it cannot go stale independently of the table it is priced from — the same
 "computed, not copied" fix applied to the fallback constant above.
 
 Worked worst case: 14,000 chars × 31 days × $100.00/M chars ≈ **$43.40/month**
-— already past the whole-pipeline $30 alarm on its own, and stacked with
+— close to the whole-pipeline $50 alarm on its own (and past the $30 alarm
+this was written under, before 2026-08-16), and stacked with
 `PODCAST_MONTHLY_CEILING_USD` ($23) and `SCOUT_MONTHLY_CEILING_USD` ($13) is
 a combined worst case near $80/month. That is the same honest disclosure
-those two ceilings already make about summing past $30 on paper (see
+those two ceilings already make about summing past the alarm on paper (see
 `PODCAST_MONTHLY_CEILING_USD`'s docstring) — not a contradiction to paper
 over. It reflects the *most expensive currently-known* model at the *hard
 per-episode cap* every single day; the shipped default (`hexgrad/kokoro-82m`)

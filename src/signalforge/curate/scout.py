@@ -137,7 +137,7 @@ def search_spend_usd(requests: int) -> float:
     A pass-through to `llm.WEB_SEARCH_USD_PER_REQUEST`, and the indirection is the
     point: `cli.py` states that it never imports `llm.py` (so the Anthropic SDK stays
     out of the CLI's direct dependencies), but `status` has to turn a search count
-    into a dollar figure or the $30 alarm cannot see the whole bill (DESIGN §8).
+    into a dollar figure or the cost alarm cannot see the whole bill (DESIGN §8).
     `curate/` already imports `llm.py` legitimately, so it carries the number across
     rather than the price being copied into a second module where it would drift.
     """

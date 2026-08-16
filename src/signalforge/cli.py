@@ -2696,7 +2696,7 @@ def _render_stale_topics(
 def _render_token_spend(conn: sqlite3.Connection, *, now: datetime, tts_model: str | None) -> None:
     """Month-to-date spend: tokens, plus the two lines tokens cannot express.
 
-    DESIGN §8 makes spend the number this project lives or dies on ($30 is the
+    DESIGN §8 makes spend the number this project lives or dies on ($50 is the
     alarm). A cost readout that only appears once there is cost to report is a
     cost readout nobody has ever looked at when it matters.
     """
@@ -2721,7 +2721,7 @@ def _render_token_spend(conn: sqlite3.Connection, *, now: datetime, tts_model: s
     table.add_row("LLM input tokens", f"{row['input_tokens']:,}")
     table.add_row("LLM output tokens", f"{row['output_tokens']:,}")
     # Web search bills per call, not per token, so this line is not derivable from
-    # the two above it — without it the $30 alarm cannot see the whole invoice
+    # the two above it — without it the cost alarm cannot see the whole invoice
     # (DESIGN §8). Shown always, including as a $0.00, for the same reason the token
     # rows are: a cost readout that appears only once there is cost to report is one
     # nobody has looked at when it mattered.
