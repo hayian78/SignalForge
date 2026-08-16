@@ -31,6 +31,7 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from signalforge.models import has_control_characters
@@ -70,6 +71,24 @@ SOURCES_FILENAME: Final = "sources.yaml"
 INTERESTS_FILENAME: Final = "interests.yaml"
 SETTINGS_FILENAME: Final = "settings.yaml"
 TAXONOMY_FILENAME: Final = "taxonomy.yaml"
+
+AWESOME_MAX_NEW_PER_RUN_CEILING: Final = 100
+"""Hard ceiling on `github.awesome_max_new_per_run`.
+
+DESIGN §8's own lesson, learned the expensive way on the scout's search budget:
+a ceiling that permits values the budget forbids is not a ceiling. Every
+awesome-list entry that becomes an item is billed at triage, so without this a
+one-line YAML edit to `awesome_max_new_per_run: 5000` moves real spend with the
+whole suite still green.
+
+Lives here rather than beside the ingestor because `config.py` is the bottom
+layer — the reverse import is a cycle, which is exactly why the scout's ceiling
+has to be clamped at use instead of bounded at load. A cap that *can* be checked
+at load should be.
+
+100 items is roughly $0.03 of Haiku triage at the measured per-item rate, and
+far above any real list's weekly churn, so it constrains mistakes and nothing
+else."""
 
 
 class ConfigError(Exception):
@@ -142,7 +161,30 @@ class GithubConfig(_StrictModel):
     """`owner/repo` slugs polled via REST `/releases` (`/tags` fallback)."""
 
     awesome_lists: list[str] = Field(default_factory=list)
-    """`owner/repo` slugs diffed between runs (Phase 1)."""
+    """`owner/repo` slugs whose README is diffed between runs (DESIGN §7)."""
+
+    awesome_max_new_per_run: int | None = Field(
+        default=None, ge=1, le=AWESOME_MAX_NEW_PER_RUN_CEILING
+    )
+    """Ceiling on how many newly-added list entries become items in one run.
+
+    Required whenever `awesome_lists` is non-empty (see the validator below),
+    optional otherwise — the same principle `CurationConfig` states: a spend cap
+    must never be a number buried in Python, but a cap on a feature you are not
+    using has nothing to cap. A list entry carries no date, so
+    `defaults.max_item_age_days` cannot bound it and this is the only thing
+    between a maintainer's 300-entry merge and a 300-item triage batch."""
+
+    @model_validator(mode="after")
+    def _require_a_cap_for_awesome_lists(self) -> GithubConfig:
+        """A configured awesome list must state what it may cost."""
+        if self.awesome_lists and self.awesome_max_new_per_run is None:
+            raise ValueError(
+                "github.awesome_max_new_per_run is required when awesome_lists is set: "
+                "a list entry has no date, so this is the only bound on how many new "
+                "entries reach triage in one run"
+            )
+        return self
 
     @field_validator("releases", "awesome_lists")
     @classmethod

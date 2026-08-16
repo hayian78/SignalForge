@@ -116,6 +116,7 @@ from signalforge.deliver.tts import tts_spend_usd
 from signalforge.feedback import harvest_marks
 from signalforge.ingest import IngestError, IngestRun, build_ingestors, ingest_all
 from signalforge.ingest.arxiv import ARXIV_SOURCE_ID
+from signalforge.ingest.awesome import AWESOME_SOURCE_PREFIX
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY, HttpFetcher
 from signalforge.ingest.fullcontent import fetch_full_content
 from signalforge.ingest.hackernews import HN_SOURCE_ID
@@ -331,6 +332,15 @@ def _select_source(config: SourcesConfig, source_id: str) -> SourcesConfig:
     filtered.rss = [source for source in filtered.rss if source.id == source_id]
     if filtered.github is not None:
         filtered.github.releases = [repo for repo in filtered.github.releases if repo == source_id]
+        # Awesome lists carry a prefixed source_id (`awesome:owner/repo`), so
+        # they need their own filter. Without one, debugging a single feed would
+        # fetch every list, emit its items, and advance its baseline — the
+        # opposite of what `--source` promises.
+        filtered.github.awesome_lists = [
+            repo
+            for repo in filtered.github.awesome_lists
+            if f"{AWESOME_SOURCE_PREFIX}{repo}" == source_id
+        ]
     if filtered.hackernews is not None and source_id != HN_SOURCE_ID:
         filtered.hackernews = None
     if filtered.arxiv is not None and source_id != ARXIV_SOURCE_ID:

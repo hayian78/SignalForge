@@ -71,6 +71,7 @@ SOURCES_YAML = textwrap.dedent("""
                  ollama/ollama, vllm-project/vllm, BerriAI/litellm, anthropics/claude-code,
                  stanfordnlp/dspy, pydantic/pydantic-ai, ggml-org/llama.cpp,
                huggingface/transformers]
+      awesome_max_new_per_run: 25
       awesome_lists: [e2b-dev/awesome-ai-agents, punkpeye/awesome-mcp-servers]
 
     arxiv:

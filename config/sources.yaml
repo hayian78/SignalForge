@@ -127,10 +127,30 @@ github:
     # 2026-08-08 curate #10: All 4 items were kept by the pipeline but you marked 3 of them noise — the only source in the window where your own marks contradict the triage that badly. It also duplicates coverage you already get…
     # - block/goose
     - modelcontextprotocol/specification
-  # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
+  # Live (2026-08-16): `ingest/awesome.py` fetches each README and emits only
+  # entries added since the last run — a diff, not a scrape. The *first* run for
+  # a list records its baseline and emits nothing at all, so adding a list here
+  # never floods triage with its back catalogue.
+  #
+  # `awesome_max_new_per_run` is required whenever this block is non-empty. A
+  # list entry carries no date, so `defaults.max_item_age_days` cannot bound it
+  # and this is the only thing between a maintainer's 300-entry merge and a
+  # 300-item triage batch. Excess is logged, never dropped silently.
+  awesome_max_new_per_run: 25
   awesome_lists:
-    - e2b-dev/awesome-ai-agents
     - punkpeye/awesome-mcp-servers
+    # Dropped 2026-08-16 on measurement, not taste: this list documents each
+    # project as an `### Heading` followed by a bullet list of its links, so a
+    # bullet-entry diff reads it as 621 "entries" titled GitHub (x92), Web
+    # (x81), Discord (x51) and Twitter (x37). The repeated-label filter in
+    # `ingest/awesome.py` removes most of that, but the 138 survivors are still
+    # navigation ("Blog post", "Founder's Twitter", "Slack") with no
+    # descriptions. No regex turns `- [GitHub](...)` into a project entry —
+    # the list's shape is simply not what this ingestor reads. Re-add if it
+    # ever moves to one-bullet-per-project.
+    # `tests/fixtures/awesome_link_list_readme.md` is a captured slice of it,
+    # kept as the counter-example that pins why.
+    #   - e2b-dev/awesome-ai-agents
 
 # Live (2026-08-07): `ingest/arxiv.py` folds `categories` + `require_keywords`
 # into one arXiv API query per run — editing either now has effect on the next
