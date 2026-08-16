@@ -142,7 +142,7 @@ def test_the_dollar_ceiling_matches_the_hard_cap_priced_at_the_worst_known_rate(
 def test_the_dollar_ceiling_honestly_exceeds_the_whole_pipeline_alarm() -> None:
     """Documents the known tension the constant's own docstring discloses —
     the worst *known* model at the hard per-episode cap every single day
-    already exceeds DESIGN §8's $30 alarm on its own. Not something to
+    approaches DESIGN §8's $50 alarm on its own. Not something to
     quietly "fix" by shrinking the number; it reflects a real worst case,
     not the shipped default (`hexgrad/kokoro-82m` prices the same scenario
     at ~$0.27/month)."""

@@ -663,7 +663,7 @@ def test_status_shows_the_web_search_count_and_its_dollar_figure(
 ) -> None:
     """Search bills per call, so this line is not derivable from the token rows.
 
-    Without it the $30 alarm cannot see the whole invoice (DESIGN §8).
+    Without it the cost alarm cannot see the whole invoice (DESIGN §8).
     """
     with connection(db_path) as conn:
         conn.execute(
@@ -771,7 +771,7 @@ def test_a_second_run_inside_the_week_is_refused_unless_forced(
 
     The unique index stops a re-run *storing* duplicates; it does nothing about the
     call being billed again. Wired into `daily` by accident, that is ~$7/month
-    expected instead of ~$1 — inside the $30 alarm but several times this feature's
+    expected instead of ~$1 — inside the $50 alarm but several times this feature's
     own budget.
     """
     _mock_feed()

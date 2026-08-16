@@ -71,7 +71,7 @@ Strict responsibilities — DESIGN §4. Violations are architectural regressions
 
 ## 6. LLM usage & cost (the money rules)
 
-DESIGN §8. Target ≈ $5–10/month; $30 is the alarm threshold.
+DESIGN §8. Target ≈ $5–10/month; **$50 is the alarm threshold** (raised from $30 on 2026-08-16 — see DESIGN §8).
 
 - Triage/scoring: `claude-haiku-4-5`, **Batches API**, structured outputs, batched ~25 items/request, on **titles + summaries only**. Full content is fetched lazily for top-N survivors only — never feed full content to triage.
 - Synthesis: `claude-opus-5` (scout, podcast, weekly brief). **Daily-cadence** calls prompt-cache a stable prefix (rubric + interests + taxonomy) with items after the breakpoint; **weekly-cadence** ones deliberately carry no breakpoint, because an ephemeral entry always expires unread and a breakpoint is then pure write premium (DESIGN §8). ❌ No timestamps, run IDs, or other volatile data in a cached prefix.

@@ -133,7 +133,7 @@ Same read-only invariants as email: the vault script is written first and always
 the feed cannot write back into SignalForge, and a dead TTS/R2 provider is a
 recorded error, never a failed run. Unlike email, this one does spend real money —
 `signalforge status` prices `runs.tts_characters` at your configured TTS model, and
-DESIGN §8 tracks the honest paper total against the $30 alarm.
+DESIGN §8 tracks the honest paper total against the $50 alarm.
 
 ## Configuration
 
@@ -171,6 +171,6 @@ uv run ruff check src tests
 uv run mypy src tests      # strict
 ```
 
-Cost discipline is a design constraint, not an afterthought: target ≈ $5–10/month, $30 is the alarm
-threshold. Triage runs on titles and summaries only, batched, via the cheapest capable model. See
-DESIGN §8.
+Cost discipline is a design constraint, not an afterthought: target ≈ $5–10/month, $50 is the alarm
+threshold (raised from $30 on 2026-08-16). Triage runs on titles and summaries only, batched, via
+the cheapest capable model. See DESIGN §8.

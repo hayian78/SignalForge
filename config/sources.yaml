@@ -216,7 +216,7 @@ curation:
   # SCOUT_MAX_SEARCHES_CEILING and SCOUT_MONTHLY_CEILING_USD were raised alongside
   # this to $13/month, the real worst case at 12 searches priced with margin above
   # (not at) the highest of three real runs — this feature can now cost as much as
-  # the rest of the pipeline combined, still trivial against the $30 overall alarm.
+  # the rest of the pipeline combined, still trivial against the $50 overall alarm.
   # Re-check `signalforge status` after a few more runs; this is still an experiment.
   max_searches_per_run: 12
 

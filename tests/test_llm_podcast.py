@@ -551,7 +551,7 @@ v2 prompt addition alone consumed roughly a third of what margin this ratio
 had); 1.0 bytes/token — the realistic bad case for a script with genuinely
 poor BPE coverage (Khmer, Tibetan, Burmese, roughly byte-level fallback
 tokenization) — prices it at ~$26.33, over the $23 ceiling, though still
-under the $30 whole-pipeline alarm from this feature alone. Two
+under the $50 whole-pipeline alarm from this feature alone. Two
 consequences: grounding this constant from a real Stage 3 run's actual
 `input_tokens` is a Stage 6 precondition in substance, not just an
 aspiration; and the stable prefix is no longer a free surface to extend
