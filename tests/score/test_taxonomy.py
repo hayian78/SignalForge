@@ -18,6 +18,7 @@ import pytest
 from signalforge.config import TaxonomyConfig, load_taxonomy
 from signalforge.db import connection, topics_for_items, upsert_item
 from signalforge.score.taxonomy import (
+    _TAG_BATCH_SIZE,
     TAXONOMY_VERSION,
     compile_taxonomy,
     match_topics,
@@ -290,3 +291,79 @@ def test_a_leaf_that_matched_long_ago_is_stale(db: Path, taxonomy: TaxonomyConfi
 
         assert "policy.regulation" in stale_topics(conn, taxonomy, now=now, days=60)
         assert "policy.regulation" not in stale_topics(conn, taxonomy, now=now, days=180)
+
+
+# --------------------------------------------------------------------------- #
+# Termination and version bumps — the two things that broke in review
+# --------------------------------------------------------------------------- #
+
+
+def test_a_full_batch_of_unmatched_items_terminates(db: Path, taxonomy: TaxonomyConfig) -> None:
+    """An unmatched item writes no row and stays selectable forever.
+
+    Re-issuing the same `LIMIT` query would then return the identical rows every
+    iteration and spin. On the real corpus most items match nothing, so this is
+    the ordinary first run, not a corner case.
+    """
+    with connection(db) as conn:
+        for n in range(_TAG_BATCH_SIZE + 5):
+            _add_item(conn, title=f"A post about sourdough {n}", summary=None, ext=f"s{n}")
+
+        outcome = tag_untagged_items(conn, taxonomy)
+
+        assert outcome.items_examined == _TAG_BATCH_SIZE + 5
+        assert outcome.items_tagged == 0
+
+
+def test_a_full_batch_terminates_with_matches_interleaved(
+    db: Path, taxonomy: TaxonomyConfig
+) -> None:
+    """The cursor has to advance past matched and unmatched items alike."""
+    with connection(db) as conn:
+        for n in range(_TAG_BATCH_SIZE + 5):
+            title = "The AI Act arrives" if n % 3 == 0 else f"A post about sourdough {n}"
+            _add_item(conn, title=title, summary=None, ext=f"m{n}")
+
+        outcome = tag_untagged_items(conn, taxonomy)
+
+        assert outcome.items_examined == _TAG_BATCH_SIZE + 5
+        assert outcome.items_tagged > 0
+
+
+def test_a_version_bump_re_tags_rather_than_being_ignored(
+    db: Path, taxonomy: TaxonomyConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`UNIQUE (item_id, topic)` excludes the version, so an `INSERT OR IGNORE`
+    would leave the stale row in place and report success — the item would then
+    be re-examined forever and its topics would vanish from the digest, which
+    reads at the current version only.
+    """
+    with connection(db) as conn:
+        item_id = _add_item(conn, title="The AI Act arrives", summary=None, ext="a")
+        tag_untagged_items(conn, taxonomy)
+        assert topics_for_items(conn, [item_id], taxonomy_version=TAXONOMY_VERSION)
+
+        monkeypatch.setattr("signalforge.score.taxonomy.TAXONOMY_VERSION", "tax-v2")
+        outcome = tag_untagged_items(conn, taxonomy)
+
+        assert outcome.items_tagged == 1
+        row = conn.execute("SELECT taxonomy_version FROM item_topics").fetchone()
+        assert row[0] == "tax-v2", "the stored row must advance, not be ignored"
+        assert topics_for_items(conn, [item_id], taxonomy_version="tax-v2")
+        # And no duplicate row was created for the same (item, topic).
+        assert conn.execute("SELECT COUNT(*) FROM item_topics").fetchone()[0] == 1
+
+
+def test_after_a_bump_the_item_is_no_longer_re_examined(
+    db: Path, taxonomy: TaxonomyConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The consequence that matters: a bump must actually settle."""
+    with connection(db) as conn:
+        _add_item(conn, title="The AI Act arrives", summary=None, ext="a")
+        tag_untagged_items(conn, taxonomy)
+
+        monkeypatch.setattr("signalforge.score.taxonomy.TAXONOMY_VERSION", "tax-v2")
+        tag_untagged_items(conn, taxonomy)
+        third = tag_untagged_items(conn, taxonomy)
+
+        assert third.items_examined == 0

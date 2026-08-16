@@ -2674,7 +2674,10 @@ def _render_stale_topics(
     stale = stale_topics(conn, taxonomy, now=now, days=days)
     if not stale:
         return
-    err_console.print(
+    # `console`, not `err_console`: `_render_freshness`'s dark-source alarm is a
+    # strictly louder signal and goes to stdout, so splitting streams inside one
+    # readout would interleave unpredictably and hide this line under a redirect.
+    console.print(
         f"[yellow]taxonomy[/yellow]: {len(stale)} leaf/leaves matched nothing in {days} days — "
         f"{', '.join(stale)}. Edit their keywords in taxonomy.yaml, or drop them."
     )

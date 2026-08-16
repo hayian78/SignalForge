@@ -45,7 +45,6 @@ __all__ = [
     "connect",
     "connection",
     "count_killed_items",
-    "topics_for_items",
     "decide_proposal",
     "delivery_exists",
     "feedback_verdicts_for_items",
@@ -69,9 +68,11 @@ __all__ = [
     "reopen_proposal",
     "source_yield_stats",
     "start_run",
+    "topics_for_items",
     "update_item_content",
     "update_proposal_probe",
     "upsert_item",
+    "upsert_item_topics",
 ]
 
 logger = logging.getLogger(__name__)
@@ -756,6 +757,38 @@ def count_killed_items(conn: sqlite3.Connection, *, start: str, end: str) -> int
         (start, end),
     ).fetchone()
     return int(row["n"])
+
+
+def upsert_item_topics(
+    conn: sqlite3.Connection,
+    *,
+    item_id: int,
+    topics: Sequence[tuple[str, str]],
+    taxonomy_version: str,
+    tagged_at: str,
+) -> None:
+    """Store one item's `(topic, matched_keyword)` pairs, replacing older ones.
+
+    `ON CONFLICT DO UPDATE`, not `INSERT OR IGNORE`. `UNIQUE (item_id, topic)`
+    deliberately excludes the version, so a row tagged under an older vocabulary
+    already occupies the slot — `OR IGNORE` would leave it there and report
+    success. The item would then still fail the current-version `NOT EXISTS`
+    check, be re-examined on every run forever, and vanish from the digest,
+    which reads topics at the current version only. Updating in place is what
+    makes a `TAXONOMY_VERSION` bump actually re-tag.
+    """
+    conn.executemany(
+        """
+        INSERT INTO item_topics
+            (item_id, topic, matched_keyword, taxonomy_version, tagged_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT (item_id, topic) DO UPDATE SET
+            matched_keyword  = excluded.matched_keyword,
+            taxonomy_version = excluded.taxonomy_version,
+            tagged_at        = excluded.tagged_at
+        """,
+        [(item_id, topic, keyword, taxonomy_version, tagged_at) for topic, keyword in topics],
+    )
 
 
 def topics_for_items(

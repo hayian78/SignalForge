@@ -2,11 +2,16 @@
 
 **No LLM anywhere in this module** (NEVER rule 3). Deciding whether the words
 "export control" appear in a title is not judgment; it is `str.find` with
-better manners. DESIGN §10 sketches a Haiku fallback for items the keywords
-miss — that is deliberately *not* built here. It would mean editing the triage
-prompt, which forces a `RUBRIC_VERSION` bump and puts a cost surface on a stage
-that currently has none. Keyword-only first; revisit if coverage feels thin,
-with a `llm-cost-guard` review (CLAUDE.md §6).
+better manners.
+
+DESIGN §10 sketches a Haiku fallback for items the keywords miss, and it is
+deliberately not built here — but **not because it is expensive**. It was
+priced at ≈$0.06/month against the real corpus, so DESIGN's "marginal cost
+~zero" is accurate and cost is not the argument. The actual reasons are that it
+edits the triage prompt (forcing a `RUBRIC_VERSION` bump, which makes every
+existing score incomparable to every new one) and that it puts an LLM surface on
+a stage that can be verified by reading it. Keyword-only ships first because it
+is reviewable; the fallback is a separate, cost-guarded change.
 
 **The taxonomy is config, not code** (CLAUDE.md §4, NEVER rule 6). Not one
 keyword appears below — every one is loaded from `config/taxonomy.yaml`.
@@ -32,6 +37,8 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 from signalforge.config import TaxonomyConfig
+from signalforge.db import upsert_item_topics
+from signalforge.score import _error_record
 
 __all__ = [
     "TAXONOMY_VERSION",
@@ -140,26 +147,36 @@ def match_topics(
     return matches
 
 
-def _fetch_untagged(conn: sqlite3.Connection, *, limit: int) -> list[tuple[int, str, str | None]]:
-    """Items with no topic row at the current taxonomy version.
+def _fetch_untagged(
+    conn: sqlite3.Connection, *, after_id: int, limit: int
+) -> list[tuple[int, str, str | None]]:
+    """Items after `after_id` with no topic row at the current taxonomy version.
 
     `NOT EXISTS` rather than a `LEFT JOIN ... IS NULL`: an item legitimately has
     many topic rows, and the join form would have to be de-duplicated. This also
     picks up items whose rows are all at an older `taxonomy_version`, which is
     what makes a version bump re-tag rather than skip.
+
+    **The `after_id` cursor is load-bearing, not an optimization.** An item that
+    matches no keyword writes no row and so stays in this result set forever — by
+    design, so a later taxonomy edit can still catch it. Re-issuing the same
+    `LIMIT` query would then hand back the identical rows every iteration and
+    never terminate. On the real database that is not a corner case: most items
+    match nothing, so the very first run would spin forever.
     """
     rows = conn.execute(
         """
         SELECT i.id, i.title, i.summary
         FROM items AS i
-        WHERE NOT EXISTS (
+        WHERE i.id > ?
+          AND NOT EXISTS (
             SELECT 1 FROM item_topics AS t
             WHERE t.item_id = i.id AND t.taxonomy_version = ?
         )
         ORDER BY i.id
         LIMIT ?
         """,
-        (TAXONOMY_VERSION, limit),
+        (after_id, TAXONOMY_VERSION, limit),
     ).fetchall()
     return [(int(row[0]), str(row[1]), row[2]) for row in rows]
 
@@ -171,10 +188,12 @@ def tag_untagged_items(conn: sqlite3.Connection, taxonomy: TaxonomyConfig) -> Ta
     (CLAUDE.md §7) — it stays untagged and is retried next run, exactly how
     `score_unscored_items` treats a failed score row.
 
-    An item that matches nothing is a real and common outcome (~20% by DESIGN
-    §10's estimate). It writes no row and is therefore re-examined every run.
-    That is deliberate: re-matching is free, and the alternative — a sentinel
-    "no topics" row — would need its own cleanup on every taxonomy edit.
+    An item that matches nothing is a real and common outcome — the majority of
+    a real corpus. It writes no row and is therefore re-examined every run. That
+    is deliberate: re-matching is free, and the alternative — a sentinel "no
+    topics" row — would need its own cleanup on every taxonomy edit. It is also
+    why the pass below walks a cursor rather than re-issuing one `LIMIT` query
+    (see `_fetch_untagged`).
     """
     outcome = TagOutcome()
     compiled = compile_taxonomy(taxonomy)
@@ -183,11 +202,13 @@ def tag_untagged_items(conn: sqlite3.Connection, taxonomy: TaxonomyConfig) -> Ta
         return outcome
 
     tagged_at = datetime.now(UTC).isoformat()
+    after_id = 0
 
     while True:
-        batch = _fetch_untagged(conn, limit=_TAG_BATCH_SIZE)
+        batch = _fetch_untagged(conn, after_id=after_id, limit=_TAG_BATCH_SIZE)
         if not batch:
             break
+        after_id = batch[-1][0]
 
         for item_id, title, summary in batch:
             outcome.items_examined += 1
@@ -195,31 +216,19 @@ def tag_untagged_items(conn: sqlite3.Connection, taxonomy: TaxonomyConfig) -> Ta
             if not matches:
                 continue
             try:
-                conn.executemany(
-                    """
-                    INSERT OR IGNORE INTO item_topics
-                        (item_id, topic, matched_keyword, taxonomy_version, tagged_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    """,
-                    [(item_id, m.topic, m.keyword, TAXONOMY_VERSION, tagged_at) for m in matches],
+                upsert_item_topics(
+                    conn,
+                    item_id=item_id,
+                    topics=[(m.topic, m.keyword) for m in matches],
+                    taxonomy_version=TAXONOMY_VERSION,
+                    tagged_at=tagged_at,
                 )
             except sqlite3.Error as exc:
                 logger.exception("persisting topics failed", extra={"item_id": item_id})
-                outcome.errors.append(
-                    {
-                        "source_id": str(item_id),
-                        "source_type": "-",
-                        "error_type": exc.__class__.__name__,
-                        "message": str(exc) or exc.__class__.__name__,
-                        "occurred_at": datetime.now(UTC).isoformat(),
-                    }
-                )
+                outcome.errors.append(_error_record(str(item_id), exc))
             else:
                 outcome.items_tagged += 1
                 outcome.topics_written += len(matches)
-
-        if len(batch) < _TAG_BATCH_SIZE:
-            break
 
     logger.info(
         "tagged items",

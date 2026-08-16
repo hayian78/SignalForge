@@ -241,7 +241,7 @@ def _trim_reasoning(text: str, *, limit: int = _WHY_IT_MATTERS_MAX_CHARS) -> str
     return f"{truncated}…"
 
 
-def _to_line(scored: DigestItem, topics: dict[int, list[str]] | None = None) -> DigestLine | None:
+def _to_line(scored: DigestItem, topics: dict[int, list[str]]) -> DigestLine | None:
     """One digest line, or None if `scored` cannot be cited.
 
     `Item.url` is required by the model, so this should be unreachable in
@@ -271,7 +271,7 @@ def _to_line(scored: DigestItem, topics: dict[int, list[str]] | None = None) -> 
         signal=scored.signal,
         relevance=scored.relevance,
         novelty=scored.novelty,
-        topics=tuple((topics or {}).get(item_id, ())) if item_id is not None else (),
+        topics=tuple(topics.get(item_id, ())) if item_id is not None else (),
     )
 
 
@@ -537,7 +537,10 @@ def build_digest_context(
     """
     start, end = utc_day_window(target_date, tz)
     scored_items = get_digest_items(conn, start=start, end=end)
-    citable = [scored for scored in scored_items if _to_line(scored) is not None]
+    # `{}` because this pass only asks "is it citable?" — topics are irrelevant
+    # to that, and fetching them for items that may not survive selection would
+    # be work thrown away.
+    citable = [scored for scored in scored_items if _to_line(scored, {}) is not None]
     selected = select_digest_items(
         citable,
         max_items=max_items,

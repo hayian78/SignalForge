@@ -349,7 +349,7 @@ def test_to_line_drops_an_item_with_no_url_rather_than_render_an_uncited_line(
     )
 
     with caplog.at_level("WARNING"):
-        line = _to_line(scored)
+        line = _to_line(scored, {})
 
     assert line is None
     assert "citation" in caplog.text.lower() or "url" in caplog.text.lower()
