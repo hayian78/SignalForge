@@ -560,7 +560,8 @@ class ValidatorStore:
         return self.cache_dir / _safe_component(source_id) / "_meta" / f"{key}.json"
 
     def state_path_for(self, source_id: str, key: str) -> Path:
-        """Sidecar for ingestor state, alongside the validators and pruned alike."""
+        """Sidecar for ingestor state, beside the validators and outside the dated
+        payload dirs for the same reason — a prune must not be able to reach it."""
         return self.cache_dir / _safe_component(source_id) / "_meta" / f"{key}.state.json"
 
     def read_state(self, source_id: str, key: str) -> dict[str, Any]:

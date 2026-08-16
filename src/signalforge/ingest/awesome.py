@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
+from urllib.parse import urlsplit
 
 from signalforge.config import SourcesConfig
 from signalforge.ingest.base import (
@@ -67,26 +69,77 @@ releases, which are a completely different kind of item."""
 BASELINE_KEY: Final = "awesome-entries"
 """Sidecar key for the seen-entry baseline, under the source's `_meta/`."""
 
+
 _README_CANDIDATES: Final = ("README.md", "readme.md", "Readme.md")
 """Tried in order. GitHub's raw host is case-sensitive, and awesome lists are
 not consistent about it."""
 
-_ENTRY_PATTERN: Final = re.compile(
-    r"""^[ \t]*             # leading indent: nested lists count too
-        [-*+][ \t]+         # the bullet
-        \[(?P<name>[^\]]+)\]   # [name]
-        \((?P<url>[^)\s]+)     # (url
-        (?:[ \t]+"[^"]*")?  # optional markdown link title
-        \)
-        (?P<rest>.*)$       # the description, usually after an em dash
-    """,
+_BULLET: Final = re.compile(r"^[ \t]*[-*+][ \t]+")
+"""The bullet and its indent. Nested lists count — plenty of lists group by
+sub-heading and indent the entries under it."""
+
+_LEADING_DECORATION: Final = re.compile(
+    r"""^(?:
+          <[^>]+>            # an <img>/<sub> tag some lists prefix
+        | \*{1,2} | _{1,2}   # bold/italic wrapping the link
+        # A leading badge/image, optionally wrapped in a link. The `!` is
+        # required: without it this alternative eats the entry's own link.
+        | \[?!\[[^\]]*\]\([^)]*\)(?:\]\([^)]*\))?
+        | [^\w\[<]           # emoji, arrows, separators, stray punctuation
+    )+""",
     re.VERBOSE,
 )
+"""What sits between the bullet and the link. Awesome lists put emoji, badges,
+bold markers and `<img>` tags here as house style — `punkpeye/awesome-mcp-servers`
+and `e2b-dev/awesome-ai-agents` between them use most of it. Consuming this
+rather than demanding `[` right after the bullet is the difference between
+reading a real list and reading none of it."""
 
-_DESCRIPTION_LEAD: Final = re.compile(r"^[\s\-–—:·|]+")
+_LINK: Final = re.compile(r"\[(?P<name>[^\]]*)\]\((?P<url>[^()\s]*(?:\([^()]*\)[^()\s]*)*)")
+"""One markdown link. The URL group allows *one* level of balanced parens so
+`.../Agent_(AI)` survives — a naive `[^)]+` truncates it into a broken citation,
+and the citation is the whole point (NEVER rule 7)."""
+
+_INLINE_MEDIA: Final = re.compile(r"\[?!\[[^\]]*\]\([^)]*\)(?:\]\([^)]*\))?")
+"""A badge or image, optionally wrapped in a link. Stripped from a description
+before it reaches triage: `punkpeye/awesome-mcp-servers` puts a glama.ai score
+badge after most entries, and its markdown is pure token cost in a summary."""
+
+_DESCRIPTION_LEAD: Final = re.compile(r"^[\s\-–—:·|>]+")
 """Awesome lists separate name from description with any of these."""
 
 _CODE_FENCE: Final = re.compile(r"^[ \t]*(```|~~~)")
+
+_BADGE_HOSTS: Final = frozenset(
+    {
+        "img.shields.io",
+        "shields.io",
+        "badge.fury.io",
+        "badgen.net",
+        "camo.githubusercontent.com",
+        "travis-ci.org",
+        "travis-ci.com",
+        "circleci.com",
+        "codecov.io",
+        "app.codecov.io",
+    }
+)
+"""Hosts that only ever serve a badge image. Not a taste filter — a badge URL is
+not a document, so an item citing one is an uncitable claim wearing a link. This
+is a property of the hosts, not of the operator's interests, so it belongs here
+rather than in `sources.yaml` (contrast the keyword lists, which are config)."""
+
+_MAX_LABEL_REPEATS: Final = 2
+"""How often one link label may repeat before every copy is treated as
+navigation rather than as entries.
+
+`e2b-dev/awesome-ai-agents` describes each project with an `### Heading` and a
+bullet list of links beneath it — "GitHub" 92 times, "Web" 81, "Discord" 51. A
+bullet-link parser reads those as 621 entries whose titles are `GitHub` and
+`Discord`, which is exactly the noise this pipeline exists to remove. A repeated
+label is a structural signal, not a keyword blocklist: it needs no vocabulary,
+generalizes to lists nobody has seen, and leaves genuinely repeated project
+links (2 in `punkpeye/awesome-mcp-servers`) alone."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,19 +160,71 @@ def readme_url(repo: str, filename: str) -> str:
     return f"https://raw.githubusercontent.com/{repo}/HEAD/{filename}"
 
 
+def _host_of(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _parse_line(line: str) -> AwesomeEntry | None:
+    """One bullet line as an entry, or None if it is not one.
+
+    The entry's link is the **first** link on the line after any leading
+    decoration, not the last. That ordering matters: `punkpeye/awesome-mcp-servers`
+    writes `- [project](repo) [![score](badge)](glama) 📇 — description`, so
+    taking the last link would cite a score badge instead of the project.
+    Image-only links (`[![…](…)](…)`) are skipped rather than preferred, which
+    handles the other house style — a badge *before* the name — by the same rule.
+    """
+    body = _BULLET.sub("", line, count=1)
+    if body == line:  # not a bullet
+        return None
+    body = _LEADING_DECORATION.sub("", body, count=1)
+
+    match = _LINK.match(body)
+    if match is None:
+        return None
+
+    url = match.group("url").strip()
+    if not is_safe_url(url) or _host_of(url) in _BADGE_HOSTS:
+        return None
+
+    name = flatten_to_single_line(match.group("name"))
+    if not name or name.startswith("!"):
+        return None
+
+    rest = body[match.end() :]
+    # Drop the closing paren the link regex leaves behind, plus any markdown
+    # link title inside it.
+    rest = re.sub(r'^(?:[ \t]+"[^"]*")?\)', "", rest, count=1)
+    rest = _INLINE_MEDIA.sub("", rest)
+    description = flatten_to_single_line(_DESCRIPTION_LEAD.sub("", rest))
+    return AwesomeEntry(name=name, url=url, description=description)
+
+
 def parse_entries(markdown: str) -> list[AwesomeEntry]:
-    """Every `- [name](url) — description` bullet, in document order.
+    """Every list entry in document order, in the shapes real lists actually use.
 
     Skips fenced code blocks: a README's usage example is full of bullets and
-    links that are not entries. Everything surviving that is filtered on
+    links that are not entries. Everything surviving is filtered on
     `is_safe_url`, which drops in-document anchors (`#contents`), relative links
     to a `CONTRIBUTING.md`, and `javascript:`/`data:` links in one test.
 
-    Text is flattened at parse time, not at render time (NEVER rule 17): a list
-    entry is world-authored, an entry name lands in a vault line, and a name
-    containing a checkbox marker would otherwise forge a decision.
+    **Repeated labels are dropped as navigation**, not kept as entries — see
+    `_MAX_LABEL_REPEATS`. This is the pass that stops a link-list-per-project
+    README from yielding ninety items called "GitHub".
+
+    A wrapped description keeps only its first line. The parser is deliberately
+    line-anchored — that is what makes it structurally impossible to smuggle a
+    vault checkbox marker across a line break (NEVER rule 17) — and a truncated
+    summary is a much better trade than a forgeable one.
+
+    Text is flattened here, at parse time: a list entry is world-authored, an
+    entry name lands in a vault line, and a name carrying a marker would
+    otherwise forge a decision.
     """
-    entries: list[AwesomeEntry] = []
+    parsed: list[AwesomeEntry] = []
     seen_urls: set[str] = set()
     in_fence = False
 
@@ -130,27 +235,19 @@ def parse_entries(markdown: str) -> list[AwesomeEntry]:
         if in_fence:
             continue
 
-        match = _ENTRY_PATTERN.match(line)
-        if match is None:
-            continue
-
-        url = match.group("url").strip()
-        if not is_safe_url(url):
+        entry = _parse_line(line)
+        if entry is None:
             continue
         # First occurrence wins. Awesome lists routinely repeat a link across
         # sections, and a duplicate would otherwise fight itself for the same
         # UNIQUE (source_id, external_id) slot.
-        if url in seen_urls:
+        if entry.url in seen_urls:
             continue
-        seen_urls.add(url)
+        seen_urls.add(entry.url)
+        parsed.append(entry)
 
-        name = flatten_to_single_line(match.group("name"))
-        description = flatten_to_single_line(_DESCRIPTION_LEAD.sub("", match.group("rest")))
-        if not name:
-            continue
-        entries.append(AwesomeEntry(name=name, url=url, description=description))
-
-    return entries
+    label_counts = Counter(entry.name.casefold() for entry in parsed)
+    return [entry for entry in parsed if label_counts[entry.name.casefold()] <= _MAX_LABEL_REPEATS]
 
 
 class AwesomeListIngestor:
@@ -192,16 +289,30 @@ class AwesomeListIngestor:
             # Not an error: a 200 that parses to nothing is far more likely to be
             # a moved README than a genuinely empty list, and treating it as an
             # empty list would wipe the baseline and re-emit everything next run.
+            # Drop the ETag we just earned. Otherwise the next run 304s before
+            # it ever parses, this anomaly is never re-detected, and a list the
+            # parser cannot read goes dark on day one after exactly one warning.
+            # Same reasoning `HttpFetcher.invalidate` exists for: a 200 that is
+            # technically cacheable but useless to us.
+            fetcher.invalidate(readme_url(self.repo, filename), source_id=self.source_id)
             logger.warning(
-                "awesome list README parsed to zero entries; leaving the baseline alone",
+                "awesome list %s: README parsed to zero entries; leaving the baseline alone "
+                "and forcing an unconditional refetch next run",
+                self.source_id,
                 extra={"source_id": self.source_id, "repo": self.repo, "readme": filename},
             )
             return IngestResult()
 
         state = fetcher.validators.read_state(self.source_id, BASELINE_KEY)
         known = state.get("urls")
-        seeded = isinstance(known, list)
+        # `repo` is verified, not decorative: `_safe_component` collapses every
+        # non-`[A-Za-z0-9._-]` run to `-`, so `a/b-c` and `a-b/c` resolve to the
+        # same sidecar path. Without this check one list would silently inherit
+        # the other's baseline and emit nothing, forever.
+        seeded = isinstance(known, list) and state.get("repo") == self.repo
         baseline: set[str] = {str(u) for u in known} if isinstance(known, list) else set()
+        if not seeded:
+            baseline = set()
 
         # The baseline covers every entry seen this run, capped or not — the cap
         # bounds a single run's triage bill, it does not defer entries to
@@ -218,15 +329,25 @@ class AwesomeListIngestor:
 
         new_entries = [entry for entry in entries if entry.url not in baseline]
         if len(new_entries) > self.max_new_entries:
-            # No silent caps (DESIGN §7.1's rule, and the reason `runs.errors` is
-            # the monitoring channel): say exactly what was dropped.
+            # No silent caps: say exactly what was dropped, *in the message*.
+            # The configured log format renders no `extra` fields, so anything
+            # only carried there is invisible to the operator reading cron.log.
+            # These entries enter the baseline and so are dropped permanently,
+            # which makes this the only record that they existed.
+            dropped = [entry.url for entry in new_entries[self.max_new_entries :]]
             logger.warning(
-                "awesome list produced more new entries than the per-run cap; dropping the excess",
+                "awesome list %s: %d new entries exceeded the per-run cap of %d; "
+                "dropping %d permanently: %s",
+                self.source_id,
+                len(new_entries),
+                self.max_new_entries,
+                len(dropped),
+                ", ".join(dropped),
                 extra={
                     "source_id": self.source_id,
                     "new_entries": len(new_entries),
                     "cap": self.max_new_entries,
-                    "dropped": [entry.url for entry in new_entries[self.max_new_entries :]],
+                    "dropped": dropped,
                 },
             )
             new_entries = new_entries[: self.max_new_entries]
@@ -247,24 +368,32 @@ class AwesomeListIngestor:
 
         A 304 counts as answering and short-circuits: an unchanged list is the
         common daily case, and trying the other spellings past it would turn a
-        free run into two wasted requests. A 404 raises `FetchError`, which is
-        the signal to try the next spelling; the last one's error is what
-        surfaces if none of them exist.
+        free run into two wasted requests.
+
+        **Only a 404 advances to the next spelling.** `HttpFetcher.get` has
+        already exhausted its retry ladder before raising, so treating a 503 or
+        a timeout as "wrong spelling" would fire two more full ladders — up to
+        nine requests for one list — and then report the *last* candidate's
+        404 in `runs.errors`, hiding the real failure. `runs.errors` is the
+        monitoring channel (CLAUDE.md §7), so a misattributed error is worse
+        than a loud one.
         """
-        last_error: Exception | None = None
+        last_404: FetchError | None = None
         for filename in _README_CANDIDATES:
             try:
                 response = await fetcher.get(
                     readme_url(self.repo, filename), source_id=self.source_id
                 )
-            except Exception as exc:  # noqa: BLE001 - try the next spelling
-                last_error = exc
+            except FetchError as exc:
+                if exc.status_code != 404:
+                    raise
+                last_404 = exc
                 continue
             return response, filename
 
-        if last_error is not None:
-            raise last_error
-        raise FetchError(f"no README found for {self.repo}", url=readme_url(self.repo, "README.md"))
+        raise last_404 or FetchError(
+            f"no README found for {self.repo}", url=readme_url(self.repo, "README.md")
+        )
 
     def _stage_baseline(self, fetcher: HttpFetcher, entries: list[AwesomeEntry]) -> None:
         """Stage every URL seen this run, durable only once the items persist."""

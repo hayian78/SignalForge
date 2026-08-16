@@ -72,6 +72,24 @@ INTERESTS_FILENAME: Final = "interests.yaml"
 SETTINGS_FILENAME: Final = "settings.yaml"
 TAXONOMY_FILENAME: Final = "taxonomy.yaml"
 
+AWESOME_MAX_NEW_PER_RUN_CEILING: Final = 100
+"""Hard ceiling on `github.awesome_max_new_per_run`.
+
+DESIGN §8's own lesson, learned the expensive way on the scout's search budget:
+a ceiling that permits values the budget forbids is not a ceiling. Every
+awesome-list entry that becomes an item is billed at triage, so without this a
+one-line YAML edit to `awesome_max_new_per_run: 5000` moves real spend with the
+whole suite still green.
+
+Lives here rather than beside the ingestor because `config.py` is the bottom
+layer — the reverse import is a cycle, which is exactly why the scout's ceiling
+has to be clamped at use instead of bounded at load. A cap that *can* be checked
+at load should be.
+
+100 items is roughly $0.03 of Haiku triage at the measured per-item rate, and
+far above any real list's weekly churn, so it constrains mistakes and nothing
+else."""
+
 
 class ConfigError(Exception):
     """Raised when a config file is missing, unparseable, or fails validation."""
@@ -145,7 +163,9 @@ class GithubConfig(_StrictModel):
     awesome_lists: list[str] = Field(default_factory=list)
     """`owner/repo` slugs whose README is diffed between runs (DESIGN §7)."""
 
-    awesome_max_new_per_run: int | None = Field(default=None, ge=1)
+    awesome_max_new_per_run: int | None = Field(
+        default=None, ge=1, le=AWESOME_MAX_NEW_PER_RUN_CEILING
+    )
     """Ceiling on how many newly-added list entries become items in one run.
 
     Required whenever `awesome_lists` is non-empty (see the validator below),

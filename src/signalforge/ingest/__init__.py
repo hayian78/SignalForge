@@ -150,7 +150,7 @@ async def ingest_all(
             "item_count": len(items),
             "skipped_too_old": len(result.items) - len(items),
             "error_count": len(result.errors),
-            "pending_validators": validators.pending_count(),
+            "pending_cache_writes": validators.pending_count(),
         },
     )
     return IngestRun(items=items, errors=result.errors, validators=validators)

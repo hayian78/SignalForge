@@ -339,3 +339,45 @@ def test_shipped_config_builds_every_ingestor(monkeypatch: pytest.MonkeyPatch) -
     )
     assert len(ingestors) == expected
     assert len({i.source_id for i in ingestors}) == len(ingestors)
+
+
+def test_source_narrows_to_a_single_awesome_list() -> None:
+    """`--source` has to narrow awesome lists too.
+
+    Without their own filter, debugging one feed fetches every configured list,
+    emits its items, and advances its baseline — the opposite of what the flag
+    promises, and it inflates the run's `attempted` count as well.
+    """
+    from signalforge.cli import _select_source
+
+    config = make_sources_config(
+        rss=[{"id": "example-blog", "url": FEED_URL}],
+        github={
+            "token_env": "SIGNALFORGE_TEST_TOKEN",
+            "releases": ["Aider-AI/aider"],
+            "awesome_lists": ["a/one", "b/two"],
+            "awesome_max_new_per_run": 25,
+        },
+        hackernews={"keywords": ["mcp"]},
+    )
+
+    ids = [i.source_id for i in build_ingestors(_select_source(config, "awesome:a/one"))]  # type: ignore[arg-type]
+
+    assert ids == ["awesome:a/one"]
+
+
+def test_source_on_a_feed_does_not_drag_in_the_awesome_lists() -> None:
+    from signalforge.cli import _select_source
+
+    config = make_sources_config(
+        rss=[{"id": "example-blog", "url": FEED_URL}],
+        github={
+            "token_env": "SIGNALFORGE_TEST_TOKEN",
+            "awesome_lists": ["a/one"],
+            "awesome_max_new_per_run": 25,
+        },
+    )
+
+    ids = [i.source_id for i in build_ingestors(_select_source(config, "example-blog"))]  # type: ignore[arg-type]
+
+    assert ids == ["example-blog"]

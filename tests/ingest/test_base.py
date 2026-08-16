@@ -622,3 +622,41 @@ def test_a_non_mapping_state_payload_is_treated_as_absent(cache_dir: Path) -> No
     path.write_text("[1, 2, 3]", encoding="utf-8")
 
     assert store.read_state("awesome:a/b", "entries") == {}
+
+
+def test_a_validator_and_state_for_one_source_are_withheld_together(cache_dir: Path) -> None:
+    """The combined case this feature actually produces.
+
+    A source that failed to persist must keep neither its 304 nor its baseline:
+    a committed baseline without the items would mark unseen entries as seen.
+    """
+    store = ValidatorStore(cache_dir)
+    response = httpx.Response(
+        200, headers={"etag": '"v1"'}, request=httpx.Request("GET", "https://example.com/x")
+    )
+    store.stage("awesome:a/b", "k", response)
+    store.stage_state("awesome:a/b", "entries", {"urls": ["https://example.com/x"]})
+
+    store.commit({"some-other-source"})
+
+    assert store.read("awesome:a/b", "k") == {}
+    assert store.read_state("awesome:a/b", "entries") == {}
+    assert store.pending_count() == 2, "still staged, ready for a later commit"
+
+
+def test_a_failed_state_write_does_not_raise(
+    cache_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Failing to write the baseline costs a re-emit next run — duplicates the
+    upsert absorbs — and must never fail a run that already produced items."""
+    store = ValidatorStore(cache_dir)
+    store.stage_state("awesome:a/b", "entries", {"urls": []})
+
+    def deny(self: Path, *args: object, **kwargs: object) -> None:
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(Path, "write_text", deny)
+
+    store.commit()
+
+    assert store.pending_count() == 0, "staged entry is cleared either way"
