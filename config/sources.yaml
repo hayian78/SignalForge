@@ -85,6 +85,12 @@ rss:
   # 2026-08-01 curate #7: openai-news earned 4 'useful' marks and anthropics/claude-code 14 kept / 4 useful, yet there is no first-party Anthropic feed in the inventory; anthropic.com ships no official RSS, so this maintained…
   - id: anthropic-news
     url: https://raw.githubusercontent.com/taobojlen/anthropic-rss-feed/main/anthropic_news_rss.xml
+  # 2026-08-15 curate #11: anthropics/claude-code is the best-performing GitHub source (22/28 kept, 8 useful) and a Claude Code team fireside chat was a top kept item, but the engineering write-ups behind those releases are…
+  - id: anthropic-engineering
+    url: https://raw.githubusercontent.com/conoro/anthropic-engineering-rss-feed/main/anthropic_engineering_rss.xml
+  # 2026-08-15 curate #12: industry.strategy is a priority topic with no dedicated source since interconnects was dropped; SemiAnalysis published 'Claude Code is the Inflection Point' (Feb 2026) and 'AI Value Capture - The…
+  - id: semianalysis
+    url: https://newsletter.semianalysis.com/feed
 # Anthropic's engineering blog publishes no RSS feed (every plausible path 404s
 # as of 2026-07-16). Its posts reach HN within hours, and `hackernews.keywords`
 # below already covers them — same reasoning DESIGN §7 applies to X/Twitter.
@@ -115,7 +121,8 @@ github:
     # microsoft/markitdown, modelcontextprotocol/servers, duckdb/duckdb removed).
     # Those are framework/library release-note noise for an exec briefing;
     # majors surface via HN and the thought-leadership RSS sources above anyway.
-    - OpenHands/OpenHands
+    # 2026-08-15 curate #13: 14 items over 30 days, only 7 kept, and the only operator marks were 4 noise with zero useful — release-note churn that Claude Code coverage (22/28 kept, 8 useful) already covers better for this…
+    # - OpenHands/OpenHands
     - continuedev/continue
     # 2026-08-08 curate #10: All 4 items were kept by the pipeline but you marked 3 of them noise — the only source in the window where your own marks contradict the triage that badly. It also duplicates coverage you already get…
     # - block/goose
