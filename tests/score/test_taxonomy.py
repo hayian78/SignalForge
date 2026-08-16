@@ -343,13 +343,16 @@ def test_a_version_bump_re_tags_rather_than_being_ignored(
         tag_untagged_items(conn, taxonomy)
         assert topics_for_items(conn, [item_id], taxonomy_version=TAXONOMY_VERSION)
 
-        monkeypatch.setattr("signalforge.score.taxonomy.TAXONOMY_VERSION", "tax-v2")
+        # Derived from the real constant rather than a literal, so bumping the
+        # shipped version never makes this test assert against itself.
+        bumped = f"{TAXONOMY_VERSION}-bumped"
+        monkeypatch.setattr("signalforge.score.taxonomy.TAXONOMY_VERSION", bumped)
         outcome = tag_untagged_items(conn, taxonomy)
 
         assert outcome.items_tagged == 1
         row = conn.execute("SELECT taxonomy_version FROM item_topics").fetchone()
-        assert row[0] == "tax-v2", "the stored row must advance, not be ignored"
-        assert topics_for_items(conn, [item_id], taxonomy_version="tax-v2")
+        assert row[0] == bumped, "the stored row must advance, not be ignored"
+        assert topics_for_items(conn, [item_id], taxonomy_version=bumped)
         # And no duplicate row was created for the same (item, topic).
         assert conn.execute("SELECT COUNT(*) FROM item_topics").fetchone()[0] == 1
 
@@ -362,7 +365,9 @@ def test_after_a_bump_the_item_is_no_longer_re_examined(
         _add_item(conn, title="The AI Act arrives", summary=None, ext="a")
         tag_untagged_items(conn, taxonomy)
 
-        monkeypatch.setattr("signalforge.score.taxonomy.TAXONOMY_VERSION", "tax-v2")
+        monkeypatch.setattr(
+            "signalforge.score.taxonomy.TAXONOMY_VERSION", f"{TAXONOMY_VERSION}-bumped"
+        )
         tag_untagged_items(conn, taxonomy)
         third = tag_untagged_items(conn, taxonomy)
 

@@ -52,7 +52,7 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-TAXONOMY_VERSION: Final = "tax-v1"
+TAXONOMY_VERSION: Final = "tax-v2"
 """Bump when `taxonomy.yaml`'s *keywords* change, exactly as `RUBRIC_VERSION`
 is bumped for a prompt change. Adding a brand-new leaf does not require it —
 previously-tagged items simply never carried that topic — but editing or

@@ -30,26 +30,49 @@
 # rather than writing straight to `sources.yaml`. Add leaves the same way you'd
 # add a `priority_topics` entry: here, plus there.
 
+# Widened 2026-08-16 against the stored corpus. The original six leaves carried
+# only multi-word phrases ("competitive positioning", "deployment at scale")
+# that real headlines do not contain verbatim: measured coverage was 3.9% of
+# 2,082 items, and `status` flagged five of six leaves stale on day one. Each
+# keyword below was counted against the real corpus before being added; the set
+# lifts coverage to 23.5% with no single leaf swamping the rest.
+#
+# Deliberately NOT added, and why:
+#   `claude` / `gemini` / `llama` (151/51/67 hits) — a vendor name is not a
+#     capability claim; these tag every routine release note.
+#   `research` (91) / `architecture` (64) — generic English in this corpus;
+#     `architecture` matches software-architecture posts, not research agendas.
+#   `production` (22) — "in production" is kept, the bare word is not: it also
+#     means "video production" and "produced by".
+
 industry:
   strategy:
-    keywords: [market strategy, competitive positioning, business model, go-to-market]
+    keywords: [market strategy, competitive positioning, business model, go-to-market,
+               acquisition, funding round, valuation, ipo, partnership, revenue,
+               market share, pricing, monetization, strategy]
 
 frontier:
   capabilities:
-    keywords: [frontier model, state of the art, benchmark record, capability jump]
+    keywords: [frontier model, state of the art, benchmark record, capability jump,
+               frontier, benchmark, sota, outperforms, reasoning model, context window,
+               multimodal, model release]
 
 enterprise:
   adoption:
-    keywords: [enterprise adoption, rollout, deployment at scale, procurement, pilot program]
+    keywords: [enterprise adoption, rollout, deployment at scale, procurement, pilot program,
+               enterprise, adoption, deployment, in production, case study, migration, customers]
 
 agents:
   autonomy:
-    keywords: [autonomous agent, agentic, agent autonomy, self-directed, long-horizon task]
+    keywords: [autonomous agent, agentic, agent autonomy, self-directed, long-horizon task,
+               agent, autonomous, multi-agent, orchestration, tool use, mcp, long-horizon]
 
 policy:
   regulation:
-    keywords: [regulation, ai act, executive order, export control]
+    keywords: [regulation, ai act, executive order, export control,
+               regulatory, ai policy, compliance, governance, antitrust, copyright, lawsuit]
 
 ai:
   research-direction:
-    keywords: [research direction, research agenda, roadmap, position paper]
+    keywords: [research direction, research agenda, roadmap, position paper,
+               paper, arxiv, preprint, survey, scaling law, interpretability, benchmark suite]
