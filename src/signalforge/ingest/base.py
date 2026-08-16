@@ -550,11 +550,51 @@ class ValidatorStore:
         self.cache_dir = cache_dir
         # value None == a staged deletion; a dict == staged validators to write.
         self._pending: dict[tuple[str, str], dict[str, str] | None] = {}
+        # Arbitrary per-source ingestor state under the same staging rule. See
+        # `stage_state`.
+        self._pending_state: dict[tuple[str, str], dict[str, Any]] = {}
 
     def path_for(self, source_id: str, key: str) -> Path:
         """Sidecar location. Outside the dated payload dirs, so the 90-day prune
         cannot strand a validator and force a full refetch of every source."""
         return self.cache_dir / _safe_component(source_id) / "_meta" / f"{key}.json"
+
+    def state_path_for(self, source_id: str, key: str) -> Path:
+        """Sidecar for ingestor state, alongside the validators and pruned alike."""
+        return self.cache_dir / _safe_component(source_id) / "_meta" / f"{key}.state.json"
+
+    def read_state(self, source_id: str, key: str) -> dict[str, Any]:
+        """Committed state for one key; empty when there is none.
+
+        Deliberately ignores a *staged* write, exactly as `read` does: staged
+        state is unconfirmed, and honoring it would let a mid-run re-read see
+        entries whose items never reached the database. Falling through to the
+        committed copy errs toward re-emitting, never toward silently skipping.
+        """
+        path = self.state_path_for(source_id, key)
+        if not path.is_file():
+            return {}
+        try:
+            data: Any = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            logger.warning(
+                "discarding unreadable ingestor state",
+                extra={"source_id": source_id, "path": str(path)},
+            )
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def stage_state(self, source_id: str, key: str, payload: dict[str, Any]) -> None:
+        """Hold arbitrary per-source ingestor state pending a `commit()`.
+
+        Exists for the awesome-list diff, whose "what have I already seen"
+        baseline has precisely the property this class was built around: writing
+        it before the items are persisted would make the next run treat unseen
+        entries as seen, and — unlike a stale ETag, which costs one refetch —
+        that loses them permanently. Riding the same `commit()` means the
+        per-source withholding in `cli._commit_validators` protects it for free.
+        """
+        self._pending_state[(source_id, key)] = payload
 
     def read(self, source_id: str, key: str) -> dict[str, str]:
         """The validators to send for one key; empty when there are none.
@@ -622,11 +662,13 @@ class ValidatorStore:
 
     def pending_sources(self) -> set[str]:
         """Source ids with staged, uncommitted changes (writes or deletions)."""
-        return {source_id for source_id, _ in self._pending}
+        return {source_id for source_id, _ in self._pending} | {
+            source_id for source_id, _ in self._pending_state
+        }
 
     def pending_count(self) -> int:
         """Staged changes awaiting commit, counting writes and deletions alike."""
-        return len(self._pending)
+        return len(self._pending) + len(self._pending_state)
 
     def commit(self, source_ids: Iterable[str] | None = None) -> int:
         """Apply staged changes to disk. Returns how many were applied.
@@ -659,6 +701,26 @@ class ValidatorStore:
             else:
                 applied += 1
             del self._pending[(source_id, key)]
+
+        for (source_id, key), state in list(self._pending_state.items()):
+            if selected is not None and source_id not in selected:
+                continue
+            path = self.state_path_for(source_id, key)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+            except OSError as exc:
+                # Unlike a validator, failing to write this costs a *re-emit*
+                # next run rather than a refetch — duplicates the upsert absorbs.
+                # Still never fails a run that already produced good items.
+                logger.warning(
+                    "could not update ingestor state; will re-emit next run",
+                    extra={"source_id": source_id, "path": str(path), "error": str(exc)},
+                )
+            else:
+                applied += 1
+            del self._pending_state[(source_id, key)]
+
         logger.debug("committed conditional-get validator changes", extra={"count": applied})
         return applied
 

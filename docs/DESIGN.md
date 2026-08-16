@@ -419,7 +419,7 @@ Relationships are Obsidian wikilinks — free graph view, no graph database to m
 | Hacker News | Algolia API: front page ≥ N points + keyword queries | 0 | Free, no auth; comments fetched only for top items |
 | Engineering newsletters (Latent Space, etc.) | RSS where published | 1 | Most have feeds; email fallback in Phase 3 |
 | arXiv (cs.AI/CL/LG/SE + keyword filters: agents, context, retrieval, inference, evaluation, compression, fine-tuning) | arXiv API (Atom), `ingest/arxiv.py`, **live 2026-08-07** | 1 | Categories + keywords fold into one `search_query` per run, so the 3s politeness guidance is satisfied by never issuing a second request rather than by a coded delay; abstracts only at triage |
-| Awesome lists (agent engineering, MCP, LLM, vector DBs, CLI tools) | Shallow `git clone` + diff of README between runs | 1 | New entries = new items; a diff, not a scrape |
+| Awesome lists (agent engineering, MCP, LLM, vector DBs, CLI tools) | Raw README fetch + diff between runs (`ingest/awesome.py`, **live 2026-08-16**) | 1 | New entries = new items; a diff, not a scrape. **Deviation from the specced shallow `git clone`** — see below |
 | CHANGELOG.md on watched repos that don't cut GitHub releases | Same shallow-clone + diff mechanism as awesome lists | 2 | The Releases API misses repos that only append changelogs; doc repos (MCP spec, Anthropic docs) could ride the same mechanism if felt need appears |
 | GitHub trending / star velocity | Search API `created:>date sort:stars` + star-count deltas on watched repos | 2 | Official API only — the trending page has none |
 | GitHub issues/discussions on watched repos | REST, filtered to maintainer posts + high-reaction threads | 2 | High noise; gated behind Phase 2 relevance scoring |
@@ -431,6 +431,19 @@ Relationships are Obsidian wikilinks — free graph view, no graph database to m
 | **X / Twitter** | **Cut** | — | API ~US$200/mo, scraping brittle/ToS-hostile; the listed people blog, and important threads reach HN in hours |
 | Discord / Slack | Cut (revisit on felt need) | — | |
 | Official docs (MCP spec, FastAPI, Anthropic, vLLM, …) | Not ingested — changelogs/releases already covered; docs are a *retrieval* target for the Phase 3 MCP server, not a feed | — | |
+
+### Awesome-list diffing (Phase 1, live 2026-08-16)
+
+**Fetched over HTTP, not shallow-cloned.** This table specced `git clone --depth 1` plus a README diff. What shipped fetches `raw.githubusercontent.com/<repo>/HEAD/README.md` through the shared `HttpFetcher`, which gets the same bytes while reusing conditional GET (an unchanged list costs one 304 and nothing else), `Retry-After`-aware retries, the politeness cap, and raw payload archiving. A clone would need `git` on PATH, a clone cache to manage, and its own failure handling outside all of it. Recorded here rather than done quietly.
+
+**The baseline is the whole design.** A large awesome list is 500+ entries, so a first run would push hundreds of items into a paid triage batch for a list of links nobody asked to read. So:
+
+- **A first run writes the baseline and emits nothing.** Only entries appearing *after* it become items. Adding a list to `sources.yaml` is therefore free.
+- **The baseline is staged, not written** — it goes through `ValidatorStore.stage_state` and becomes durable only once the items reached the database, riding the same per-source withholding `cli._commit_validators` already does. Written eagerly, a crash between fetch and persist would mark unseen entries as seen and lose them permanently. That is strictly worse than a stale ETag, which only costs a refetch, and it is why the mechanism is shared rather than reimplemented.
+- **`github.awesome_max_new_per_run` is required whenever `awesome_lists` is non-empty.** A list entry carries no date, so `defaults.max_item_age_days` cannot bound it and this is the only thing between a maintainer's 300-entry merge and a 300-item triage batch. Required, not defaulted, for the reason `CurationConfig` states: a spend cap must never be a number buried in Python. The cap bounds one run's bill and does not defer entries to tomorrow — deferring would make a long list dribble in for weeks and make "new" mean "new to us" rather than "new to the list". Excess is logged, never dropped silently.
+- **Identity is the link.** `external_id` is the entry's URL, not a hash of the line, so a maintainer rewording a description does not resurrect the entry as a new item. `published_at` stays None — a list entry has no publication date, and inventing "now" would let the digest claim the linked project shipped today.
+- **A 200 that parses to zero entries leaves the baseline alone.** Far likelier to be a moved README than an emptied list, and wiping the baseline would re-emit everything.
+- Entry names and descriptions are world-authored, so both go through `flatten_to_single_line` at parse time (NEVER rule 17). The parser is also line-anchored, so a marker cannot be smuggled across a line break at all.
 
 ### `sources.yaml` shape
 
@@ -453,6 +466,7 @@ github:
   releases: [Aider-AI/aider, langchain-ai/langgraph, modelcontextprotocol/specification,
              ollama/ollama, vllm-project/vllm, BerriAI/litellm, anthropics/claude-code,
              stanfordnlp/dspy, pydantic/pydantic-ai, ggml-org/llama.cpp, huggingface/transformers]
+  awesome_max_new_per_run: 25   # required whenever awesome_lists is set — see §7
   awesome_lists: [e2b-dev/awesome-ai-agents, punkpeye/awesome-mcp-servers]
 
 arxiv:
@@ -1262,7 +1276,9 @@ RSS + GitHub releases + HN → normalize → exact dedup → batched Haiku triag
 **Status — the gate's component shipped 2026-08-08; the gate itself is four Sundays of reading.**
 - [x] **Weekly Intelligence Brief** (`report/weekly.py`, `synth/weekly.py`, `llm.run_weekly_brief`, `signalforge weekly`) — deterministic selection over the seven days *before* its Sunday, one Opus call, vault-written on every outcome, marks harvested from `weekly/` so the gate has a sensor
 - [ ] Four consecutive Sunday briefs, ≥ 80% of brief items rated `useful` or better
-- [x] **vault git-committed** (`report/vaultgit.py`, shipped 2026-08-16 — §14) · [x] **`score/taxonomy.py` tagger** (keyword-only, shipped 2026-08-16 — §10) · [ ] awesome-list diffing
+- [x] **vault git-committed** (`report/vaultgit.py`, shipped 2026-08-16 — §14) · [x] **`score/taxonomy.py` tagger** (keyword-only, shipped 2026-08-16 — §10) · [x] **awesome-list diffing** (`ingest/awesome.py`, shipped 2026-08-16 — §7)
+
+**Every Phase 1 component is now built. What remains is calendar time**, not code: the four-Sunday brief streak and the four-week curation streak below. Phase 2 does not start until those close.
 - [x] `status` + `mark` commands · [x] adaptive source curation (#9) · [x] arXiv ingestion
 
 `sources.yaml` / `interests.yaml` / `taxonomy.yaml` (**config staged 2026-08-07** — validated, `score/taxonomy.py` tagger still pending, §10); arXiv (`ingest/arxiv.py`, **shipped 2026-08-07**) + awesome-list diffing (still pending); 3-dimension scoring with stored reasoning; **Weekly Intelligence Brief**; vault git-committed; `status` + `mark` commands; **adaptive source curation** (§7.1 — weekly scout, digest-based approval, append-only `sources.yaml` applier).

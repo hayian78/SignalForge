@@ -16,9 +16,8 @@ convention this package holds itself to, not something CLAUDE.md §2 states
 module with a different job — backfilling a column on rows already committed —
 and imports `db.py` directly; see its docstring.
 
-Sources: RSS, GitHub releases, Hacker News (Phase 0), arXiv (Phase 1). Awesome-
-list diffing is still Phase 1 but unimplemented; YouTube and newsletters are
-Phase 3 (NEVER rule 15).
+Sources: RSS, GitHub releases, Hacker News (Phase 0), arXiv and awesome-list
+diffing (Phase 1). YouTube and newsletters are Phase 3 (NEVER rule 15).
 
 Nothing here imports `llm.py` or calls an LLM (CLAUDE.md §2).
 """
@@ -31,6 +30,7 @@ from pathlib import Path
 
 from signalforge.config import SourcesConfig, get_secret
 from signalforge.ingest.arxiv import ArxivIngestor, build_arxiv_ingestors
+from signalforge.ingest.awesome import AwesomeListIngestor, build_awesome_ingestors
 from signalforge.ingest.base import (
     DEFAULT_MAX_CONCURRENCY,
     FetchError,
@@ -50,6 +50,7 @@ from signalforge.ingest.rss import RssIngestor, build_rss_ingestors, parse_feed
 
 __all__ = [
     "ArxivIngestor",
+    "AwesomeListIngestor",
     "FetchError",
     "FetchResponse",
     "GithubReleasesIngestor",
@@ -71,7 +72,7 @@ logger = logging.getLogger(__name__)
 
 
 def build_ingestors(config: SourcesConfig) -> list[Ingestor]:
-    """Construct every Phase 0 ingestor from `sources.yaml`.
+    """Construct every configured ingestor from `sources.yaml`.
 
     The GitHub token is resolved here, once, from the env var *named* by the
     config (`github.token_env`) — never from YAML and never logged (NEVER rule
@@ -90,6 +91,10 @@ def build_ingestors(config: SourcesConfig) -> list[Ingestor]:
             )
         token = secret.get_secret_value() if secret is not None else None
         ingestors.extend(build_github_ingestors(config, token))
+
+    # Unauthenticated: `raw.githubusercontent.com` serves public READMEs without
+    # a token, so this is outside the `github.releases` token branch above.
+    ingestors.extend(build_awesome_ingestors(config))
 
     ingestors.extend(build_hackernews_ingestors(config))
     ingestors.extend(build_arxiv_ingestors(config))

@@ -349,12 +349,14 @@ def test_build_github_ingestors_from_config() -> None:
             "token_env": "GITHUB_TOKEN",
             "releases": ["Aider-AI/aider", "ollama/ollama"],
             "awesome_lists": ["e2b-dev/awesome-ai-agents"],
+            "awesome_max_new_per_run": 25,
         }
     )
 
     ingestors = build_github_ingestors(config, None)
 
-    # awesome_lists is Phase 1 — configured, but not ingested (NEVER rule 15).
+    # `build_github_ingestors` covers releases only; awesome lists get their own
+    # builder (`ingest/awesome.py`), so they must not appear here.
     assert [i.source_id for i in ingestors] == ["Aider-AI/aider", "ollama/ollama"]
 
 

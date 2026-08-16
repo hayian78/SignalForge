@@ -22,6 +22,7 @@ from signalforge.ingest.base import (
     IngestError,
     Ingestor,
     IngestResult,
+    ValidatorStore,
     filter_by_age,
     run_ingestors,
 )
@@ -552,3 +553,72 @@ def test_filter_by_age_logs_skipped_counts_per_source(
     counts = {record.source_id: record.skipped_too_old for record in skip_records}  # type: ignore[attr-defined]
     assert counts == {"alpha": 2, "beta": 1}
     assert all(record.max_item_age_days == 7 for record in skip_records)  # type: ignore[attr-defined]
+
+
+# --------------------------------------------------------------------------- #
+# Ingestor state — the awesome-list baseline rides the validator staging rule
+# --------------------------------------------------------------------------- #
+
+
+def test_staged_state_is_not_durable_until_commit(cache_dir: Path) -> None:
+    """The property the whole mechanism exists for.
+
+    Written eagerly, a crash between fetch and DB persist would mark unseen
+    entries as seen and lose them permanently — strictly worse than a stale
+    ETag, which only costs a refetch.
+    """
+    store = ValidatorStore(cache_dir)
+
+    store.stage_state("awesome:a/b", "entries", {"urls": ["https://example.com/x"]})
+
+    assert store.read_state("awesome:a/b", "entries") == {}
+    assert not store.state_path_for("awesome:a/b", "entries").is_file()
+
+
+def test_committed_state_reads_back(cache_dir: Path) -> None:
+    store = ValidatorStore(cache_dir)
+    store.stage_state("awesome:a/b", "entries", {"urls": ["https://example.com/x"]})
+
+    store.commit()
+
+    assert store.read_state("awesome:a/b", "entries") == {"urls": ["https://example.com/x"]}
+
+
+def test_state_commit_honours_the_per_source_selection(cache_dir: Path) -> None:
+    """A source whose items failed to persist must not have its baseline made
+    durable, exactly as it must not earn its 304."""
+    store = ValidatorStore(cache_dir)
+    store.stage_state("awesome:good/list", "entries", {"urls": ["https://example.com/a"]})
+    store.stage_state("awesome:bad/list", "entries", {"urls": ["https://example.com/b"]})
+
+    store.commit({"awesome:good/list"})
+
+    assert store.read_state("awesome:good/list", "entries")
+    assert store.read_state("awesome:bad/list", "entries") == {}
+
+
+def test_state_counts_toward_pending(cache_dir: Path) -> None:
+    store = ValidatorStore(cache_dir)
+    store.stage_state("awesome:a/b", "entries", {"urls": []})
+
+    assert store.pending_sources() == {"awesome:a/b"}
+    assert store.pending_count() == 1
+
+
+def test_an_unreadable_state_sidecar_is_treated_as_absent(cache_dir: Path) -> None:
+    """Same failure direction as a corrupt validator: re-emit, never silently skip."""
+    store = ValidatorStore(cache_dir)
+    path = store.state_path_for("awesome:a/b", "entries")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{not json", encoding="utf-8")
+
+    assert store.read_state("awesome:a/b", "entries") == {}
+
+
+def test_a_non_mapping_state_payload_is_treated_as_absent(cache_dir: Path) -> None:
+    store = ValidatorStore(cache_dir)
+    path = store.state_path_for("awesome:a/b", "entries")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[1, 2, 3]", encoding="utf-8")
+
+    assert store.read_state("awesome:a/b", "entries") == {}

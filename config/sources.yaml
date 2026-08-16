@@ -127,7 +127,16 @@ github:
     # 2026-08-08 curate #10: All 4 items were kept by the pipeline but you marked 3 of them noise — the only source in the window where your own marks contradict the triage that badly. It also duplicates coverage you already get…
     # - block/goose
     - modelcontextprotocol/specification
-  # Phase 1 — diffed between runs, not ingested yet (NEVER rule 15).
+  # Live (2026-08-16): `ingest/awesome.py` fetches each README and emits only
+  # entries added since the last run — a diff, not a scrape. The *first* run for
+  # a list records its baseline and emits nothing at all, so adding a list here
+  # never floods triage with its back catalogue.
+  #
+  # `awesome_max_new_per_run` is required whenever this block is non-empty. A
+  # list entry carries no date, so `defaults.max_item_age_days` cannot bound it
+  # and this is the only thing between a maintainer's 300-entry merge and a
+  # 300-item triage batch. Excess is logged, never dropped silently.
+  awesome_max_new_per_run: 25
   awesome_lists:
     - e2b-dev/awesome-ai-agents
     - punkpeye/awesome-mcp-servers

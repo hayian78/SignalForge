@@ -31,6 +31,7 @@ from pydantic import (
     SecretStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 
 from signalforge.models import has_control_characters
@@ -142,7 +143,28 @@ class GithubConfig(_StrictModel):
     """`owner/repo` slugs polled via REST `/releases` (`/tags` fallback)."""
 
     awesome_lists: list[str] = Field(default_factory=list)
-    """`owner/repo` slugs diffed between runs (Phase 1)."""
+    """`owner/repo` slugs whose README is diffed between runs (DESIGN §7)."""
+
+    awesome_max_new_per_run: int | None = Field(default=None, ge=1)
+    """Ceiling on how many newly-added list entries become items in one run.
+
+    Required whenever `awesome_lists` is non-empty (see the validator below),
+    optional otherwise — the same principle `CurationConfig` states: a spend cap
+    must never be a number buried in Python, but a cap on a feature you are not
+    using has nothing to cap. A list entry carries no date, so
+    `defaults.max_item_age_days` cannot bound it and this is the only thing
+    between a maintainer's 300-entry merge and a 300-item triage batch."""
+
+    @model_validator(mode="after")
+    def _require_a_cap_for_awesome_lists(self) -> GithubConfig:
+        """A configured awesome list must state what it may cost."""
+        if self.awesome_lists and self.awesome_max_new_per_run is None:
+            raise ValueError(
+                "github.awesome_max_new_per_run is required when awesome_lists is set: "
+                "a list entry has no date, so this is the only bound on how many new "
+                "entries reach triage in one run"
+            )
+        return self
 
     @field_validator("releases", "awesome_lists")
     @classmethod

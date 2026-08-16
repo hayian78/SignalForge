@@ -329,10 +329,11 @@ def test_shipped_config_builds_every_ingestor(monkeypatch: pytest.MonkeyPatch) -
 
     ingestors = build_ingestors(config)
 
-    # one per feed + one per release repo + one HN + one arXiv
+    # one per feed + one per release repo + one per awesome list + one HN + one arXiv
     expected = (
         len(config.rss)
         + len(config.github.releases if config.github else [])
+        + len(config.github.awesome_lists if config.github else [])
         + 1
         + (1 if config.arxiv and config.arxiv.categories else 0)
     )
