@@ -108,6 +108,20 @@ class DigestLine:
     as Obsidian tags. Defaulted empty so every pre-tagger digest — and every
     item the keywords simply miss — renders exactly as it did before."""
 
+    @property
+    def topics_line(self) -> str:
+        """The topics line as Obsidian tags, or empty when there are none.
+
+        Composed in Python for the same reason as `ProposalLine.heading`: with
+        jinja's `trim_blocks`, a content line that ends in a block tag loses its
+        newline and joins the next line. Here that ran the tag list straight into
+        the first feedback checkbox, so `- [ ] useful` was swallowed — the `-`
+        absorbed into the trailing tag and the box never rendered."""
+        if not self.topics:
+            return ""
+        tags = " ".join(f"#{topic.replace('.', '/')}" for topic in self.topics)
+        return f"**Topics:** {tags}"
+
 
 @dataclass(frozen=True, slots=True)
 class SourceFailure:

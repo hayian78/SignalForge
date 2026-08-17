@@ -23,7 +23,7 @@ import pytest
 
 from signalforge.curate.approvals import parse_proposal_marks
 from signalforge.db import decide_proposal, insert_proposal, start_run, upsert_item
-from signalforge.feedback import parse_marks
+from signalforge.feedback import CHECKBOX_VERDICTS, checkbox_marker, parse_marks
 from signalforge.models import (
     Item,
     ProposalKind,
@@ -1580,6 +1580,27 @@ def test_topics_render_as_obsidian_tags(conn: sqlite3.Connection) -> None:
     )
 
     assert "**Topics:** #industry/strategy #policy/regulation" in rendered
+
+
+def test_the_topic_line_does_not_swallow_the_first_checkbox(conn: sqlite3.Connection) -> None:
+    """A tagged item's first feedback box must still start its own line.
+
+    Regression: the template's topic loop ended a content line with a block tag,
+    so `trim_blocks` ate the newline and `- [ ] useful` joined the tag list — the
+    `-` absorbed into the trailing tag and the checkbox stopped rendering.
+    """
+    item_id, _ = upsert_item(conn, make_item())
+    _insert_score(conn, item_id)
+    _tag(conn, item_id, "industry.strategy", version=TAXONOMY_VERSION)
+
+    rendered = render_digest(
+        build_digest_context(conn, target_date=TARGET_DATE, max_items=MAX_ITEMS)
+    )
+
+    first_box = checkbox_marker(item_id, CHECKBOX_VERDICTS[0])
+    assert f"#industry/strategy\n{first_box}" in rendered
+    for verdict in CHECKBOX_VERDICTS:
+        assert f"\n{checkbox_marker(item_id, verdict)}\n" in rendered
 
 
 def test_an_untagged_item_renders_no_topic_line(conn: sqlite3.Connection) -> None:

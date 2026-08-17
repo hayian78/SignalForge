@@ -15,8 +15,8 @@ kept_count: {{ context.kept_count }}
 
 **Scores:** signal {{ line.signal if line.signal is not none else "—" }} · relevance {{ line.relevance if line.relevance is not none else "—" }} · novelty {{ line.novelty if line.novelty is not none else "—" }}
 **Link:** {{ line.url }}
-{% if line.topics %}
-**Topics:** {% for topic in line.topics %}#{{ topic | replace(".", "/") }}{{ " " if not loop.last }}{% endfor %}
+{% if line.topics_line %}
+{{ line.topics_line }}
 {% endif %}
 {% if line.id is not none %}
 {% for verdict in checkbox_verdicts %}
