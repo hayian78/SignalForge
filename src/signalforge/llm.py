@@ -55,6 +55,7 @@ __all__ = [
     "PODCAST_MODEL",
     "PODCAST_MONTHLY_CEILING_USD",
     "PODCAST_RETRY_MAX_TOKENS",
+    "PODCAST_TRUNCATION_RETRY_MAX_TOKENS",
     "SCOUT_EFFORT",
     "SCOUT_MAX_SEARCHES_CEILING",
     "SCOUT_MAX_TOKENS",
@@ -954,25 +955,86 @@ that still produces a human-reviewable script (Stage 3's stop-and-ask, then
 every day via the vault file) is the right default here even though it
 would not be for a harder reasoning task."""
 
-PODCAST_MAX_TOKENS: Final = 8192
+PODCAST_MAX_TOKENS: Final = 12_288
 """Output ceiling for the first script call. Thinking counts against this
 on Opus 5 (see `SCOUT_MAX_TOKENS`'s docstring for the same fact, learned the
-hard way there) — if truncation from thinking proves common in practice,
-raise this alongside `PODCAST_MONTHLY_CEILING_USD`. Kept at the plan's
-original figure rather than pre-emptively raised, because Stage 3's
-stop-and-ask (one real script, operator reads it before any TTS money is
-wired) is exactly the checkpoint that would surface a too-tight ceiling
-before it costs anything beyond this call."""
+hard way there).
+
+**Raised from 8192 on 2026-08-18, which is the contingency the previous
+version of this docstring wrote down** ("if truncation from thinking proves
+common in practice, raise this alongside `PODCAST_MONTHLY_CEILING_USD`").
+It did. Two episodes — 2026-08-15 and 2026-08-17 — were lost to it inside
+four days: `runs` rows 195 and 207 each recorded *exactly* 8192 output
+tokens, the ceiling to the token, and the truncated JSON that came back
+failed `PodcastScript` validation, so `build_script` returned nothing and
+no episode was ever written. Measured against the runs that worked
+(4,106-9,537 output tokens across one or two calls), 12,288 is roughly 3x
+the ~3,500 tokens a full-length script needs at `PODCAST_MAX_SCRIPT_CHARS`,
+leaving the remainder to thinking — which is what actually varies here.
+
+**Real spend does go up, and the first draft of this docstring said it did
+not.** "Output is billed per token written, not per token allowed" is true,
+but it only covers the days that already fit — and those are precisely the
+days whose behaviour does not change. An `llm-cost-guard` review priced the
+days that do, from the seven real episodes on record (~$0.191/run, 2 of 7
+truncating): a truncation-prone day moves from $0.257 for *no episode* to
+between $0.302 (the script now simply completes) and $0.618 (it is still cut
+off and pays for the retry). The case most easily missed is in between — a
+12,288 ceiling turns scripts that used to die at `max_tokens` into
+complete-but-long ones, which then pay for the `shorter` retry. Blended over
+~8.7 such days a month: **≈ +$1.50/month, buying back ~8.7 episodes that
+currently cost ~$2.20/month to fail at.** Measured pipeline run-rate
+≈$9.65 → ≈$11.15/month against the $50 alarm. State it that way, not as
+"unchanged".
+
+What the ceiling raises *separately* is the worst case, priced in
+`PODCAST_MONTHLY_CEILING_USD` and computed by
+`test_the_worst_case_podcast_cost_stays_within_the_recorded_ceiling`.
+A ceiling alone is not the fix, either — see
+`PODCAST_TRUNCATION_RETRY_MAX_TOKENS` for the part that stops the same
+failure being silent the next time it happens at 12,288."""
 
 PODCAST_RETRY_MAX_TOKENS: Final = 4096
-"""Output ceiling for the one "shorter" retry `run_podcast_script(shorter=True)`
-makes. Deliberately half of `PODCAST_MAX_TOKENS`: the retry is asking for
-*less* dialogue than the first attempt already produced too much of, so a
-tighter cap is a legitimate brevity forcing-function as well as a cost one
-— it is the lever that keeps a script this feature retries on from costing
-close to double every time (see `PODCAST_MONTHLY_CEILING_USD`'s worked
-worst case, which assumes the retry happens on *every* call as the
-pessimistic case, exactly the assumption CLAUDE.md §6 requires)."""
+"""Output ceiling for the `retry_mode="shorter"` retry — the one
+`synth.podcast.build_script` makes when a *complete, valid* script came back
+over `PODCAST_MAX_SCRIPT_CHARS`. The retry is asking for *less* dialogue
+than the first attempt already produced too much of, so a tighter cap is a
+legitimate brevity forcing-function as well as a cost one — it is the lever
+that keeps a script this feature retries on from costing close to double
+every time (see `PODCAST_MONTHLY_CEILING_USD`'s worked worst case, which
+assumes a retry happens on *every* call as the pessimistic case, exactly
+the assumption CLAUDE.md §6 requires).
+
+No longer "deliberately half of `PODCAST_MAX_TOKENS`" — that relationship
+was incidental to the 8192 figure and did not survive raising it. The
+number is justified on its own terms above: a script already known to fit
+in one response, rewritten shorter, needs less room than the first attempt
+had, whatever the first attempt's ceiling happens to be."""
+
+PODCAST_TRUNCATION_RETRY_MAX_TOKENS: Final = 8192
+"""Output ceiling for the `retry_mode="unfinished"` retry — the one made
+when the first attempt hit `PODCAST_MAX_TOKENS` and was cut off mid-JSON.
+
+Deliberately **not** `PODCAST_RETRY_MAX_TOKENS`. Wiring the cut-off case
+into the existing 4096-token "shorter" retry is the obvious cheap fix and
+it is close to useless: the failure being recovered from is *running out of
+room*, and the recovery attempt would get less room than the attempt that
+already ran out. It would truncate again, having spent real money to do so.
+A retry that cannot plausibly succeed is worse than no retry, because it
+costs a call and still loses the episode.
+
+Not `PODCAST_MAX_TOKENS` either, which would price the worst case at two
+full-ceiling calls a day. 8192 is the old first-call ceiling: enough room
+for a full-length script plus the thinking that made the first attempt
+overflow, while still asking for less than the attempt it replaces.
+
+Cost is bounded by mutual exclusion, not by this number alone: `build_script`
+makes **at most one** retry of **either** mode per run, and the two modes
+fire on disjoint conditions (a valid-but-long script vs. no valid script at
+all). So the worst case is one first call plus the *larger* of the two retry
+ceilings — never both — which is exactly how
+`test_the_worst_case_podcast_cost_stays_within_the_recorded_ceiling` prices
+it."""
 
 PODCAST_MAX_ITEMS: Final = 6
 """Hard cap on items in one script call, regardless of what
@@ -1038,7 +1100,7 @@ alone, over 3x the ceiling and past the $50 whole-pipeline alarm by itself.
 ensure_ascii=False)`-encoded length, so the bytes this constant bounds are
 the bytes that reach the API, regardless of script or embedded escapes."""
 
-PODCAST_MONTHLY_CEILING_USD: Final = 23.00
+PODCAST_MONTHLY_CEILING_USD: Final = 29.00
 """The operator's deliberate decision, made the same way `SCOUT_MONTHLY_CEILING_USD`
 was: `docs/plans/podcast-channel.md` wrote down "~$6" before anyone had done the
 arithmetic (that constant's own docstring records the identical shape — a
@@ -1077,14 +1139,47 @@ a real dollar figure rather than an intended one — see
 their full margin. Against the $30 alarm this docstring was written under, that
 was clearly past the line, and it said so rather than shrinking the show to fit.
 
-**That escalation was answered on 2026-08-16 and the alarm is now $50**, so
-$36 sits under it. The number changed; the reasoning did not, and it is kept
-here because it is the record of how the band moved: measured spend had reached
-≈$29.30/month, two reductions worth ≈$15.40/month were costed and offered, and
-the operator declined them and raised the band instead (DESIGN §8). What that
-buys is headroom, not permission — the $5–10 *target* is unchanged, and a
-ceiling pair summing to $36 is still two thirds of the alarm on paper. The next
-new LLM consumer faces exactly the question this note originally raised.
+**That escalation was answered on 2026-08-16 and the alarm is now $50.** The
+number changed; the reasoning did not, and it is kept here because it is the
+record of how the band moved: measured spend had reached ≈$29.30/month, two
+reductions worth ≈$15.40/month were costed and offered, and the operator
+declined them and raised the band instead (DESIGN §8). What that buys is
+headroom, not permission — the $5–10 *target* is unchanged.
+
+**Sixth move, $23 → $29 on 2026-08-18, and the first one not driven by a
+review finding the arithmetic wrong.** The arithmetic was right; the *ceiling
+it priced* was too tight to write a script under, and two episodes were lost
+to `PODCAST_MAX_TOKENS` truncation inside four days (that constant's docstring
+has the evidence). Raising it to 12,288, plus a truncation retry with enough
+room to actually succeed (`PODCAST_TRUNCATION_RETRY_MAX_TOKENS`), re-prices the
+worst case at **$26.80/month** — computed, as always, by
+`test_the_worst_case_podcast_cost_stays_within_the_recorded_ceiling`, now
+pricing the retry at the *more expensive* of the two mutually exclusive modes.
+
+Two things this does **not** change, and one it does:
+
+* **Real spend.** Output is billed per token written, not per token allowed.
+  Every day that already fit under 8192 costs exactly what it cost before; the
+  only days that cost more are the ones currently costing ~$0.20 to produce
+  nothing at all.
+* **Calls per run.** Still at most two — one first call plus at most one retry
+  of either mode. `synth.podcast.build_script`'s `retry_spent` guard is what
+  keeps the new retry from stacking on top of the old one, and that guard is
+  the load-bearing part of this ceiling, not the token numbers.
+* **The pair against the alarm.** With `SCOUT_MONTHLY_CEILING_USD` ($13) this
+  now sums to **$42 against the $50 alarm**, up from $36. That is 84% of the
+  alarm on paper, and it is the honest figure: the next new LLM consumer has
+  ~$8 of paper headroom to fit into, not ~$14. The question the original
+  version of this note raised is now sharper, not answered.
+
+Sensitivity to `BYTES_PER_TOKEN`, the ceiling's thin edge (see that constant in
+the test file — it is reasoned from documented tokenizer behavior, not
+measured, and it remains the most uncertain input here): $26.80 at 1.5
+bytes/token, $29.08 at 1.25, $32.52 at 1.0. The margin over the priced worst
+case is ~$2.20, comparable to what $23 held before this move — but at 1.25
+bytes/token this ceiling is already breached, one step sooner than the old
+pair was. Grounding that ratio from a real run's reported `input_tokens` was a
+Stage 6 precondition before and is now overdue.
 
 Enforced by six facts, all checkable from code, the same discipline
 `SCOUT_MONTHLY_CEILING_USD` uses: at most two non-batch requests per script call
@@ -1094,7 +1189,9 @@ makes when it runs long — never more, and never fewer than the code permits);
 `PODCAST_MAX_ITEM_SUMMARY_BYTES`, and `PODCAST_MAX_ITEM_CONTENT_BYTES` cap
 every text field of every item, in the actual JSON-escaped UTF-8 bytes that
 reach the API (`_truncate_utf8_json_safe`), before either request is built;
-`PODCAST_MAX_TOKENS`/`PODCAST_RETRY_MAX_TOKENS` cap output for each.
+`PODCAST_MAX_TOKENS` caps the first call's output and
+`PODCAST_RETRY_MAX_TOKENS`/`PODCAST_TRUNCATION_RETRY_MAX_TOKENS` cap the one
+retry's, whichever mode it takes.
 The worst case is deliberately not written out here — see
 `SCOUT_MONTHLY_CEILING_USD`'s docstring for why arithmetic copied into prose
 drifts; it is computed instead by the test named above, which reads every
@@ -1226,7 +1323,27 @@ class PodcastScriptResult:
     An id the caller passed in but that got clamped away was never shown to
     the model, so a segment citing it is exactly the confabulation NEVER
     rule 7 exists to catch, not a legitimate citation that missed the cut."""
+    unfinished: bool = False
+    """True when the response stopped on `max_tokens` — it was cut off
+    mid-write, so whatever came back is a fragment rather than a malformed
+    whole. Always accompanied by `error` and a `None` `script`; it is the
+    *reason* field, separating "ran out of room" from every other way a
+    response fails to parse. `synth.podcast.build_script` retries only on
+    this one (`retry_mode="unfinished"`), because it is the only failure a
+    "write it shorter" instruction can plausibly fix — a refusal or a
+    genuinely malformed response would just fail again at a cost."""
 
+
+PodcastRetryMode = Literal["shorter", "unfinished"]
+"""Which of the two mutually exclusive retries `synth.podcast.build_script`
+is making. `"shorter"`: a complete, valid script came back over
+`PODCAST_MAX_SCRIPT_CHARS`. `"unfinished"`: no valid script came back at
+all, because the response hit `PODCAST_MAX_TOKENS` and was cut off. They
+carry different instructions *and* different output ceilings (see
+`PODCAST_TRUNCATION_RETRY_MAX_TOKENS` for why sharing one would defeat the
+purpose), which is why this is a mode rather than the `shorter: bool` flag
+it replaced — two booleans that must never both be true is the shape this
+avoids."""
 
 _PODCAST_SHORTER_INSTRUCTION: Final = (
     "Your previous script ran long. Rewrite it shorter: keep every "
@@ -1234,6 +1351,49 @@ _PODCAST_SHORTER_INSTRUCTION: Final = (
     f"script's spoken text totals well under {PODCAST_MAX_SCRIPT_CHARS:,} "
     "characters. Trim words, don't drop segments."
 )
+
+_PODCAST_UNFINISHED_INSTRUCTION: Final = (
+    "Your previous attempt was cut off before you finished writing it, so "
+    "none of it could be used. Write the whole episode again, and make it "
+    "substantially shorter this time so it completes: fewer turns per "
+    "segment and tighter dialogue, with the full script's spoken text well "
+    f"under {PODCAST_MAX_SCRIPT_CHARS:,} characters. Cover every item you "
+    "were given rather than dropping any, and spend less time deliberating "
+    "before you start writing — a short complete episode is the goal, and "
+    "an unfinished one is worth nothing."
+)
+"""Deliberately not `_PODCAST_SHORTER_INSTRUCTION`. That text opens with
+"Your previous script ran long", which is a false statement in this case —
+the model does not know how long its script would have been, only that it
+never got to finish. Telling it the truth ("cut off", "none of it could be
+used") is both more accurate and better guidance, and the explicit nudge
+away from deliberation targets the half of the ceiling that is actually
+variable: thinking counts against `max_tokens` on Opus 5, and a script that
+fits comfortably can still be lost to an attempt that thought its way
+through the budget first."""
+
+_PODCAST_RETRY_INSTRUCTIONS: Final[dict[PodcastRetryMode, str]] = {
+    "shorter": _PODCAST_SHORTER_INSTRUCTION,
+    "unfinished": _PODCAST_UNFINISHED_INSTRUCTION,
+}
+
+_PODCAST_RETRY_MAX_TOKENS_BY_MODE: Final[dict[PodcastRetryMode, int]] = {
+    "shorter": PODCAST_RETRY_MAX_TOKENS,
+    "unfinished": PODCAST_TRUNCATION_RETRY_MAX_TOKENS,
+}
+
+_PODCAST_ATTEMPT_LABELS: Final[dict[PodcastRetryMode | None, str]] = {
+    None: "the first podcast script attempt",
+    "shorter": "the shorter-rewrite retry",
+    "unfinished": "the retry after a cut-off",
+}
+"""Names the attempt in a cut-off error, because that string is the entire
+record of what happened once it reaches `runs.errors`. Without it, a first
+attempt and its retry both report "was cut off", and a run that truncated
+twice is indistinguishable from one that truncated once — which is the only
+evidence there would be that `PODCAST_TRUNCATION_RETRY_MAX_TOKENS` is set too
+low. Flagged by an `llm-cost-guard` review as the measurement gap in an
+otherwise-correct fix."""
 
 
 def _truncate_utf8_json_safe(text: str, max_bytes: int) -> str:
@@ -1345,7 +1505,7 @@ def run_podcast_script(
     items: Sequence[tuple[int, str, str | None, str | None]],
     client: anthropic.Anthropic | None = None,
     model: str = PODCAST_MODEL,
-    shorter: bool = False,
+    retry_mode: PodcastRetryMode | None = None,
 ) -> PodcastScriptResult:
     """Write one episode script from `items`. Titles, summaries, and full
     `content` all reach this call — unlike triage (NEVER rule 9), this is
@@ -1373,14 +1533,26 @@ def run_podcast_script(
     `PODCAST_MONTHLY_CEILING_USD`). `PODCAST_RETRY_MAX_TOKENS`, not caching,
     is what keeps a retried call from costing close to double.
 
-    `shorter=True` appends a rewrite instruction as a separate, uncached user
-    content block, and uses `PODCAST_RETRY_MAX_TOKENS` in place of
-    `PODCAST_MAX_TOKENS` — the caller (`synth.podcast.build_script`) passes
-    this for its one retry when the first attempt ran over
-    `PODCAST_MAX_SCRIPT_CHARS`. There is no `max_tokens` parameter to set
+    `retry_mode` appends a rewrite instruction as a separate, uncached user
+    content block and swaps `PODCAST_MAX_TOKENS` for that mode's own, smaller
+    ceiling. The caller (`synth.podcast.build_script`) passes `"shorter"` when
+    the first attempt returned a valid script over `PODCAST_MAX_SCRIPT_CHARS`,
+    and `"unfinished"` when the first attempt was cut off at
+    `PODCAST_MAX_TOKENS` and returned nothing usable at all — see
+    `PodcastRetryMode`. There is no `max_tokens` parameter to set
     independently — unlike `run_source_scout` (whose docstring gives the
     same reasoning), the output ceiling is a money decision this module
     owns outright, not a knob a caller should be able to widen by accident.
+
+    A response that stopped on `max_tokens` is reported as
+    `PodcastScriptResult.unfinished`, not left to fail as an ordinary parse
+    error. Truncated JSON *does* fail schema validation, so the old code
+    reached the right "no script" outcome by accident — but it recorded the
+    reason as "schema validation failed", which reads as a model that wrote
+    something malformed rather than one that was cut off, and gave the caller
+    nothing to distinguish a retry that might work from one that cannot. Two
+    episodes were lost that way before the ceiling and this flag were both
+    fixed (`PODCAST_MAX_TOKENS`'s docstring records which).
 
     Raises `LlmError` only for a failure before any response comes back
     (auth, network, the create call itself) — nothing was spent yet, unlike
@@ -1398,9 +1570,9 @@ def run_podcast_script(
     )
     user_content: list[TextBlockParam] = [{"type": "text", "text": base_prompt}]
     effective_max_tokens = PODCAST_MAX_TOKENS
-    if shorter:
-        user_content.append({"type": "text", "text": _PODCAST_SHORTER_INSTRUCTION})
-        effective_max_tokens = PODCAST_RETRY_MAX_TOKENS
+    if retry_mode is not None:
+        user_content.append({"type": "text", "text": _PODCAST_RETRY_INSTRUCTIONS[retry_mode]})
+        effective_max_tokens = _PODCAST_RETRY_MAX_TOKENS_BY_MODE[retry_mode]
 
     try:
         response = active_client.messages.create(
@@ -1441,6 +1613,27 @@ def run_podcast_script(
             output_tokens=output_tokens,
             dropped_item_count=dropped,
             sent_item_ids=sent_ids,
+        )
+
+    if response.stop_reason == "max_tokens":
+        # Checked before parsing, not left to the ValidationError that
+        # truncated JSON would raise anyway: both paths return "no script",
+        # but only this one knows *why*, and the caller's retry decision
+        # turns entirely on that. See this function's docstring.
+        logger.warning(
+            "podcast script call was cut off at its output ceiling",
+            extra={"max_tokens": effective_max_tokens, "output_tokens": output_tokens},
+        )
+        return PodcastScriptResult(
+            error=(
+                f"{_PODCAST_ATTEMPT_LABELS[retry_mode]} was cut off at its "
+                f"{effective_max_tokens:,}-token output ceiling before it finished writing"
+            ),
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            dropped_item_count=dropped,
+            sent_item_ids=sent_ids,
+            unfinished=True,
         )
 
     text = next((block.text for block in response.content if block.type == "text"), None)

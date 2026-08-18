@@ -120,7 +120,7 @@ from signalforge.ingest.awesome import AWESOME_SOURCE_PREFIX
 from signalforge.ingest.base import DEFAULT_MAX_CONCURRENCY, HttpFetcher
 from signalforge.ingest.fullcontent import fetch_full_content
 from signalforge.ingest.hackernews import HN_SOURCE_ID
-from signalforge.models import Item, ProposalStatus
+from signalforge.models import Item, ProposalStatus, flatten_to_single_line
 from signalforge.report.daily import (
     DigestContext,
     build_digest_context,
@@ -493,6 +493,40 @@ def _run_level_error(exc: BaseException) -> dict[str, str]:
         "source_type": "-",
         "error_type": exc.__class__.__name__,
         "message": str(exc) or exc.__class__.__name__,
+        "occurred_at": datetime.now(UTC).isoformat(),
+    }
+
+
+_MAX_RUN_ERROR_CHARS: Final = 200
+"""Char cap on a recorded run-level message, matching `ingest.probe`'s
+`_MAX_ERROR_CHARS`. Same reason: `runs.errors` is a record, not a log."""
+
+
+def _run_level_message(error_type: str, message: str) -> dict[str, str]:
+    """The same `runs.errors` record shape for a failure that produced no
+    exception to describe it.
+
+    Not every real failure raises. `synth.podcast.build_script` deliberately
+    never raises once its first call has been billed (NEVER rule 11), so a
+    lost episode arrives as a `BuiltScript` with `.script is None` and a
+    reason string — which had nowhere to go until this existed, and so went
+    nowhere at all (see `BuiltScript.error`). Kept beside `_run_level_error`
+    rather than folded into it: synthesizing a throwaway `Exception` just to
+    reuse that function would put a class name in `error_type` that names
+    nothing, chosen only to satisfy the signature. `error_type` here is a
+    category picked for the reader instead — `_run_level_error`'s rows carry
+    a real exception's class name, and these carry a label, which is the
+    honest difference rather than a hidden one.
+    """
+    return {
+        "source_id": _RUN_LEVEL_SOURCE_ID,
+        "source_type": "-",
+        "error_type": error_type,
+        # Capped as well as flattened, the same pairing `ingest/probe.py` uses:
+        # a pydantic `ValidationError` over a truncated 12k-token response
+        # renders the offending input and runs to multiple KB, and this string
+        # goes verbatim into the `runs.errors` blob and the status table.
+        "message": flatten_to_single_line(message)[:_MAX_RUN_ERROR_CHARS],
         "occurred_at": datetime.now(UTC).isoformat(),
     }
 
@@ -1335,6 +1369,7 @@ def podcast(
         run_level_error: dict[str, str] | None = None
         harvest_error: dict[str, str] | None = None
         deep_read_errors: list[dict[str, str]] = []
+        script_errors: list[dict[str, str]] = []
         delivery_errors: list[dict[str, str]] = []
         vault_commit_errors: list[dict[str, str]] = []
         input_tokens = output_tokens = 0
@@ -1418,10 +1453,34 @@ def podcast(
                         input_tokens = built.input_tokens
                         output_tokens = built.output_tokens
                         if built.script is None:
-                            console.print(
-                                "[yellow]script call produced nothing usable[/yellow]; "
-                                "see the log for why."
-                            )
+                            # Recorded, not just printed: a cron run's console
+                            # output goes to a log nobody reads. Two episodes
+                            # were lost silently before this line existed —
+                            # see `synth.podcast.BuiltScript.error`.
+                            #
+                            # Honest about the reach, because an architectural
+                            # review found the first version of this comment
+                            # claiming more: this surfaces in `signalforge
+                            # status`, and *not* in the digest. `report/daily.py`
+                            # reads only the latest `ingest` run and explicitly
+                            # drops run-level (`source_id == "*"`) records, so
+                            # nothing here reaches the vault. `status` shows the
+                            # latest run per kind, so tomorrow's successful
+                            # podcast run hides this one. That is a real gap
+                            # against §7's reports-are-the-monitoring-channel
+                            # intent, left as an operator decision rather than
+                            # widened here — it changes what the digest renders.
+                            reason = built.error or "the script call produced nothing usable"
+                            script_errors.append(_run_level_message("podcast-script", reason))
+                            # `escape`d, like every other untrusted print in
+                            # this file: `reason` can embed a pydantic
+                            # `ValidationError`, which renders the offending
+                            # `input_value` — a feed's own words. Rich reads
+                            # `[...]` as markup and raises `MarkupError` on a
+                            # malformed tag, which would be caught by the
+                            # `except BaseException` below and turn a *handled*
+                            # lost episode into a crashed run with exit 1.
+                            console.print(f"[yellow]no script written[/yellow]: {escape(reason)}")
                         else:
                             written = write_script(
                                 conn,
@@ -1452,7 +1511,14 @@ def podcast(
                         run_id=run_id,
                         resend=resend,
                     )
-                    status_value = "ok"
+                    # `partial`, not `ok`, when the episode was lost: the run
+                    # did real work (harvest, deep read) and closed cleanly,
+                    # but it produced no script, and a status of `ok` is what
+                    # let two lost episodes look like healthy runs in
+                    # `signalforge status`. Delivery failures stay `ok` by
+                    # design — a channel never fails the run (NEVER rule 19) —
+                    # so only the script failure moves this.
+                    status_value = "partial" if script_errors else "ok"
         except BaseException as exc:
             # Includes KeyboardInterrupt, mirroring every other command's
             # no-silent-runs rule (CLAUDE.md §3): a crash mid-episode still
@@ -1478,13 +1544,14 @@ def podcast(
                         *([run_level_error] if run_level_error is not None else []),
                         *([harvest_error] if harvest_error is not None else []),
                         *deep_read_errors,
+                        *script_errors,
                         *delivery_errors,
                         *vault_commit_errors,
                     ]
                     or None
                 ),
             )
-        if status_value == "ok" and item_count:
+        if status_value in {"ok", "partial"} and item_count:
             tts_model = channel_config.tts_model if channel_config is not None else ""
             dollars = tts_spend_usd(tts_characters, tts_model)
             console.print(

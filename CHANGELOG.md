@@ -154,6 +154,39 @@ consecutive Sunday briefs. Everything below sits under *Unreleased* until then.
   `interests.yaml` can no longer silently contradict the prompt.
 
 ### Fixed
+- **The podcast stopped producing episodes, silently.** Two were lost —
+  2026-08-15 and 2026-08-17 — before anyone noticed, because the runs that
+  lost them reported `status="ok"` with an empty `errors` column. The script
+  call was hitting `PODCAST_MAX_TOKENS` exactly (both `runs` rows recorded
+  8192 output tokens to the token), returning truncated JSON that failed
+  schema validation, and `build_script` gave up there. Three parts to the fix,
+  and the first alone would not have been enough:
+
+  - `PODCAST_MAX_TOKENS` 8192 → 12,288, which is the contingency that
+    constant's own docstring had written down in advance. Thinking counts
+    against the ceiling on Opus 5, so the room a script needs is not the room
+    the script takes.
+  - A distinct `retry_mode="unfinished"` retry with its own, larger ceiling
+    (`PODCAST_TRUNCATION_RETRY_MAX_TOKENS`) and its own instruction. Wiring
+    the cut-off case into the existing 4096-token "shorter" retry would have
+    been the obvious cheap fix and close to useless: recovering from *running
+    out of room* with less room than the attempt that ran out. A run still
+    makes at most one retry of either mode — `retry_spent` guards it, and the
+    worst-case cost test prices the more expensive of the two.
+  - `BuiltScript.error` and the CLI wiring behind it, so a lost episode lands
+    in `runs.errors` and closes the run as `partial`. `build_script` never
+    raises once a call is billed, so a lost episode produced no exception and
+    had nothing to record; its docstring had described this wiring as a later
+    stage's job, and the later stage shipped without it.
+
+  `PODCAST_MONTHLY_CEILING_USD` rises $23 → $29 (computed worst case
+  $26.80/month), putting the ceiling pair at $42 against the $50 alarm. Real
+  spend rises ≈$1.50/month — priced by an `llm-cost-guard` review against the
+  seven real episodes on record — to buy back the ~8.7 episodes a month that
+  were previously being lost at a cost of ~$2.20/month in calls that produced
+  nothing. Days that already fit under the old ceiling are unaffected, since
+  output is billed per token written rather than per token allowed.
+
 - **A feed could forge your feedback marks** (`models.flatten_to_single_line`).
   `scores.reasoning` is model-authored from feed content and renders straight
   into the daily digest, and `harvest_marks` reads a verdict from any line
