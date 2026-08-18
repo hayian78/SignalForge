@@ -86,6 +86,29 @@ class BuiltScript:
     script: PodcastScript | None
     script_version: str
     model: str
+    error: str | None = None
+    """Why `.script` is `None`, in one line, for the CLI to record into
+    `runs.errors`. `None` whenever `.script` is set — exactly one of the two
+    is ever meaningful, the same discipline `llm.PodcastScriptResult` uses.
+
+    This exists because it was missing: `build_script` logged every
+    "nothing usable" outcome via `logger.warning` and returned, and its own
+    docstring recorded that threading those into `runs.errors` was "Stage 6's
+    job, once a CLI caller exists to do it." A CLI caller existed and the
+    wiring never happened, so two lost episodes (see
+    `llm.PODCAST_MAX_TOKENS`) both closed their run as `status="ok"` with an
+    empty `errors` column. A silent failure in the one place nobody reads is
+    the failure mode CLAUDE.md §7 exists to prevent.
+
+    **Reaches `signalforge status`, not the digest.** `report/daily.py`
+    surfaces the latest *ingest* run's per-source errors and deliberately
+    drops run-level ones, so a lost episode is recorded in `runs.errors` and
+    visible to `status` — but never rendered into the vault, and `status`
+    shows only the latest run per kind, so the next successful podcast run
+    hides it. Strictly better than `status="ok"` and an empty column; short of
+    the guarantee §7 describes. Closing that gap means teaching the digest to
+    render run-level podcast failures, which changes what the vault file
+    contains and is the operator's call, not this function's."""
     dropped_item_ids: tuple[int, ...] = ()
     """The *unknown* ids that caused a segment to be dropped (§7) — never a
     real id, since a segment is dropped whole only for citing at least one
@@ -399,6 +422,7 @@ def _truncate_to_fit(script: PodcastScript, *, max_chars: int) -> _TruncationRes
 
 def _empty_script(
     *,
+    error: str | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     dropped_item_count: int = 0,
@@ -420,6 +444,7 @@ def _empty_script(
         script=None,
         script_version=PODCAST_SCRIPT_VERSION,
         model=PODCAST_MODEL,
+        error=error,
         dropped_item_ids=dropped_item_ids,
         dropped_item_count=dropped_item_count,
         input_tokens=input_tokens,
@@ -445,10 +470,18 @@ def build_script(
     (NEVER rule 11). `.script` is `None` for every "nothing usable"
     outcome — no items, a refused call, a script that cleaned down to
     nothing — each logged via `logger.warning` with the reason (CLAUDE.md
-    §7's monitoring-channel intent), though the log line itself is not yet
-    threaded into `runs.errors`; that wiring is Stage 6's job, once a CLI
-    caller exists to do it. Otherwise `.script` always has at least one
-    segment.
+    §7's monitoring-channel intent) *and* carried on `BuiltScript.error` for
+    the CLI to record into `runs.errors` — see that field's docstring for the
+    two lost episodes that went unrecorded while this was still described as
+    a later stage's job. Otherwise `.script` always has at least one segment.
+
+    Makes **at most one** billed retry per call, of either mode, never both:
+    `retry_mode="unfinished"` if the first attempt was cut off at its output
+    ceiling, or `retry_mode="shorter"` if it came back valid but over
+    `PODCAST_MAX_SCRIPT_CHARS`. The conditions are disjoint (no script vs. a
+    valid script) and the `retry_spent` guard keeps the second from following
+    the first, which is what `PODCAST_MONTHLY_CEILING_USD`'s two-calls-a-day
+    worst case is priced on.
 
     Cleaning order matters and is deliberate: unknown-id segments are
     dropped **before** the char-cap check, not after. A hallucinated,
@@ -475,7 +508,7 @@ def build_script(
             extra={"unsaved_count": unsaved_count},
         )
     if not item_tuples:
-        return _empty_script()
+        return _empty_script(error="no items with a stored id were available for the script")
 
     result = run_podcast_script(
         stable_prefix,
@@ -487,12 +520,58 @@ def build_script(
     input_tokens = result.input_tokens
     output_tokens = result.output_tokens
     dropped_item_count = result.dropped_item_count
+    retry_spent = False
+
+    if result.script is None and result.unfinished:
+        # The one failure a retry can actually fix. Everything else that
+        # empties `.script` — a refusal, genuinely malformed JSON, zero
+        # segments — would fail the same way again and is not worth a second
+        # billed call; being cut off mid-write is the case where asking for
+        # less, with room to deliver it, has a real chance
+        # (`llm.PODCAST_TRUNCATION_RETRY_MAX_TOKENS`).
+        try:
+            retry = run_podcast_script(
+                stable_prefix,
+                date_label=date_label,
+                presenter_a=presenter_a,
+                presenter_b=presenter_b,
+                items=item_tuples,
+                retry_mode="unfinished",
+            )
+        except LlmError:
+            # Same accounting reasoning as the "shorter" retry's handler
+            # below: nothing was spent on a call that never got a response,
+            # but letting this propagate would take the first call's real
+            # spend down with it (NEVER rule 11).
+            logger.warning("podcast 'unfinished' retry failed before a response came back")
+        else:
+            retry_spent = True
+            input_tokens += retry.input_tokens
+            output_tokens += retry.output_tokens
+            # Taken wholesale, *including* when the retry also came back with
+            # no script. `result.error` is what reaches `runs.errors`, so
+            # keeping the first call's reason for the second call's failure
+            # would report a double cut-off as a single one — and whether the
+            # retry also truncated is precisely the datum that says whether
+            # `PODCAST_TRUNCATION_RETRY_MAX_TOKENS` is set high enough. An
+            # `llm-cost-guard` review caught that gap: the code would have
+            # spent ~$0.26 per failed day and recorded nothing about where it
+            # went. Replacing rather than merging costs nothing here —
+            # `sent_item_ids` is identical across the two calls (same
+            # `item_tuples`, same deterministic clamp).
+            result = retry
+            if retry.unfinished:
+                logger.warning(
+                    "podcast script was cut off twice; the truncation retry ceiling may be "
+                    "too low for this show's length"
+                )
 
     if result.script is None:
         logger.warning(
             "podcast script call produced no usable script", extra={"error": result.error}
         )
         return _empty_script(
+            error=result.error,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             dropped_item_count=dropped_item_count,
@@ -508,6 +587,7 @@ def build_script(
         # doesn't otherwise need to make.
         logger.warning("podcast script had no segments left after cleaning")
         return _empty_script(
+            error="every segment cited an item id the model was never given",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             dropped_item_count=dropped_item_count,
@@ -517,7 +597,16 @@ def build_script(
     truncated = False
     teasered_item_ids: tuple[int, ...] = ()
     truncation_dropped_item_ids: tuple[int, ...] = ()
-    if _total_chars(script) > PODCAST_MAX_SCRIPT_CHARS:
+    if _total_chars(script) > PODCAST_MAX_SCRIPT_CHARS and not retry_spent:
+        # `not retry_spent` is a *money* guard, not a style one. The
+        # "unfinished" retry above already asked for a shorter script and
+        # was already billed; without this, a run whose first attempt was
+        # cut off and whose retry came back over the char cap would make a
+        # third Opus call in one run. The worst case
+        # `PODCAST_MONTHLY_CEILING_USD` is priced against — one first call
+        # plus at most one retry — depends on exactly this staying true.
+        # A script that runs long with the retry already spent falls through
+        # to `_truncate_to_fit` below, which needs no API call at all.
         try:
             retry = run_podcast_script(
                 stable_prefix,
@@ -525,7 +614,7 @@ def build_script(
                 presenter_a=presenter_a,
                 presenter_b=presenter_b,
                 items=item_tuples,
-                shorter=True,
+                retry_mode="shorter",
             )
         except LlmError:
             # `run_podcast_script` only raises for a failure *before* any
@@ -554,22 +643,30 @@ def build_script(
                 if not script.segments:
                     logger.warning("podcast script had no segments left after cleaning the retry")
                     return _empty_script(
+                        error=(
+                            "every segment of the shorter retry cited an item id the "
+                            "model was never given"
+                        ),
                         input_tokens=input_tokens,
                         output_tokens=output_tokens,
                         dropped_item_count=dropped_item_count,
                         dropped_item_ids=dropped_item_ids,
                     )
-        if _total_chars(script) > PODCAST_MAX_SCRIPT_CHARS:
-            truncation = _truncate_to_fit(script, max_chars=PODCAST_MAX_SCRIPT_CHARS)
-            script = truncation.script
-            truncated = truncation.truncated
-            teasered_item_ids = truncation.teasered_item_ids
-            truncation_dropped_item_ids = truncation.dropped_item_ids
+    if _total_chars(script) > PODCAST_MAX_SCRIPT_CHARS:
+        # Dedented one level from the retry block above deliberately: this is
+        # the no-API-call fallback, and it has to run whether the retry was
+        # made, skipped for `retry_spent`, or made and still came back long.
+        truncation = _truncate_to_fit(script, max_chars=PODCAST_MAX_SCRIPT_CHARS)
+        script = truncation.script
+        truncated = truncation.truncated
+        teasered_item_ids = truncation.teasered_item_ids
+        truncation_dropped_item_ids = truncation.dropped_item_ids
 
     final_script = _flatten_and_finalize(script)
     if final_script is None:
         logger.warning("podcast script had no usable content left after flattening")
         return _empty_script(
+            error="no usable dialogue survived flattening the script for the vault",
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             dropped_item_count=dropped_item_count,

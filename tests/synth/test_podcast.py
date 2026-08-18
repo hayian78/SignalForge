@@ -157,6 +157,9 @@ def test_items_with_no_id_never_reach_the_paid_call(
         result, calls = _build(monkeypatch, [], items=[unsaved])
 
     assert result.script is None
+    assert result.error is not None, (
+        "a lost episode now flips the run to `partial` — the reason must be recorded"
+    )
     assert calls == []
     drop_records = [
         record
@@ -255,6 +258,9 @@ def test_a_retry_cleaned_to_nothing_still_reports_both_calls_spend(
     )
 
     assert result.script is None
+    assert result.error is not None, (
+        "a lost episode now flips the run to `partial` — the reason must be recorded"
+    )
     assert len(calls) == 2
     assert (result.input_tokens, result.output_tokens) == (2_000, 1_000)
     assert result.dropped_item_ids == (999,)
@@ -301,6 +307,9 @@ def test_dropping_every_segment_returns_none(monkeypatch: pytest.MonkeyPatch) ->
     result, _ = _build(monkeypatch, [_result(script, sent_item_ids=(1,))], item_count=1)
 
     assert result.script is None
+    assert result.error is not None, (
+        "a lost episode now flips the run to `partial` — the reason must be recorded"
+    )
     assert (result.input_tokens, result.output_tokens) == (1_000, 500)
     assert result.dropped_item_ids == (999,)
 
@@ -396,7 +405,142 @@ def test_an_intro_reduced_to_nothing_by_flattening_returns_none(
     result, _ = _build(monkeypatch, [_result(script, sent_item_ids=(1,))], item_count=1)
 
     assert result.script is None
+    assert result.error is not None, (
+        "a lost episode now flips the run to `partial` — the reason must be recorded"
+    )
     assert (result.input_tokens, result.output_tokens) == (1_000, 500)
+
+
+# --------------------------------------------------------------------------- #
+# the cut-off retry — the failure that used to lose an episode in silence
+# --------------------------------------------------------------------------- #
+
+
+def _unfinished(sent_item_ids: tuple[int, ...] = (1,)) -> PodcastScriptResult:
+    """What `run_podcast_script` returns when the response hit `max_tokens`."""
+    return PodcastScriptResult(
+        script=None,
+        error="podcast script call was cut off at its 12,288-token output ceiling",
+        input_tokens=1_000,
+        output_tokens=500,
+        sent_item_ids=sent_item_ids,
+        unfinished=True,
+    )
+
+
+def test_a_cut_off_first_attempt_retries_and_uses_what_comes_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression that cost two real episodes (2026-08-15, 2026-08-17):
+    a first attempt truncated at its output ceiling returned no script, and
+    `build_script` gave up on the spot. It must instead spend its one retry
+    on the single failure mode a "write it shorter" instruction can fix.
+    """
+    result, calls = _build(
+        monkeypatch,
+        [_unfinished(), _result(_script(chars_per_turn=20), sent_item_ids=(1,))],
+        item_count=1,
+    )
+
+    assert result.script is not None
+    assert len(calls) == 2
+    assert calls[1]["retry_mode"] == "unfinished"
+    # Both calls' spend, not just the one that produced something.
+    assert (result.input_tokens, result.output_tokens) == (2_000, 1_000)
+
+
+def test_a_failure_that_is_not_a_cut_off_never_pays_for_a_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`unfinished` is the whole trigger, not "the script was None". A
+    refusal or genuinely malformed JSON would fail identically on a second
+    attempt, so retrying it buys nothing and costs an Opus call.
+    """
+    refused = PodcastScriptResult(
+        script=None,
+        error="podcast script call was refused by safety classifiers",
+        input_tokens=1_000,
+        output_tokens=500,
+        sent_item_ids=(1,),
+    )
+    result, calls = _build(monkeypatch, [refused], item_count=1)
+
+    assert result.script is None
+    assert len(calls) == 1
+    assert result.error == "podcast script call was refused by safety classifiers"
+
+
+def test_a_cut_off_retry_that_is_also_cut_off_reports_the_retrys_own_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two cut-offs in a row is a lost episode — but a *recorded* one, and
+    recorded as the *retry's* failure rather than the first attempt's.
+
+    The gap an `llm-cost-guard` review caught in the first cut of this fix:
+    `result` was only reassigned when the retry produced a script, so a
+    double cut-off put the first call's reason in `runs.errors` and a run
+    that truncated twice looked exactly like one that truncated once. That
+    is the single datum that says whether the retry's ceiling is set high
+    enough, and the code was spending real money to throw it away.
+    """
+    first = _unfinished()
+    second = PodcastScriptResult(
+        script=None,
+        error="the retry after a cut-off was cut off at its 8,192-token output ceiling",
+        input_tokens=1_000,
+        output_tokens=500,
+        sent_item_ids=(1,),
+        unfinished=True,
+    )
+    result, calls = _build(monkeypatch, [first, second], item_count=1)
+
+    assert result.script is None
+    assert len(calls) == 2
+    assert result.error == second.error, "the first attempt's reason must not mask the retry's"
+    assert result.error != first.error
+    # Both attempts were billed; neither one's spend is lost with the episode.
+    assert (result.input_tokens, result.output_tokens) == (2_000, 1_000)
+
+
+def test_a_cut_off_retry_that_raises_keeps_the_first_calls_spend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same accounting rule the "shorter" retry's handler follows: an
+    `LlmError` means nothing was spent on the retry, but letting it
+    propagate would take the first call's real, billed tokens with it
+    (NEVER rule 11).
+    """
+    result, calls = _build(monkeypatch, [_unfinished(), LlmError("network error")], item_count=1)
+
+    assert result.script is None
+    assert len(calls) == 2
+    assert (result.input_tokens, result.output_tokens) == (1_000, 500)
+
+
+def test_a_cut_off_run_never_also_pays_for_the_shorter_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The money guard. A run whose first attempt was cut off and whose
+    retry came back *over the char cap* must not then make a third Opus
+    call — `PODCAST_MONTHLY_CEILING_USD` is priced on one first call plus at
+    most one retry, and a third would silently break the ceiling this whole
+    feature's budget rests on. The over-long retry is truncated locally
+    instead, which costs nothing.
+    """
+    long_script = _script(segment_count=5, chars_per_turn=2_000)
+    result, calls = _build(
+        monkeypatch,
+        [
+            _unfinished(sent_item_ids=_all_ids(5)),
+            _result(long_script, sent_item_ids=_all_ids(5)),
+            _result(_script(segment_count=5, chars_per_turn=20), sent_item_ids=_all_ids(5)),
+        ],
+        item_count=5,
+    )
+
+    assert result.script is not None
+    assert len(calls) == 2  # never the third response, which was there to be taken
+    assert result.truncated is True
 
 
 # --------------------------------------------------------------------------- #
@@ -483,7 +627,7 @@ def test_an_overlong_script_retries_once_and_uses_the_shorter_result(
 
     assert result.script is not None
     assert len(calls) == 2
-    assert calls[1]["shorter"] is True
+    assert calls[1]["retry_mode"] == "shorter"
     assert result.truncated is False
     # The result is the *retry's* content — each turn is 20 chars, not 8000.
     assert len(result.script.intro_turns[0].text) == 20

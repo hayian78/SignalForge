@@ -45,6 +45,7 @@ from signalforge.llm import (
     PODCAST_MODEL,
     PODCAST_MONTHLY_CEILING_USD,
     PODCAST_RETRY_MAX_TOKENS,
+    PODCAST_TRUNCATION_RETRY_MAX_TOKENS,
     LlmError,
     run_podcast_script,
 )
@@ -335,7 +336,7 @@ def test_control_character_content_is_capped_after_json_escaping() -> None:
 
 def test_shorter_appends_the_rewrite_instruction_as_a_separate_uncached_block() -> None:
     _, plain_client = _run([_message()])
-    _, shorter_client = _run([_message()], shorter=True)
+    _, shorter_client = _run([_message()], retry_mode="shorter")
 
     blocks = _user_blocks(shorter_client)
     assert len(blocks) == 2
@@ -343,20 +344,85 @@ def test_shorter_appends_the_rewrite_instruction_as_a_separate_uncached_block() 
     assert "cache_control" not in blocks[1]
     assert "shorter" in str(blocks[1]["text"]).lower()
     # The base block (date/presenters/items) is byte-identical to a plain
-    # call's only block — `shorter=True` only appends, never rewrites it.
+    # call's only block — a retry mode only appends, never rewrites it.
     assert blocks[0]["text"] == _base_text(plain_client)
 
 
 def test_shorter_keeps_the_same_system_prefix() -> None:
-    _, client = _run([_message()], shorter=True)
+    _, client = _run([_message()], retry_mode="shorter")
 
     assert client.messages.requests[0]["system"][0]["text"] == STABLE_PREFIX
 
 
 def test_shorter_uses_the_smaller_retry_token_ceiling() -> None:
-    _, client = _run([_message()], shorter=True)
+    _, client = _run([_message()], retry_mode="shorter")
 
     assert client.messages.requests[0]["max_tokens"] == PODCAST_RETRY_MAX_TOKENS
+
+
+# --------------------------------------------------------------------------- #
+# the cut-off response — reported as its own reason, not as a parse failure
+# --------------------------------------------------------------------------- #
+
+
+def test_a_response_cut_off_at_the_ceiling_is_reported_as_unfinished() -> None:
+    """`stop_reason="max_tokens"` is checked before parsing. Truncated JSON
+    fails schema validation anyway, so the old code reached "no script" by
+    accident — but recorded it as "schema validation failed", which reads as
+    a model that wrote something malformed rather than one that ran out of
+    room, and left the caller nothing to base a retry decision on. Two real
+    episodes were lost that way.
+    """
+    result, _ = _run(
+        [_message(raw_text='{"intro_turns": [{"speaker": "A", "te', stop_reason="max_tokens")]
+    )
+
+    assert result.script is None
+    assert result.unfinished is True
+    assert result.error is not None
+    assert "cut off" in result.error
+    # Billed for what it wrote, cut off or not (NEVER rule 11).
+    assert (result.input_tokens, result.output_tokens) == (1_000, 500)
+
+
+def test_an_ordinary_parse_failure_is_not_reported_as_unfinished() -> None:
+    """The flag has to actually discriminate: malformed JSON that came back
+    complete is not a cut-off, and must not trigger the retry that only a
+    cut-off justifies paying for."""
+    result, _ = _run([_message(raw_text="not json at all")])
+
+    assert result.script is None
+    assert result.unfinished is False
+
+
+def test_a_refusal_is_not_reported_as_unfinished() -> None:
+    result, _ = _run([_message(stop_reason="refusal")])
+
+    assert result.script is None
+    assert result.unfinished is False
+
+
+def test_the_unfinished_retry_gets_more_room_than_the_shorter_one() -> None:
+    """The point of a separate ceiling. Recovering from "ran out of room" with
+    *less* room than the attempt that ran out would truncate again, having
+    spent a real Opus call to do it."""
+    _, client = _run([_message()], retry_mode="unfinished")
+
+    assert client.messages.requests[0]["max_tokens"] == PODCAST_TRUNCATION_RETRY_MAX_TOKENS
+    assert PODCAST_TRUNCATION_RETRY_MAX_TOKENS > PODCAST_RETRY_MAX_TOKENS
+
+
+def test_the_unfinished_retry_tells_the_model_it_was_cut_off_not_that_it_ran_long() -> None:
+    """Two instructions, not one shared. "Your previous script ran long" is
+    simply false here — the model never finished, and does not know how long
+    the script would have been."""
+    _, client = _run([_message()], retry_mode="unfinished")
+
+    blocks = _user_blocks(client)
+    assert len(blocks) == 2
+    assert "cut off" in str(blocks[1]["text"]).lower()
+    assert "ran long" not in str(blocks[1]["text"]).lower()
+    assert "cache_control" not in blocks[1]
 
 
 # --------------------------------------------------------------------------- #
@@ -538,25 +604,32 @@ above the observed/documented worst, not at it" posture
 constant, it should be replaced with a grounded figure once a real
 Stage 3 run reports actual `input_tokens` for non-English content.
 
-**This is the ceiling's thin edge, flagged by a sixth `llm-cost-guard`
-review and re-measured by a seventh after the intro/outro citation-
-discipline prompt fix (`PODCAST_SCRIPT_VERSION` "podcast-v2") added ~340
-bytes to the stable prefix.** `PODCAST_MONTHLY_CEILING_USD`'s headline
+**This is the ceiling's thin edge**, flagged by a sixth `llm-cost-guard`
+review, re-measured by a seventh after the intro/outro citation-discipline
+prompt fix (`PODCAST_SCRIPT_VERSION` "podcast-v2") added ~340 bytes to the
+stable prefix, and re-measured again by an eighth when
+`PODCAST_MAX_TOKENS` was raised. `PODCAST_MONTHLY_CEILING_USD`'s headline
 margin over the worst case computed at this ratio is not the margin that
 matters — the ratio itself is the uncertain input, and the worst case is
-sensitive to it: at 1.5 bytes/token (this constant) the worst case is
-~$20.63; 1.25 bytes/token prices the same worst case at ~$22.91 (still
-inside, but headroom against the $23 ceiling is down to under $0.10 — the
-v2 prompt addition alone consumed roughly a third of what margin this ratio
-had); 1.0 bytes/token — the realistic bad case for a script with genuinely
-poor BPE coverage (Khmer, Tibetan, Burmese, roughly byte-level fallback
-tokenization) — prices it at ~$26.33, over the $23 ceiling, though still
-under the $50 whole-pipeline alarm from this feature alone. Two
-consequences: grounding this constant from a real Stage 3 run's actual
-`input_tokens` is a Stage 6 precondition in substance, not just an
-aspiration; and the stable prefix is no longer a free surface to extend
-casually — a future addition of even a few hundred more bytes should be
-priced against this sensitivity table before it ships, not after."""
+sensitive to it.
+
+**The sensitivity figures live in `PODCAST_MONTHLY_CEILING_USD`'s docstring
+and are deliberately not repeated here.** An earlier version of this
+docstring carried its own copy, which went stale the moment the ceiling
+moved and then contradicted the canonical one — breaking, in the constant
+whose whole purpose is pricing discipline, the rule DESIGN §8 states in so
+many words: a number written in two places is a number that will disagree
+with itself. The eighth review caught the copy still quoting $20.63 against
+a $23 ceiling that no longer existed.
+
+Two consequences that *do* belong here, because they are about this
+constant rather than about the ceiling: grounding it from a real run's
+actual `input_tokens` is overdue rather than aspirational — there are now
+seven real runs to ground it against, and English content runs nearer 4
+bytes/token than 1.5, so the honest figure would likely *lower* the computed
+worst case substantially. And the stable prefix is not a free surface to
+extend casually — a future addition of even a few hundred bytes should be
+priced against the sensitivity table before it ships, not after."""
 
 
 def _worst_case_item_tuples() -> list[tuple[int, str, str | None, str | None]]:
@@ -591,14 +664,22 @@ def _worst_case_item_tuples() -> list[tuple[int, str, str | None, str | None]]:
 
 
 def _worst_case_monthly_usd(
-    prefix_tokens: int, item_payload_tokens: int, shorter_instruction_tokens: int
+    prefix_tokens: int, item_payload_tokens: int, retry_instruction_tokens: int
 ) -> float:
     """Prices one day as *two* calls: the first attempt at `PODCAST_MAX_TOKENS`
-    output, and the "shorter" retry at the smaller `PODCAST_RETRY_MAX_TOKENS`
-    plus its own rewrite-instruction text — both paying full, uncached price
-    for the identical item payload, since NEVER rule 10 keeps that payload
-    out of the cached block on every call.
+    output, and one retry — both paying full, uncached price for the identical
+    item payload, since NEVER rule 10 keeps that payload out of the cached
+    block on every call.
+
+    The retry is priced at the **more expensive of the two retry modes**, in
+    both its output ceiling and its instruction text, because which one fires
+    is not something this arithmetic gets to assume. `build_script` makes at
+    most one retry per run and the modes are mutually exclusive (`retry_spent`
+    guards it), so pricing both would overstate the ceiling — but pricing the
+    *cheaper* one would understate it, and understating is the direction every
+    earlier round of this file got caught in.
     """
+    worst_retry_max_tokens = max(PODCAST_RETRY_MAX_TOKENS, PODCAST_TRUNCATION_RETRY_MAX_TOKENS)
     first_call = (
         prefix_tokens * IN_RATE_USD_PER_TOKEN * CACHE_WRITE_MULTIPLIER
         + item_payload_tokens * IN_RATE_USD_PER_TOKEN
@@ -606,8 +687,8 @@ def _worst_case_monthly_usd(
     )
     retry_call = (
         prefix_tokens * IN_RATE_USD_PER_TOKEN * CACHE_WRITE_MULTIPLIER
-        + (item_payload_tokens + shorter_instruction_tokens) * IN_RATE_USD_PER_TOKEN
-        + PODCAST_RETRY_MAX_TOKENS * OUT_RATE_USD_PER_TOKEN
+        + (item_payload_tokens + retry_instruction_tokens) * IN_RATE_USD_PER_TOKEN
+        + worst_retry_max_tokens * OUT_RATE_USD_PER_TOKEN
     )
     per_day = first_call + retry_call
     return per_day * (CALLS_PER_MONTH / CALLS_PER_DAY)
@@ -633,6 +714,7 @@ def test_the_worst_case_podcast_cost_stays_within_the_recorded_ceiling(
     """
     from signalforge.llm import (  # noqa: PLC0415 - the real things being measured
         _PODCAST_SHORTER_INSTRUCTION,
+        _PODCAST_UNFINISHED_INSTRUCTION,
         _build_podcast_user_prompt,
     )
 
@@ -663,15 +745,22 @@ def test_the_worst_case_podcast_cost_stays_within_the_recorded_ceiling(
     assert dropped == 0  # exactly PODCAST_MAX_ITEMS items — none clamped away
     assert len(sent_ids) == PODCAST_MAX_ITEMS
     item_payload_tokens = int(len(user_text.encode("utf-8")) / BYTES_PER_TOKEN)
-    shorter_instruction_tokens = int(
-        len(_PODCAST_SHORTER_INSTRUCTION.encode("utf-8")) / BYTES_PER_TOKEN
+    # The longer of the two retry instructions, matching `_worst_case_monthly_usd`'s
+    # "price the worse mode" rule — not whichever one happens to fire more often.
+    retry_instruction_tokens = int(
+        max(
+            len(_PODCAST_SHORTER_INSTRUCTION.encode("utf-8")),
+            len(_PODCAST_UNFINISHED_INSTRUCTION.encode("utf-8")),
+        )
+        / BYTES_PER_TOKEN
     )
 
-    worst = _worst_case_monthly_usd(prefix_tokens, item_payload_tokens, shorter_instruction_tokens)
+    worst = _worst_case_monthly_usd(prefix_tokens, item_payload_tokens, retry_instruction_tokens)
 
     assert worst <= PODCAST_MONTHLY_CEILING_USD, (
         f"worst case at PODCAST_MAX_ITEMS (non-ASCII filler), priced at {CALLS_PER_DAY} "
         f"calls/day, is ${worst:.2f}/month against a ${PODCAST_MONTHLY_CEILING_USD:.2f} "
         "budget. Lower PODCAST_MAX_ITEMS, the per-field *_BYTES caps, PODCAST_MAX_TOKENS, "
-        "or PODCAST_RETRY_MAX_TOKENS, or raise the budget deliberately with the operator."
+        "PODCAST_RETRY_MAX_TOKENS, or PODCAST_TRUNCATION_RETRY_MAX_TOKENS, or raise the "
+        "budget deliberately with the operator."
     )

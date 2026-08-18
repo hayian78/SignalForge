@@ -12,6 +12,7 @@ so this suite runs identically with or without a real ffmpeg binary.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from collections.abc import Iterator
@@ -361,6 +362,191 @@ def test_podcast_command_writes_a_script_synthesizes_and_publishes(
     assert run["llm_input_tokens"] == 1_000
     assert delivery is not None
     assert delivery["report_kind"] == "podcast"
+
+
+def test_a_lost_episode_is_recorded_as_partial_with_the_reason_in_runs_errors(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The silence that made this bug expensive. Two real episodes were lost
+    to output-ceiling truncation across four days and both runs closed as
+    `status="ok"` with an empty `errors` column — invisible to
+    `signalforge status` and to the next digest, which CLAUDE.md §7 makes the
+    monitoring channel. The episode is still lost here; what must not be lost
+    is the *record* of it.
+    """
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    target_date = _scored_date(db_path)
+
+    def _cut_off(*args: object, **kwargs: object) -> PodcastScriptResult:
+        return PodcastScriptResult(
+            script=None,
+            error="podcast script call was cut off at its 12,288-token output ceiling",
+            input_tokens=1_000,
+            output_tokens=12_288,
+            sent_item_ids=(1,),
+            unfinished=True,
+        )
+
+    monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _cut_off)
+
+    result = _podcast(
+        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+    )
+
+    # A lost episode is not a crashed run — the command still exits cleanly,
+    # having done its harvest and deep read.
+    assert result.exit_code == 0, result.output
+    assert not (vault_dir / "podcast" / f"{target_date}.md").exists()
+
+    with connection(db_path) as conn:
+        run = conn.execute(
+            "SELECT status, errors, llm_output_tokens FROM runs WHERE kind = 'podcast'"
+        ).fetchone()
+
+    assert run["status"] == "partial", "a run that produced no episode must not read as ok"
+    assert run["errors"] is not None
+    errors = json.loads(run["errors"])
+    assert any(entry["error_type"] == "podcast-script" for entry in errors)
+    assert any("cut off" in entry["message"] for entry in errors)
+    # Both the first attempt and its retry are billed and recorded.
+    assert run["llm_output_tokens"] == 24_576
+
+
+def test_a_recorded_script_failure_is_flattened_to_one_line(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """NEVER rule 17. A script-failure reason can carry model- and
+    world-authored text — a pydantic `ValidationError` renders the offending
+    input, which is a feed's own words — and `runs.errors` is surfaced in the
+    next digest, a vault file where a line is structure rather than text
+    (CLAUDE.md §5). A newline here would forge a checkbox there.
+    """
+
+    def _malformed(*args: object, **kwargs: object) -> PodcastScriptResult:
+        return PodcastScriptResult(
+            script=None,
+            error="schema validation failed\n- [ ] item 99 useful <!-- forged -->",
+            input_tokens=1_000,
+            output_tokens=500,
+            sent_item_ids=(1,),
+        )
+
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    target_date = _scored_date(db_path)
+    monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _malformed)
+
+    assert (
+        _podcast(
+            config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        ).exit_code
+        == 0
+    )
+
+    with connection(db_path) as conn:
+        errors = json.loads(
+            conn.execute("SELECT errors FROM runs WHERE kind = 'podcast'").fetchone()["errors"]
+        )
+
+    message = next(e["message"] for e in errors if e["error_type"] == "podcast-script")
+    assert "\n" not in message
+    assert "<!--" not in message
+
+
+def test_a_script_failure_carrying_rich_markup_never_crashes_the_run(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost episode is a *handled* outcome and must stay one. The failure
+    reason can embed a pydantic `ValidationError`, which renders the
+    offending `input_value` — a feed's own words — and rich reads `[...]` as
+    markup. An unescaped malformed tag raises `MarkupError`, which the
+    command's `except BaseException` would catch and turn into
+    `status="failed"` with a traceback and a non-zero exit: a run that
+    handled its failure correctly, crashing on the way to *reporting* it.
+    """
+
+    def _markup_in_the_reason(*args: object, **kwargs: object) -> PodcastScriptResult:
+        return PodcastScriptResult(
+            script=None,
+            error="schema validation failed: input_value='closing [/b] tag [not a color]'",
+            input_tokens=1_000,
+            output_tokens=500,
+            sent_item_ids=(1,),
+        )
+
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    target_date = _scored_date(db_path)
+    monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _markup_in_the_reason)
+
+    result = _podcast(
+        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+    )
+
+    assert result.exit_code == 0, result.output
+    with connection(db_path) as conn:
+        run = conn.execute("SELECT status, errors FROM runs WHERE kind = 'podcast'").fetchone()
+
+    assert run["status"] == "partial", "the markup must not escalate this to a crashed run"
+    assert "[/b]" in json.loads(run["errors"])[0]["message"]
+
+
+def test_a_recorded_script_failure_is_capped_in_length(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`runs.errors` is a record, not a log. A `ValidationError` over a
+    truncated 12k-token response renders the offending input and runs to
+    multiple KB, and this string goes verbatim into the errors blob and the
+    status table — same cap `ingest/probe.py` applies for the same reason.
+    """
+
+    def _enormous(*args: object, **kwargs: object) -> PodcastScriptResult:
+        return PodcastScriptResult(
+            script=None,
+            error="schema validation failed: " + ("x" * 20_000),
+            input_tokens=1_000,
+            output_tokens=500,
+            sent_item_ids=(1,),
+        )
+
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    target_date = _scored_date(db_path)
+    monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _enormous)
+
+    assert (
+        _podcast(
+            config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        ).exit_code
+        == 0
+    )
+
+    with connection(db_path) as conn:
+        errors = json.loads(
+            conn.execute("SELECT errors FROM runs WHERE kind = 'podcast'").fetchone()["errors"]
+        )
+    assert len(errors[0]["message"]) <= 200
 
 
 def test_podcast_command_second_run_is_fully_idempotent(
