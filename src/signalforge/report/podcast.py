@@ -92,6 +92,7 @@ __all__ = [
     "ScriptTurn",
     "SourceLink",
     "build_script_context",
+    "has_reviewed_item",
     "order_by_verdict",
     "parse_script",
     "render_script",
@@ -163,9 +164,12 @@ def order_by_verdict(
     * Within a tier the incoming order is preserved, so score still decides —
       `sorted` is stable and this function never re-sorts inside a tier.
 
-    Unmarked items are a tier, not an exclusion: a day the operator never opens
-    the digest still yields a normal, score-ranked episode. That is the property
-    that lets marking be optional rather than a gate on the pipeline running.
+    Unmarked items are a tier, not an exclusion: this function alone never
+    drops an unmarked item, so a day nobody opens the digest still produces a
+    normal, score-ranked ordering here. Whether that ordering is worth airing
+    at all is a separate decision `cli.podcast` makes after selection, using
+    `has_reviewed_item` — by default it does not air an episode built entirely
+    from unmarked items (`--include-unreviewed` overrides).
 
     `verdicts` maps item id to that item's stored verdicts, unreduced
     (`db.feedback_verdicts_for_items`); each item is collapsed to its strongest
@@ -189,6 +193,32 @@ def order_by_verdict(
             continue
         tiered.append((_VERDICT_TIER[rung], scored))
     return [scored for _tier, scored in sorted(tiered, key=lambda pair: pair[0])]
+
+
+def has_reviewed_item(
+    scored_items: Sequence[DigestItem],
+    verdicts: Mapping[int, Sequence[str]],
+) -> bool:
+    """True if any of `scored_items` is marked `useful` or `exceptional`.
+
+    `cli.podcast`'s default gate on airing an episode at all: an operator who
+    never opened last night's digest gets a normal, score-ranked episode from
+    `order_by_verdict` if they ask for it (`--include-unreviewed`), but by
+    default an episode built entirely from items nobody actually judged is
+    not worth the Opus/TTS spend to record. Unmarked items resolve `False`
+    here; a `noise`-marked one would too, but in practice never reaches this
+    function; its only caller (`cli._select_podcast_items`) always runs
+    `order_by_verdict` first, which already drops every `noise` item.
+
+    Same `verdicts` contract as `order_by_verdict`: unreduced per-item marks,
+    collapsed with `feedback.highest_rung`. Pure: no DB, no config, no I/O.
+    """
+    for scored in scored_items:
+        item_id = scored.item.id
+        marks = verdicts.get(item_id, ()) if item_id is not None else ()
+        if highest_rung(marks) in ("exceptional", "useful"):
+            return True
+    return False
 
 
 @dataclass(frozen=True, slots=True)

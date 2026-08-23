@@ -1147,13 +1147,32 @@ Tiering **before** crowding is the load-bearing order: the caps truncate the
 operator's preferred order rather than spending the episode's slots before a
 single mark is consulted.
 
-**Unmarked is a tier, not an exclusion.** This is what keeps marking optional. A
-day nobody opens the digest still yields a normal, score-ranked episode — marks
-are upside, never a gate on the pipeline running. It is also why the alternative
-design (poll until every item is marked, then record) was rejected: "all items
-marked" is a condition that may simply never become true, so it needs a deadline
-fallback anyway, and a poller plus a deadline is strictly more machinery than one
-extra cron line for the same result (§14).
+**Unmarked is a tier, not an exclusion — within the ranking.** This is what keeps
+marking optional for *ordering purposes*: `order_by_verdict` never drops an
+unmarked item, so if the episode runs, a day nobody opens the digest still gets
+a normal, score-ranked ordering rather than an empty one. It is also why the
+alternative design (poll until every item is marked, then record) was rejected:
+"all items marked" is a condition that may simply never become true, so it needs
+a deadline fallback anyway, and a poller plus a deadline is strictly more
+machinery than one extra cron line for the same result (§14).
+
+**Whether the episode runs at all is a separate, later decision — added
+2026-08-24.** Operator report: a same-day review window that gets skipped
+("sometimes I don't get time to review the night before") produces an episode
+built entirely from unreviewed, score-ranked items, and that episode is "kind of
+crap" — the failure mode the marks-outrank-score reorder above exists to
+prevent, just arriving with zero marks instead of a bad one. `cli.podcast` now
+gates on `report.podcast.has_reviewed_item`, checked against the final, crowded
+selection, but only around *writing a fresh script* — the check sits after the
+existing "script already on disk" reuse branch, not before it. If none of the
+selection carries a `useful` or `exceptional` mark and no script exists yet for
+the date, no deep read runs and no Opus call is billed (`status: ok`); an
+already-written episode (one from an earlier `--include-unreviewed` run, say)
+is unaffected and still reaches `_deliver_podcast_and_report`, so `--resend`
+and a retry after a dead channel both keep working regardless of today's mark
+state. `daily`'s own `--include-unreviewed` passes this through, since a
+same-day catch-up run has no review window behind it
+either and would otherwise skip silently by default.
 
 **What it cost.** Stated in full, because a promotion that appears free is a
 promotion nobody will scrutinise next time:
