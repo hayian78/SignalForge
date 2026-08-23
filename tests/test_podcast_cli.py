@@ -337,7 +337,12 @@ def test_podcast_command_writes_a_script_synthesizes_and_publishes(
 
     calls = _fake_run_podcast_script(monkeypatch)
     result = _podcast(
-        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--include-unreviewed"],
     )
 
     assert result.exit_code == 0, result.output
@@ -396,7 +401,12 @@ def test_a_lost_episode_is_recorded_as_partial_with_the_reason_in_runs_errors(
     monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _cut_off)
 
     result = _podcast(
-        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--include-unreviewed"],
     )
 
     # A lost episode is not a crashed run — the command still exits cleanly,
@@ -449,7 +459,12 @@ def test_a_recorded_script_failure_is_flattened_to_one_line(
 
     assert (
         _podcast(
-            config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+            config_dir,
+            db_path,
+            cache_dir,
+            vault_dir,
+            audio_dir,
+            extra_args=["--date", target_date, "--include-unreviewed"],
         ).exit_code
         == 0
     )
@@ -496,7 +511,12 @@ def test_a_script_failure_carrying_rich_markup_never_crashes_the_run(
     monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _markup_in_the_reason)
 
     result = _podcast(
-        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--include-unreviewed"],
     )
 
     assert result.exit_code == 0, result.output
@@ -537,7 +557,12 @@ def test_a_recorded_script_failure_is_capped_in_length(
 
     assert (
         _podcast(
-            config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+            config_dir,
+            db_path,
+            cache_dir,
+            vault_dir,
+            audio_dir,
+            extra_args=["--date", target_date, "--include-unreviewed"],
         ).exit_code
         == 0
     )
@@ -563,7 +588,12 @@ def test_podcast_command_second_run_is_fully_idempotent(
 
     calls = _fake_run_podcast_script(monkeypatch)
     first = _podcast(
-        config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--include-unreviewed"],
     )
     assert first.exit_code == 0, first.output
     assert len(calls) == 1
@@ -593,6 +623,7 @@ def test_podcast_command_second_run_is_fully_idempotent(
             str(audio_dir),
             "--date",
             target_date,
+            "--include-unreviewed",
         )
     assert second.exit_code == 0, second.output
     assert script_file.read_text(encoding="utf-8") == first_render
@@ -728,7 +759,7 @@ def test_a_dead_r2_is_a_recorded_error_not_a_failed_run(
         vault_dir,
         audio_dir,
         r2_down=True,
-        extra_args=["--date", target_date],
+        extra_args=["--date", target_date, "--include-unreviewed"],
     )
 
     # The script is on disk either way (DESIGN §13.2's vault-first invariant);
@@ -791,6 +822,7 @@ def test_daily_runs_podcast_as_a_fifth_isolated_step(
             str(vault_dir),
             "--audio-dir",
             str(audio_dir),
+            "--include-unreviewed",
         )
 
     assert result.exit_code == 0, result.output
@@ -800,6 +832,63 @@ def test_daily_runs_podcast_as_a_fifth_isolated_step(
 
     today_scripts = list((vault_dir / "podcast").glob("*.md"))
     assert len(today_scripts) == 1
+
+
+def test_daily_default_skips_the_podcast_step_on_a_same_day_unreviewed_run(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A same-day `daily` catch-up run has no review window behind it, so
+    without `--include-unreviewed` the podcast step is a clean, isolated skip
+    — the digest still lands, no script gets written, and the run is still
+    `ok` (DESIGN §13.3's default-gate paragraph)."""
+    monkeypatch.setattr(
+        "signalforge.llm.run_triage_batch",
+        lambda *a, **k: TriageBatchResult(
+            results={
+                1: TriageResult(triage="keep", signal=5, relevance=5, novelty=4, reasoning="Good.")
+            },
+            input_tokens=1,
+            output_tokens=1,
+        ),
+    )
+    script_calls = _fake_run_podcast_script(monkeypatch)
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(FEED_URL).mock(
+            return_value=httpx.Response(200, text=FEED, headers={"etag": '"a-1"'})
+        )
+        mock.get(ARTICLE_URL).mock(return_value=httpx.Response(200, content=_ARTICLE_HTML))
+        result = _run(
+            "daily",
+            "--config-dir",
+            str(config_dir),
+            "--db",
+            str(db_path),
+            "--cache-dir",
+            str(cache_dir),
+            "--vault-dir",
+            str(vault_dir),
+            "--audio-dir",
+            str(audio_dir),
+        )
+
+    assert result.exit_code == 0, result.output
+    assert script_calls == []
+    assert not (vault_dir / "podcast").exists()
+    assert list((vault_dir / "daily").glob("*.md"))  # the digest still landed
+
+    with connection(db_path) as conn:
+        kinds = [row[0] for row in conn.execute("SELECT kind FROM runs ORDER BY id")]
+        podcast_status = conn.execute("SELECT status FROM runs WHERE kind = 'podcast'").fetchone()[
+            "status"
+        ]
+    assert kinds == ["ingest", "score", "daily", "podcast"]
+    assert podcast_status == "ok"
 
 
 def test_daily_isolates_a_podcast_step_failure_from_the_already_written_digest(
@@ -849,6 +938,7 @@ def test_daily_isolates_a_podcast_step_failure_from_the_already_written_digest(
             str(vault_dir),
             "--audio-dir",
             str(audio_dir),
+            "--include-unreviewed",
         )
 
     assert result.exit_code != 0
@@ -891,7 +981,12 @@ def test_status_prices_recorded_tts_characters_at_the_configured_model(
     _fake_run_podcast_script(monkeypatch)
     assert (
         _podcast(
-            config_dir, db_path, cache_dir, vault_dir, audio_dir, extra_args=["--date", target_date]
+            config_dir,
+            db_path,
+            cache_dir,
+            vault_dir,
+            audio_dir,
+            extra_args=["--date", target_date, "--include-unreviewed"],
         ).exit_code
         == 0
     )
@@ -996,7 +1091,7 @@ def test_a_noise_mark_keeps_an_item_off_the_episode(
     assert status == "ok"
 
 
-def test_an_unmarked_day_still_records_a_normal_episode(
+def test_an_unmarked_day_does_not_record_by_default(
     config_dir: Path,
     db_path: Path,
     cache_dir: Path,
@@ -1004,10 +1099,12 @@ def test_an_unmarked_day_still_records_a_normal_episode(
     audio_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Marking is upside, never a gate: an empty vault must not stop the episode."""
+    """The default gate: a day nobody reviewed is the "kind of crap" episode
+    this command should not produce unopposed. A clean `ok` skip, not a
+    failure — no Opus call, no script, no delivery attempt."""
     assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
     assert _score(config_dir, db_path, monkeypatch).exit_code == 0
-    _fake_run_podcast_script(monkeypatch)
+    script_calls = _fake_run_podcast_script(monkeypatch)
 
     result = _podcast(
         config_dir,
@@ -1019,7 +1116,92 @@ def test_an_unmarked_day_still_records_a_normal_episode(
     )
 
     assert result.exit_code == 0, result.output
+    assert "nothing reviewed" in result.output
+    assert script_calls == []
+    assert not (vault_dir / "podcast").exists()
+    with connection(db_path) as conn:
+        run = conn.execute(
+            "SELECT status, tts_characters FROM runs WHERE kind = 'podcast'"
+        ).fetchone()
+    assert run["status"] == "ok"
+    assert run["tts_characters"] == 0
+
+
+def test_include_unreviewed_records_an_unmarked_day_anyway(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`--include-unreviewed` is the override: a normal, score-ranked episode
+    from a day nobody marked anything, for the operator who wants one anyway."""
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    _fake_run_podcast_script(monkeypatch)
+
+    result = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", _scored_date(db_path), "--include-unreviewed"],
+    )
+
+    assert result.exit_code == 0, result.output
     assert len(list((vault_dir / "podcast").glob("*.md"))) == 1
+
+
+def test_resend_of_an_existing_episode_ignores_the_review_gate(
+    config_dir: Path,
+    db_path: Path,
+    cache_dir: Path,
+    vault_dir: Path,
+    audio_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate blocks writing a *fresh* script, not reusing or resending one
+    already on disk — an episode written earlier via `--include-unreviewed`
+    (or from a day that got marked and later had its marks removed) must
+    still be `--resend`-able without the flag."""
+    assert _ingest(config_dir, db_path, cache_dir).exit_code == 0
+    assert _score(config_dir, db_path, monkeypatch).exit_code == 0
+    target_date = _scored_date(db_path)
+
+    calls = _fake_run_podcast_script(monkeypatch)
+    first = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--include-unreviewed"],
+    )
+    assert first.exit_code == 0, first.output
+    assert len(calls) == 1
+    script_file = vault_dir / "podcast" / f"{target_date}.md"
+    first_render = script_file.read_text(encoding="utf-8")
+
+    def _must_not_be_called(*args: object, **kwargs: object) -> PodcastScriptResult:
+        raise AssertionError("a resend must reuse the existing script, never regenerate it")
+
+    monkeypatch.setattr("signalforge.synth.podcast.run_podcast_script", _must_not_be_called)
+
+    second = _podcast(
+        config_dir,
+        db_path,
+        cache_dir,
+        vault_dir,
+        audio_dir,
+        extra_args=["--date", target_date, "--resend"],
+    )
+
+    assert second.exit_code == 0, second.output
+    assert "nothing reviewed" not in second.output
+    assert "podcast delivered" in second.output
+    assert script_file.read_text(encoding="utf-8") == first_render
 
 
 def test_daily_no_podcast_stops_after_the_digest(

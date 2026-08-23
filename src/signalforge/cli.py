@@ -10,7 +10,9 @@ Phase 0 surface, and deliberately no more (NEVER rule 15):
   `run` is the only command in this CLI that spends money on being typed.
 * `podcast` — write the day's episode script and publish it to the podcast
   channel, if configured (DESIGN §13.3). Harvests vault marks first and ranks
-  the episode by them: `noise` out, then exceptional → useful → unmarked.
+  the episode by them: `noise` out, then exceptional → useful → unmarked. By
+  default only runs at all if something was marked useful/exceptional
+  (`--include-unreviewed` overrides).
 * `daily` — `curate apply` → `ingest` → `score` → `digest` → `podcast`. Split
   across two cron entries (DESIGN §14): `daily --no-podcast` in the evening,
   `podcast --date <yesterday>` the next morning, with the gap as the operator's
@@ -129,7 +131,12 @@ from signalforge.report.daily import (
     select_digest_items,
     utc_day_window,
 )
-from signalforge.report.podcast import order_by_verdict, script_path, write_script
+from signalforge.report.podcast import (
+    has_reviewed_item,
+    order_by_verdict,
+    script_path,
+    write_script,
+)
 from signalforge.report.vaultgit import VaultCommitStatus, commit_vault
 from signalforge.report.weekly import (
     WEEKLY_WINDOW_DAYS,
@@ -1221,9 +1228,10 @@ def _select_podcast_items(
     target_date: Date,
     tz: tzinfo,
     podcast_top_n: int,
-) -> list[Item]:
+) -> tuple[list[Item], bool]:
     """The top-`podcast_top_n` kept items for `target_date`, preferring the
-    operator's marks over the model's score (DESIGN §13.3).
+    operator's marks over the model's score (DESIGN §13.3), plus whether any
+    of them is actually reviewed.
 
     Three filters, in this order, and the order is the whole design:
 
@@ -1243,6 +1251,11 @@ def _select_podcast_items(
     beat an unmarked third from elsewhere only as far as `daily_max_per_source`
     allows. Running it the other way would let the score ranking spend the
     episode's slots before a single mark was consulted.
+
+    The second return value is `has_reviewed_item` over the *final*, crowded
+    selection — not the wider `citable` pool — so a reviewed item that the
+    per-source cap bumped does not count. `cli.podcast` uses it to decide
+    whether an all-unreviewed selection is worth airing at all.
     """
     start, end = utc_day_window(target_date, tz)
     scored_items = get_digest_items(conn, start=start, end=end)
@@ -1256,7 +1269,7 @@ def _select_podcast_items(
         max_per_source=interests.thresholds.daily_max_per_source,
         max_per_github_repo=interests.thresholds.daily_max_per_github_repo,
     )
-    return [scored.item for scored in selected]
+    return [scored.item for scored in selected], has_reviewed_item(selected, verdicts)
 
 
 async def _deep_read(
@@ -1322,6 +1335,14 @@ def podcast(
         bool,
         typer.Option("--resend", help="Publish again even if this date was already delivered."),
     ] = False,
+    include_unreviewed: Annotated[
+        bool,
+        typer.Option(
+            "--include-unreviewed",
+            help="Record the episode even if nothing was marked useful or exceptional "
+            "(falls back to a score-ranked selection nobody has actually reviewed).",
+        ),
+    ] = False,
 ) -> None:
     """Write the day's podcast script (Opus) and publish it (TTS + R2 feed).
 
@@ -1334,11 +1355,15 @@ def podcast(
     **The operator's marks outrank the score.** Vault feedback is harvested
     first (read-only, non-fatal), then `noise` items are dropped and the rest
     tiered exceptional → useful → unmarked before the cap applies — see
-    `_select_podcast_items`. Unmarked is a tier, not an exclusion, so a day
-    nobody ticked anything still yields a normal score-ranked episode: marking
-    is upside, never a gate on the episode existing. This is why the default
-    schedule records the episode the morning *after* its digest (DESIGN §14) —
-    same day, and there is no window in which to have marked anything.
+    `_select_podcast_items`. Unmarked is a tier, not an exclusion *within that
+    ranking* — but by default the episode itself does not run unless at least
+    one selected item is actually marked `useful` or `exceptional`
+    (`--include-unreviewed` overrides): an episode built entirely from
+    unreviewed, score-ranked items is exactly the "kind of crap" result this
+    gate exists to stop, since a five-slot episode is ruined by one dud in a
+    way a fifteen-line digest is not. This is why the default schedule records
+    the episode the morning *after* its digest (DESIGN §14) — the gap is the
+    window in which the operator actually marks something.
 
     Idempotent by construction
     (CLAUDE.md §3): a vault script already on disk for `--date` is reused
@@ -1406,7 +1431,7 @@ def podcast(
                     logger.exception("harvesting vault feedback failed; continuing to the episode")
                     harvest_error = _run_level_error(exc)
 
-                items = _select_podcast_items(
+                items, has_reviewed = _select_podcast_items(
                     conn,
                     interests=interests,
                     target_date=resolved_date,
@@ -1426,6 +1451,22 @@ def podcast(
                         console.print(
                             f"[dim]script already exists at {script_file}; skipping the "
                             "Opus call (--force-script to regenerate).[/dim]"
+                        )
+                    elif not has_reviewed and not include_unreviewed:
+                        # The default gate: an episode nobody has actually
+                        # reviewed is the "kind of crap" result the operator
+                        # asked this command not to produce. Gated here, not
+                        # above the `script_file` check, so it only ever blocks
+                        # *writing a fresh script* — an already-written episode
+                        # (e.g. one written earlier via --include-unreviewed)
+                        # still reuses its script and still reaches
+                        # `_deliver_podcast_and_report` below, so `--resend` and
+                        # a retry after a dead R2 both keep working regardless
+                        # of today's mark state.
+                        console.print(
+                            f"[yellow]nothing reviewed[/yellow]: {len(items)} kept item(s) for "
+                            f"{resolved_date.isoformat()}, none marked useful or exceptional yet "
+                            "(--include-unreviewed to write a script anyway)."
                         )
                     else:
                         deep_read_errors = asyncio.run(
@@ -2323,6 +2364,15 @@ def daily(
             "`digest`, for the split evening-digest / morning-podcast schedule.",
         ),
     ] = True,
+    include_unreviewed: Annotated[
+        bool,
+        typer.Option(
+            "--include-unreviewed",
+            help="Passed through to `podcast`: record the episode even if nothing was "
+            "marked useful or exceptional. Same-day catch-up runs have no review "
+            "window, so this is usually needed to get an episode out of them at all.",
+        ),
+    ] = False,
 ) -> None:
     """Run `curate apply`, `ingest`, `score`, `digest`, then `podcast` (DESIGN §14).
 
@@ -2332,8 +2382,10 @@ def daily(
     ticks `noise`/`useful`/`exceptional`, and `podcast` harvests those marks and
     ranks the episode by them (`_select_podcast_items`). Running the whole chain
     in one shot (the default, `--podcast`) is still correct and is what a manual
-    catch-up run wants; it just records the episode against whatever marks
-    already existed, which on a same-day run is none.
+    catch-up run wants, but a same-day run has no review window behind it, so
+    `podcast`'s default gate (no marks yet → no episode) will usually skip it;
+    pass `--include-unreviewed` here to get a score-ranked episode out of a
+    same-day run anyway.
 
     Each step keeps its own `runs` row and failure isolation — a step that
     comes back `partial`/`failed` does not stop the next one from running,
@@ -2399,6 +2451,7 @@ def daily(
                     cache_dir=cache_dir,
                     vault_dir=vault_dir,
                     audio_dir=audio_dir,
+                    include_unreviewed=include_unreviewed,
                 ),
             )
             if with_podcast
